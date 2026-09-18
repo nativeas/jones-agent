@@ -26,6 +26,8 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# spikes/ 是一次性技术验证脚本，不是产品代码，不纳入 lint / 包 / 测试收集
+exclude = ["spikes"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
