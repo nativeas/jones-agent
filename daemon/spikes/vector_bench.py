@@ -403,6 +403,12 @@ BACKENDS = {
     "chroma": bench_chroma,
 }
 
+# 精确检索后端：对 numpy-brute ground truth 应该恒等，不是"接近"（评审第二轮 #3：
+# 上一版 recall_at_k 只是打印出来的信息字段，对精确后端来说 recall@k=1.0 是数学
+# 恒等式，不是回归检查——真正的回归检查是"结果集是否一致"这个断言，下面在 main()
+# 里把它变成会让脚本非零退出的硬断言，而不是只在 JSON 里悄悄留一个偏低的数字）。
+EXACT_BACKENDS = {"sqlite-blob", "sqlite-persist", "sqlite-vec"}
+
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -435,6 +441,7 @@ def main() -> None:
     if not args.no_ground_truth:
         ground_truth = ground_truth_topk(base, queries, args.topk)
 
+    consistency_failures: list[str] = []
     for name in names:
         workdir = Path(tempfile.mkdtemp(prefix=f"vecbench_{name}_"))
         try:
@@ -446,9 +453,25 @@ def main() -> None:
             result["n"] = args.n
             result["dim"] = args.dim
             print(json.dumps(result, ensure_ascii=False))
+            # 精确后端 vs numpy ground truth 的结果集一致性断言（评审第二轮 #3）：
+            # recall@k < 1.0 对一个精确检索后端来说不是"召回率略低"，是结果集和
+            # numpy 精确 top-k 不一致——要么实现有 bug，要么 SQL 排序/去重有问题，
+            # 这才是这个脚本该当回归检查捕捉的东西。
+            if name in EXACT_BACKENDS and ground_truth is not None:
+                recall = result.get("recall_at_k")
+                if recall is not None and recall < 1.0:
+                    consistency_failures.append(
+                        f"{name}: recall_at_k={recall} != 1.0，"
+                        f"与 numpy-brute 精确结果集不一致（精确后端不应该有差异）"
+                    )
         finally:
             if not args.keep:
                 shutil.rmtree(workdir, ignore_errors=True)
+
+    if consistency_failures:
+        for msg in consistency_failures:
+            print(f"CONSISTENCY CHECK FAILED: {msg}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

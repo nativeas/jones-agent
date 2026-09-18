@@ -38,7 +38,7 @@
 - 数据：`np.random.default_rng(42)` 生成 N×768 的单位化随机向量（float32），模拟 embedding 输出；查询向量同分布生成，与库集合不重叠。
 - 规模：N = 100,000，dim = 768，topk = 10，每个后端跑 30～100 次查询取 p50/p95/mean。
 - 环境：macOS，Apple Silicon（arm64），Python 3.12（uv 管理，daemon 的运行时版本），各后端依赖用 `uv run --with <pkg>` 按需注入，不写进 `daemon/pyproject.toml`（避免污染 daemon 主依赖树，这只是 spike）。
-- **召回率**：脚本对每个查询同时算出 numpy 精确 top-k 作为 ground truth，其余后端返回的 top-k 与它取交集算 `recall_at_k`（评审 #10）。
+- **召回率 / 一致性断言**：脚本对每个查询同时算出 numpy 精确 top-k 作为 ground truth，其余后端返回的 top-k 与它取交集算 `recall_at_k`（评审 #10）。对精确检索后端（`sqlite-blob`/`sqlite-persist`/`sqlite-vec`）来说 `recall_at_k=1.0` 是数学恒等式，不是"召回率指标"——评审第二轮 #3 指出这一点，脚本已改为把它变成硬断言：`recall_at_k < 1.0` 时脚本以非零退出码结束并把不一致的后端打到 stderr（`main()` 里的 `consistency_failures` 检查），这样"sqlite-vec 的结果集和 numpy 精确结果不一致"会让 CI/复现命令直接失败，而不是只在 JSON 里留一个安静的偏低数字等人工去读。LanceDB/Chroma 是近似检索，不纳入这个断言（预期 recall 可以 < 1.0）。
 - **内存**：脚本自身用 `resource.getrusage().ru_maxrss` 记录进程峰值 RSS（`rss_max_mb` 字段），但同一进程里跑多个后端时这个数字是"跑到该行为止"的累计峰值，不是单后端独立值；本报告 §4/§5 里逐后端独立的内存数字来自 `/usr/bin/time -l`（每个后端单独一次 `uv run` 调用），方法与数字见 §5。
 - 复现命令见脚本头部注释；每个后端一次独立 `uv run` 调用，互不污染环境。
 
@@ -74,7 +74,7 @@ LanceDB / Chroma：本次修复重新尝试联网安装（评审前一版因带�
 对照同一 harness 下的基线：
 
 ```
- 653148160  maximum resident set size   # numpy-brute ≈ 0.65 GB（0.61GB 是 harness 自身常驻的 base 数组 + copy）
+ 653148160  maximum resident set size   # numpy-brute ≈ 622.9 MB（与 §4 表一致，不是 0.65GB——653148160 字节按二进制单位是 622.9 MiB / 0.608 GiB，上一版把十进制字节数直接读成"0.65 GB"是单位换算错误；构成：base 数组 100000×768×4B ≈ 293.0MiB + bench_numpy_brute 里 `matrix = base.copy()` 的第二份拷贝 ≈ 293.0MiB，合计 586.0MiB，其余约 37MiB 是 Python/numpy 解释器自身常驻开销——上一版说"0.61GB 是 base 数组 + copy"也是错的，base+copy 只有 0.57GB）
  658522112  maximum resident set size   # sqlite-vec  ≈ 0.66 GB（几乎不比基线高）
  657768448  maximum resident set size   # sqlite-persist ≈ 0.66 GB（单次查询峰值不高，但见下）
 ```
@@ -181,20 +181,47 @@ class VectorStore(Protocol):
         ...
 
     def delete(self, id: str) -> None:
-        """真删——对应 PRD G20，删除后磁盘上不留分片残留。
-        实现要求（不是留给以后的细节，是选型阶段就要锁定的约束，见文末修复记录 #5）：
-        打开连接时必须执行 `PRAGMA secure_delete=ON`。普通 SQLite DELETE 只把页面挂回
-        freelist，BLOB/向量原文会原样留在库文件里直到 VACUUM；secure_delete=ON 让
-        DELETE 在原地把被删内容覆写为 0，代价只摊在被删的页上（不像 VACUUM 要重写整个
-        文件，不适合作为高频 delete 路径的常规操作）。已用 `daemon/spikes/delete_verify.py`
-        实测验证：sqlite-blob 表在 secure_delete=ON 下 DELETE 后 hexdump 扫库文件找不到
-        被删向量的原始字节；不开 secure_delete 则能找到（复现见该脚本）。"""
+        """真删——契约定义（评审第二轮裁定，对应 PRD 10.4）：**真删 = SQLite 行 +
+        payload 文件 + 向量分片一起删**。磁盘级残留（页面/WAL frame 里的原始字节
+        还能被读出来）由下面两条一起满足，不要求"文件系统底层扇区被物理擦除"
+        （那是操作系统/磁盘层的事，任何用户态数据库都做不到，也不是 PRD 10.4 的定义）：
+
+        1. 打开连接时执行 `PRAGMA secure_delete=ON`——让 DELETE 就地把被删内容覆写
+           为 0，代价只摊在被删的页上（不像 VACUUM 要重写整个文件，不适合作为高频
+           delete 路径的常规操作）。
+        2. **每次 DELETE 提交后执行 `PRAGMA wal_checkpoint(TRUNCATE)`**——生产推荐
+           配置是 WAL 模式（见"目录结构"一节），而 WAL 是 append-only 日志：
+           secure_delete 只保证"新写入的页"内容干净，不保证 -wal 文件里更早的、
+           包含原始被删数据的旧 frame 被抹掉；只有 wal_checkpoint(TRUNCATE) 把
+           -wal 文件截断到 0 字节，才会物理清除那些旧 frame。只做 1 不做 2，
+           在一个长驻连接的 daemon 进程里，删除后到下次自然 checkpoint 之间的
+           窗口期，-wal 文件上仍能读到被删向量的原始字节。
+
+        两条都做到才是真删；只做其中一条都不够——`daemon/spikes/delete_verify.py`
+        用真实文件字节检查（不是理论推导）验证了这个矩阵，对 sqlite-blob 和 vec0
+        两种存储各测了"两条都做/只做一条/都不做"的组合：
+          - sqlite-blob：只开 secure_delete 不 checkpoint → -wal 残留；只 checkpoint
+            不开 secure_delete → 合并进主库的页仍残留；两条都做 → 真删。
+          - sqlite-vec (vec0)：DELETE 在应用层已经把被删行的向量槽位覆写为 0（不依赖
+            secure_delete PRAGMA，实测验证见该脚本"非 WAL"用例），所以 vec0 只需要
+            checkpoint(TRUNCATE) 就够真删；但 secure_delete=ON 仍然按统一实现要求打开
+            （对 `_meta`/`_collections` 等普通表有效，不是无用功）。
+        实测方法与逐条数字见该脚本注释与运行输出（`uv run --python 3.12 --with numpy
+        --with sqlite-vec daemon/spikes/delete_verify.py`）。"""
         ...
 
     def search(
-        self, query_vector: list[float], top_k: int = 10,
-        modality: Modality | None = None,
-    ) -> list[MemoryHit]: ...
+        self, query_vector: list[float], modality: Modality, top_k: int = 10,
+    ) -> list[MemoryHit]:
+        """`modality` 是必填参数，不是可选过滤条件（评审第二轮裁定 #2：上一版
+        `modality: Modality | None = None` 与"按 modality 分表 + 每 modality 锁定
+        dim"自相矛盾——search 内部要靠 modality 才知道去查 `vecs_text` 还是
+        `vecs_image`，不同表维度不同，向量空间也不可比，modality=None 时"跨所有
+        模态比较相似度"做不出来）。调用方发起检索时天然知道 query_vector 来自哪个
+        modality 的 embedding 模型，这不是一个可以省略的参数。真正的跨模态检索
+        （例如"用一句文字搜图片"）要等文本和图像共享同一个 embedding 空间（如 CLIP
+        联合空间）接入之后才有意义，属于未来 Issue，不是这个 Store 接口该解决的。"""
+        ...
 
     def close(self) -> None: ...
 ```
@@ -209,7 +236,8 @@ class VectorStore(Protocol):
 
 ```
 <shard-dir>/                 # <项目目录>/.jones/memory/ 或 ~/.jones/memory/global/
-└── vectors.db                # 唯一文件；WAL 模式，PRAGMA secure_delete=ON
+└── vectors.db                # 唯一文件；WAL 模式，PRAGMA secure_delete=ON；
+                               # delete() 提交后执行 wal_checkpoint(TRUNCATE)（真删契约，见 delete()）
     ├── vecs_text (vec0)      # 按 modality 惰性建表
     ├── vecs_image (vec0)
     ├── vecs_audio (vec0)
@@ -228,7 +256,7 @@ class VectorStore(Protocol):
 ## 10. 给评审者的关注点
 
 - `sqlite-vec` 是否需要额外处理扩展加载失败（不同平台/架构的 wheel 是否都带正确的 `.so`/`.dylib`）——这个 spike 未验证打包后行为，留给 spike #2 或后续集成 Issue 验证。
-- §8 的"按 modality 分表 + secure_delete"设计目前只在小规模（几百行）手工验证过真删行为（`daemon/spikes/delete_verify.py`）；10 万条规模下 `secure_delete=ON` 对写入延迟的额外开销没有测（评审如果认为这值得在选型阶段量化，可以再补一版基准，本次修复的重点是先把"会不会真删"这个正确性问题锁死）。
+- §8 的"按 modality 分表 + secure_delete + wal_checkpoint(TRUNCATE)"设计的**正确性**（会不会真删、WAL 模式下会不会残留）已经用 `daemon/spikes/delete_verify.py` 在 WAL 模式下逐条组合验证过（评审第二轮 #1，见 delete() docstring 与该脚本），不再只是小规模手工检查。**没测的是性能**：10 万条规模下 `secure_delete=ON` 对写入延迟的额外开销、以及"每次 delete 都做一次 wal_checkpoint(TRUNCATE)"在高频删除场景下的开销（TRUNCATE 要求没有其它连接持有旧快照，理论上比 PASSIVE checkpoint 更贵）都没有量化（评审如果认为这值得在选型阶段量化，可以再补一版基准；本次修复的重点是先把"会不会真删"这个正确性问题锁死，性能数字留给实现该功能的 Issue，那时会有真实的 upsert/delete 频率参考）。
 - LanceDB/Chroma 的实测数字（如果本次修复联网成功拿到）只是佐证，不是排除它们的理由——排除理由自始至终是依赖体积（§5.3）。
 
 ---
@@ -255,3 +283,48 @@ class VectorStore(Protocol):
 - `uv run --python 3.12 --with numpy --with sqlite-vec daemon/spikes/delete_verify.py` — 通过（exit 0），secure_delete=ON 的两个用例均验证为"真删"，未开 secure_delete 的 sqlite-blob 用例验证为"残留"（符合预期）。
 - `uv run --with ruff ruff check daemon/spikes/vector_bench.py daemon/spikes/delete_verify.py` — 见下方"lint"结果。
 - LanceDB / Chroma 端到端复现命令见文末 §4/§5.3 结果或"未测得"标注。
+
+---
+
+## 第二轮修复记录（评审后）
+
+控制者裁定 5 条意见的处理结果（详细过程、探测脚本、逐条证据在分支报告文件末尾的同构小节里，此处只写结论）：
+
+1. **[important] WAL 残留，真删定义按 PRD 10.4 裁定** — 采纳。§8 `delete()` 契约重写为
+   「secure_delete=ON + delete 提交后 `wal_checkpoint(TRUNCATE)`」两者缺一不可；
+   `daemon/spikes/delete_verify.py` 新增 6 条 WAL 用例直接读 -wal 文件字节验证，
+   11 条用例（5 非 WAL + 6 WAL）全部通过。未出现"实测仍残留"的情况，"推荐配置"
+   在实测下确实做到真删。
+2. **[important] search(modality=None) 接口自相矛盾** — 采纳。§8 `search()` 的
+   `modality` 改为必填参数，去掉 `| None = None`，docstring 写明原因与"跨模态检索
+   留给未来统一 embedding 空间"这句裁定要求的话。`list()` 未改（裁定只针对
+   search，list 是纯枚举，`modality=None` 语义上不矛盾）。
+3. **[minor] recall_at_k 恒等、delete_verify 的 vec0 用例无区分力** — 部分采纳。
+   `vector_bench.py` 把 `recall_at_k<1.0`（对精确后端）变成硬断言，脚本会
+   `SystemExit(1)`，是真正的结果集一致性回归检查。`delete_verify.py` 的 vec0
+   用例：实测发现 vec0 的 DELETE 在应用层已经零化向量槽位、不依赖 secure_delete
+   （直接探测 `vecs_vector_chunks00` 影子表验证），"secure_delete 开关"这个维度
+   对 vec0 天然没有区分力，不是测试设计问题；已改为在真正有区分力的维度（WAL +
+   是否 checkpoint）上给 vec0 用例区分力（一条 LEAK、一条 SCRUBBED）。**未按字面
+   做出"secure_delete=OFF 时 vec0 应 LEAK"这条用例**，因为实测证明这个前提是假的，
+   强行做会是一条已知错误的断言——这一点记在分支报告的 open 小节。
+4. **[minor] §5.1 内存基线数字自相矛盾（0.65GB vs 0.61GB）；pyarrow 零拷贝未验证**
+   — 采纳。§5.1 改成统一的二进制 MiB 口径：653148160 字节 = 622.9MiB（与 §4 表
+   一致），构成拆解为 base 293.0MiB + copy 293.0MiB + 解释器开销 ~37MiB，不再是
+   两个对不上的数字。pyarrow 零拷贝改动本轮重新尝试联网验证（先试完整 lancedb、
+   超时后改试单独的 pyarrow 包），`nettop` 证据显示网络仍然降速（约 4 分钟仅
+   收到 ~9.6MB/95MB，`rx_ooo`≈240 万包），未能在预算内拿到新的 `insert_s` 数字。
+   按裁定的"标注未验证"分支处理：代码保留（它修的是一个独立于计时结果的测量
+   方法论 bug），但明确标注这个改进的幅度本轮仍未验证，不冒充已验证。
+5. **bench 脚本目录归属确认** — 已确认，无需改代码。只读检查了 `daemon/` 目录
+   owner（`w1/0-foundation` 分支）的 `daemon/pyproject.toml`：打包目标是
+   `packages = ["src/jones_daemon"]`（不含 `daemon/spikes/`），pytest
+   `testpaths = ["tests"]`（不含 `daemon/spikes/`）。`daemon/spikes/` 下两个脚本
+   位置不动。
+
+### 相关测试
+
+- `uv run --with ruff ruff check daemon/spikes/` — 通过。
+- `uv run --python 3.12 --with numpy --with sqlite-vec daemon/spikes/delete_verify.py` — 通过（exit 0），11 条用例全部符合预期。
+- `uv run --python 3.12 --with numpy daemon/spikes/vector_bench.py --backends numpy-brute,sqlite-blob,sqlite-persist --n 100000 --dim 768 --n-queries 30` — 通过，一致性断言未触发。
+- `uv run --python 3.12 --with numpy --with sqlite-vec daemon/spikes/vector_bench.py --backends sqlite-vec --n 100000 --dim 768 --n-queries 30` — 通过，recall_at_k=1.0，p50 39.7ms / p95 41.3ms，与上一版同量级。
