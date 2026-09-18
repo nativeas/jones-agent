@@ -310,7 +310,12 @@ def bench_lancedb(
 
     t0 = time.perf_counter()
     # 零拷贝构造 FixedSizeList，而不是 list(base)（后者会先把 base 拆成 n 个独立的
-    # numpy 标量数组对象，这段 Python 对象转换开销此前被错误计入插入耗时，见评审 #9）
+    # numpy 标量数组对象，这段 Python 对象转换开销此前被错误计入插入耗时，见评审 #9）。
+    # 【未验证】这处改动本身没有在网络条件恢复后重新跑过 insert_s 数字来确认改进
+    # 幅度（评审第二轮 #4/第三轮修复记录）——它修的是一个独立于计时结果的测量
+    # 方法论 bug（零拷贝构造本身是 pyarrow 文档记录的标准写法），逻辑成立与否不
+    # 依赖跑没跑出新数字，但改进幅度这个具体数字目前仍是未验证状态，不要当作
+    # 已确认的性能结论引用。
     vector_array = pa.FixedSizeListArray.from_arrays(pa.array(base.reshape(-1)), dim)
     table = db.create_table(
         "vecs",

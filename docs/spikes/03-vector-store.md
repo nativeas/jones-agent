@@ -75,8 +75,8 @@ LanceDB / Chroma：本次修复重新尝试联网安装（评审前一版因带�
 
 ```
  653148160  maximum resident set size   # numpy-brute ≈ 622.9 MB（与 §4 表一致，不是 0.65GB——653148160 字节按二进制单位是 622.9 MiB / 0.608 GiB，上一版把十进制字节数直接读成"0.65 GB"是单位换算错误；构成：base 数组 100000×768×4B ≈ 293.0MiB + bench_numpy_brute 里 `matrix = base.copy()` 的第二份拷贝 ≈ 293.0MiB，合计 586.0MiB，其余约 37MiB 是 Python/numpy 解释器自身常驻开销——上一版说"0.61GB 是 base 数组 + copy"也是错的，base+copy 只有 0.57GB）
- 658522112  maximum resident set size   # sqlite-vec  ≈ 0.66 GB（几乎不比基线高）
- 657768448  maximum resident set size   # sqlite-persist ≈ 0.66 GB（单次查询峰值不高，但见下）
+ 658522112  maximum resident set size   # sqlite-vec  ≈ 628.1 MiB（与 §4 表一致，几乎不比基线高；不用 0.66GB 这个十进制口径）
+ 657768448  maximum resident set size   # sqlite-persist ≈ 627.4 MiB（单次查询峰值不高，但见下；单位口径同上）
 ```
 
 `sqlite-blob` 单次查询的瞬时内存峰值比基线高出约 **1.1–1.2 GB**（10 万条 × 3072 字节 BLOB 的 `fetchall()` 元组/字节对象 + `b"".join` 的第二份连续拷贝 + `frombuffer` 的第三份视图），发生在**常驻 daemon 进程**里。这直接撞上 PRD 11.2 的两条硬上限：「守护进程常驻内存（空闲）≤150MB」「全部合计（空闲）≤500MB」——即便这个峰值只在检索的瞬间出现，一次检索就能把 daemon 进程的内存占用顶到那两个上限的 3.5～12 倍，且随记忆量线性变差（O(N)）。**§6 上一版推荐 `sqlite-blob` 是自相矛盾的**：本节（§5）已经用"不常驻大对象"的原则论证 `sqlite-vec` 更优，上一版 §6 却推荐了被这条原则否定的方案。
@@ -181,10 +181,11 @@ class VectorStore(Protocol):
         ...
 
     def delete(self, id: str) -> None:
-        """真删——契约定义（评审第二轮裁定，对应 PRD 10.4）：**真删 = SQLite 行 +
-        payload 文件 + 向量分片一起删**。磁盘级残留（页面/WAL frame 里的原始字节
-        还能被读出来）由下面两条一起满足，不要求"文件系统底层扇区被物理擦除"
-        （那是操作系统/磁盘层的事，任何用户态数据库都做不到，也不是 PRD 10.4 的定义）：
+        """真删——契约定义（评审第二轮裁定，对应 PRD 10.4；busy 重试部分为控制者
+        第三轮裁定）：**真删 = SQLite 行 + payload 文件 + 向量分片一起删**。
+        磁盘级残留（页面/WAL frame 里的原始字节还能被读出来）由下面三条一起
+        满足，不要求"文件系统底层扇区被物理擦除"（那是操作系统/磁盘层的事，
+        任何用户态数据库都做不到，也不是 PRD 10.4 的定义）：
 
         1. 打开连接时执行 `PRAGMA secure_delete=ON`——让 DELETE 就地把被删内容覆写
            为 0，代价只摊在被删的页上（不像 VACUUM 要重写整个文件，不适合作为高频
@@ -196,16 +197,44 @@ class VectorStore(Protocol):
            -wal 文件截断到 0 字节，才会物理清除那些旧 frame。只做 1 不做 2，
            在一个长驻连接的 daemon 进程里，删除后到下次自然 checkpoint 之间的
            窗口期，-wal 文件上仍能读到被删向量的原始字节。
+        3. **checkpoint 可能因为 SQLITE_BUSY 而不完整，必须检查返回值、有限重试、
+           仍失败则向上抛异常**：`PRAGMA wal_checkpoint(TRUNCATE)` 不保证总能
+           成功——如果 daemon 进程里同时有其它连接持有会挡住 TRUNCATE 的读事务/锁
+           （比如另一个正在做检索的请求），它会返回 `(busy, log, checkpointed)`
+           三元组里 `busy!=0`，且*不会自动重试、不会抛异常*——只做 1、2 两条而不
+           检查这个返回值，会在并发场景下悄悄留下 -wal 残留而不自知。实现必须：
+             (i) 检查返回三元组的 busy 位；
+             (ii) busy 时按指数退避有限重试（参考实现：最多 5 次，每次等待翻倍，
+                  封顶 1 秒——`daemon/spikes/delete_verify.py` 的
+                  `checkpoint_truncate_or_raise()`）；
+             (iii) 重试用尽仍然 busy，**向上抛出异常**（不吞、不静默返回）——
+                  调用方（未来的记忆模块）负责捕获这个异常，把该 Project 标记
+                  为"待清理"，在下次空闲时重试 checkpoint，而不是假装这次
+                  delete 已经做到真删。
 
-        两条都做到才是真删；只做其中一条都不够——`daemon/spikes/delete_verify.py`
-        用真实文件字节检查（不是理论推导）验证了这个矩阵，对 sqlite-blob 和 vec0
-        两种存储各测了"两条都做/只做一条/都不做"的组合：
+        三条都做到才是真删；少做任何一条都不够——`daemon/spikes/delete_verify.py`
+        用真实文件字节检查（不是理论推导）验证了 1/2 两条的矩阵，并单独验证了
+        第 3 条（用第二个连接开一个不提交的读事务人为制造 busy，见下）：
           - sqlite-blob：只开 secure_delete 不 checkpoint → -wal 残留；只 checkpoint
             不开 secure_delete → 合并进主库的页仍残留；两条都做 → 真删。
           - sqlite-vec (vec0)：DELETE 在应用层已经把被删行的向量槽位覆写为 0（不依赖
             secure_delete PRAGMA，实测验证见该脚本"非 WAL"用例），所以 vec0 只需要
             checkpoint(TRUNCATE) 就够真删；但 secure_delete=ON 仍然按统一实现要求打开
-            （对 `_meta`/`_collections` 等普通表有效，不是无用功）。
+            （对 `_meta`/`_collections` 等普通表有效，不是无用功）。**证据边界（评审
+            第三轮 #5）**：这条"vec0 只需 checkpoint"的结论只在单个 vec0 chunk
+            （499 行，未跨 chunk 边界，见该脚本 `check_vec0`/`check_vec0_wal`）下
+            验证过；vec0 的向量数据实际存在 `vecs_vector_chunks00` 这类按 chunk
+            分片的影子表里，多 chunk、chunk 边界附近的删除是否仍然只需
+            checkpoint（不需要 secure_delete）**没有测过，是外推，不是断言**——
+            如果后续在多 chunk 规模（比如 10 万条实际落地规模）下复现，应该
+            重新验证这一条，不能直接照搬单 chunk 的结论。
+          - checkpoint busy → 重试 → 抛异常（第 3 条）：`checkpoint_truncate_or_raise()`
+            在人为制造的 busy 场景下确实抛出 `CheckpointBusyError`，无阻塞时一次
+            成功不抛异常（两条用例都通过，见该脚本 `check_checkpoint_busy_raises()`
+            / `check_checkpoint_succeeds_without_blocker()`）。**没测的是**这个
+            busy 状态在真实 daemon 里出现的频率、以及退避重试本身对写入路径延迟
+            的额外开销——本轮只锁死"会不会被静默吞掉"这个正确性问题，不是性能
+            问题。
         实测方法与逐条数字见该脚本注释与运行输出（`uv run --python 3.12 --with numpy
         --with sqlite-vec daemon/spikes/delete_verify.py`）。"""
         ...
@@ -237,7 +266,8 @@ class VectorStore(Protocol):
 ```
 <shard-dir>/                 # <项目目录>/.jones/memory/ 或 ~/.jones/memory/global/
 └── vectors.db                # 唯一文件；WAL 模式，PRAGMA secure_delete=ON；
-                               # delete() 提交后执行 wal_checkpoint(TRUNCATE)（真删契约，见 delete()）
+                               # delete() 提交后执行 wal_checkpoint(TRUNCATE) 并检查 busy
+                               # 位，busy 时有限重试、仍失败则抛异常（真删契约，见 delete()）
     ├── vecs_text (vec0)      # 按 modality 惰性建表
     ├── vecs_image (vec0)
     ├── vecs_audio (vec0)
@@ -328,3 +358,32 @@ class VectorStore(Protocol):
 - `uv run --python 3.12 --with numpy --with sqlite-vec daemon/spikes/delete_verify.py` — 通过（exit 0），11 条用例全部符合预期。
 - `uv run --python 3.12 --with numpy daemon/spikes/vector_bench.py --backends numpy-brute,sqlite-blob,sqlite-persist --n 100000 --dim 768 --n-queries 30` — 通过，一致性断言未触发。
 - `uv run --python 3.12 --with numpy --with sqlite-vec daemon/spikes/vector_bench.py --backends sqlite-vec --n 100000 --dim 768 --n-queries 30` — 通过，recall_at_k=1.0，p50 39.7ms / p95 41.3ms，与上一版同量级。
+
+---
+
+## 第三轮修复记录（评审后）
+
+控制者裁定 5 条意见（1 条 important、4 条 minor）的处理结果（详细过程与证据在分支报告文件末尾的同构小节）：
+
+1. **[important] wal_checkpoint(TRUNCATE) 遇 SQLITE_BUSY 被当成必然成功，静默留残留** — 采纳。§8 `delete()` 契约由两条改为三条：新增第 3 条——检查 `PRAGMA wal_checkpoint(TRUNCATE)` 返回三元组的 busy 位，busy 时指数退避有限重试（最多 5 次，封顶 1 秒），仍失败**向上抛异常**（不吞），调用方负责把 Project 标记「待清理」、下次空闲重试。`daemon/spikes/delete_verify.py` 新增 `checkpoint_truncate_or_raise()`（参考实现）与两条用例：一条用第二个连接开不提交的读事务人为制造 busy，断言抛出 `CheckpointBusyError`；一条验证无阻塞时一次成功、不抛异常（对照组，证明"抛异常"确实是 busy 触发的）。13 条用例全部通过。
+2. **[minor] WAL 用例读 -wal 字节只打印不断言** — 采纳，但过程中发现按原计划"直接拿 wal_scrubbed 和 expect_scrubbed 比"是错的：第 2 条 WAL 用例（blob + secure_delete=OFF + checkpoint）的 `wal_scrubbed` 应该是 `True`（TRUNCATE 已经把 -wal 截空）而 `scrubbed_overall` 是 `False`（残留搬进了主库文件里）——两个字段在这条用例上**本来就不该相等**。改为给每条 WAL 用例配一对独立的期望值（`expect_scrubbed` / `expect_wal_scrubbed`），照实测行为逐条推导，而不是简化成同一个值。这个过程本身就是"加断言"的价值所在：真按原计划粗暴断言，会把一个正确的实现误判成失败。
+3. **[minor] §5.1 单位口径剩余两行未统一** — 采纳。sqlite-vec/sqlite-persist 那两行的独立进程 RSS 从"≈0.66 GB"（十进制、与上一轮修的 numpy-brute 那行口径不一致）改成"628.1 MiB / 627.4 MiB"，与 §4 表格及 numpy-brute 那行统一用二进制 MiB。
+4. **[minor] pyarrow 零拷贝改动未在代码里标"未验证"** — 采纳。`vector_bench.py` 的 `bench_lancedb` 里，`pa.FixedSizeListArray.from_arrays(...)` 那行上方新增【未验证】注释：说明这处改动本身没有跑出新的 `insert_s` 数字来确认改进幅度（网络原因，同 §5.3），逻辑成立与否不依赖计时结果，但改进幅度这个数字目前是未验证状态，避免读代码的人误当作已确认的性能结论。
+5. **[minor] vec0"只需 checkpoint 即真删"外推未标注证据边界** — 采纳。§8 `delete()` docstring 补了一段"证据边界"说明：这条结论只在单个 vec0 chunk（499 行，未跨 chunk 边界）下验证过；vec0 的向量数据实际按 chunk 存在独立的影子表里，多 chunk/chunk 边界场景没测过，是外推不是断言，未来在真实规模（10 万条，会跨多个 chunk）下应该重新验证。没有把这条改成更强的断言。
+
+### 改没改前提
+
+5 条都是结构性改动（delete() 契约、测试期望值的推导方式、单位口径、代码注释、文档措辞），没有打补丁。第 2 条尤其是一次"按原计划做会做错"的例子：不是简单加一行 assert，而是先跑出真实数据、发现两个字段不该总相等，再据实测重新设计期望值——这也是评审要求"加断言"的本意（让测试真的验证东西，不是让它随便通过）。
+
+### 跑了什么测试
+
+- `uv run --with ruff ruff check daemon/spikes/` — 通过。
+- `uv run --python 3.12 --with numpy --with sqlite-vec daemon/spikes/delete_verify.py` — 通过（exit 0），13 条用例（5 非 WAL + 6 WAL，含逐条 wal_scrubbed 断言 + 2 条 checkpoint busy 用例）全部符合预期。
+- `uv run --python 3.12 --with numpy daemon/spikes/vector_bench.py --backends numpy-brute,sqlite-blob,sqlite-persist --n 100000 --dim 768 --n-queries 30` — 通过，recall_at_k 均 1.0。
+- `uv run --python 3.12 --with numpy --with sqlite-vec daemon/spikes/vector_bench.py --backends sqlite-vec --n 100000 --dim 768 --n-queries 30` — 通过，recall_at_k=1.0。
+
+### open（未能验证或留给后续，未静默略过）
+
+- checkpoint busy 在真实 daemon 里出现的频率、以及退避重试本身对写入路径延迟的额外开销——本轮只锁死"会不会被静默吞掉"这个正确性问题，性能数字留给实现记忆功能的 Issue。
+- vec0"只需 checkpoint"结论的多 chunk 场景未验证（见第 5 条），10 万条实际规模下应重新跑一遍 `delete_verify.py` 的 vec0 用例确认结论不变。
+- LanceDB/Chroma 运行时数字、pyarrow 零拷贝改动的新 `insert_s` 数字——本轮未重新尝试联网（不在本轮裁定范围内），沿用上一轮"未测得"标注。

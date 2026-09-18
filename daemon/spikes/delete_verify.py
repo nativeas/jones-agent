@@ -30,10 +30,21 @@
     做检查（不只是整体扫描 workdir），并且验证"checkpoint 后 -wal 不含残留"这个
     具体断言。
 
+4. **checkpoint 遇到 SQLITE_BUSY 不能静默留残留（评审第三轮裁定，本轮新增）**：
+   `wal_checkpoint(TRUNCATE)` 需要没有其它连接持有会挡住它的读事务/锁；如果
+   daemon 进程里同时有别的连接正在读，TRUNCATE 会做不完整（返回的三元组
+   `(busy, log, checkpointed)` 里 `busy!=0`），且不会自动重试或报错——调用方
+   如果对这个返回值毫无处理，就会在 -wal 里留下残留而不自知。`checkpoint_
+   truncate_or_raise()` 把这个返回值当成契约的一部分：busy 时按指数退避有限
+   重试，仍然 busy 就抛 `CheckpointBusyError`（不吞），调用方（未来的记忆模块）
+   负责把该 Project 标记为"待清理"、下次空闲重试。本脚本用第二个连接开一个
+   不提交的读事务人为制造 busy，验证这条路径真的抛异常而不是静默通过。
+
 结论写进 docs/spikes/03-vector-store.md §8：VectorStore 的 delete() 实现必须
-（a）建连接时执行 `PRAGMA secure_delete=ON`，且（b）每次 DELETE 提交后执行
-`PRAGMA wal_checkpoint(TRUNCATE)`——两者缺一都会在 WAL 模式下留下残留（本脚本
-用例逐一验证了缺哪一个会导致残留）。
+（a）建连接时执行 `PRAGMA secure_delete=ON`，（b）每次 DELETE 提交后执行
+`PRAGMA wal_checkpoint(TRUNCATE)` 且检查返回三元组的 busy 位，busy 时有限
+重试、仍失败则向上抛异常——三者缺一都会在 WAL 模式或高并发场景下留下残留或
+静默失败（本脚本用例逐一验证了缺哪一个会导致什么后果）。
 
 用法：
   uv run --python 3.12 --with numpy --with sqlite-vec daemon/spikes/delete_verify.py
@@ -44,6 +55,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 
 DIM = 768
@@ -66,6 +78,42 @@ def _scrubbed(workdir: Path, needle: bytes) -> bool:
 def _wal_path(workdir: Path) -> Path | None:
     matches = list(workdir.glob("*-wal"))
     return matches[0] if matches else None
+
+
+class CheckpointBusyError(RuntimeError):
+    """`wal_checkpoint(TRUNCATE)` 在有限重试后仍处于 busy 状态（PRAGMA 返回三元组
+    `(busy, log, checkpointed)` 的 busy 位非 0）——delete() 契约要求把这个状态
+    向上抛出，不静默吞掉。调用方（未来的记忆模块）负责把该 Project 标记为
+    "待清理"，在下次空闲时重试 wal_checkpoint(TRUNCATE)（控制者裁定，见
+    docs/spikes/03-vector-store.md §8 delete() docstring）。"""
+
+
+def checkpoint_truncate_or_raise(
+    con: sqlite3.Connection,
+    *,
+    max_retries: int = 5,
+    max_backoff_s: float = 1.0,
+) -> None:
+    """delete() 提交后调用：执行 `PRAGMA wal_checkpoint(TRUNCATE)`，检查返回的
+    `(busy, log, checkpointed)` 三元组里的 busy 位。busy!=0 表示有其它连接的
+    读事务/锁挡住了 TRUNCATE（SQLite 行本身已经在 DELETE 里删了，只是 -wal 的
+    磁盘级清理这一步暂时做不到）——按指数退避重试最多 `max_retries` 次（每次
+    等待翻倍，封顶 `max_backoff_s` 秒），仍然 busy 就抛出 `CheckpointBusyError`，
+    不静默返回：调用方必须处理（标记 Project 待清理 + 下次空闲重试），不能假装
+    真删已经完成。"""
+    busy = log = checkpointed = None
+    delay = 0.0
+    for _ in range(max_retries):
+        if delay:
+            time.sleep(delay)
+        busy, log, checkpointed = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if not busy:
+            return
+        delay = min(max_backoff_s, (delay or 0.01) * 2)
+    raise CheckpointBusyError(
+        f"wal_checkpoint(TRUNCATE) 重试 {max_retries} 次后仍 busy "
+        f"(busy={busy}, log={log}, checkpointed={checkpointed})"
+    )
 
 
 def _wal_scrubbed(workdir: Path, needle: bytes) -> bool:
@@ -200,6 +248,67 @@ def check_vec0_wal(*, secure_delete: bool, checkpoint_truncate: bool) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# checkpoint busy → 重试 → 抛异常（评审第三轮裁定）：单独验证
+# checkpoint_truncate_or_raise() 本身的契约，不是 WAL 残留矩阵的一部分。
+# ---------------------------------------------------------------------------
+def check_checkpoint_busy_raises() -> bool:
+    """用第二个连接开一个不提交的读事务，人为制造 `wal_checkpoint(TRUNCATE)`
+    的 busy 状态（读事务挡住 TRUNCATE 需要的排它访问），验证
+    `checkpoint_truncate_or_raise()` 确实在有限重试后抛出 `CheckpointBusyError`，
+    而不是静默返回、留下残留却不报错。"""
+    d = Path(tempfile.mkdtemp())
+    con = sqlite3.connect(d / "t.db")
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA secure_delete=ON")
+    con.execute("CREATE TABLE vecs (id INTEGER PRIMARY KEY, v BLOB NOT NULL)")
+    con.execute("INSERT INTO vecs (id, v) VALUES (1, ?)", (_marker(),))
+    for i in range(2, 200):
+        con.execute("INSERT INTO vecs (id, v) VALUES (?, ?)", (i, os.urandom(3072)))
+    con.commit()
+    con.execute("DELETE FROM vecs WHERE id=1")
+    con.commit()
+
+    reader = sqlite3.connect(d / "t.db")
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM vecs").fetchone()  # 持有读事务，挡住 TRUNCATE
+
+    raised = False
+    try:
+        checkpoint_truncate_or_raise(con, max_retries=3, max_backoff_s=0.1)
+    except CheckpointBusyError:
+        raised = True
+    finally:
+        reader.commit()
+        reader.close()
+        con.close()
+    return raised
+
+
+def check_checkpoint_succeeds_without_blocker() -> bool:
+    """对照用例：没有其它连接挡着时，`checkpoint_truncate_or_raise()` 应该一次
+    成功、不抛异常——证明上一条用例的"抛异常"确实是 busy 触发的，不是函数本身
+    坏了、逢查就抛。"""
+    d = Path(tempfile.mkdtemp())
+    con = sqlite3.connect(d / "t.db")
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA secure_delete=ON")
+    con.execute("CREATE TABLE vecs (id INTEGER PRIMARY KEY, v BLOB NOT NULL)")
+    con.execute("INSERT INTO vecs (id, v) VALUES (1, ?)", (_marker(),))
+    con.commit()
+    con.execute("DELETE FROM vecs WHERE id=1")
+    con.commit()
+    ok = False
+    try:
+        checkpoint_truncate_or_raise(con, max_retries=3, max_backoff_s=0.1)
+        ok = True
+    except CheckpointBusyError:
+        ok = False
+    finally:
+        con.close()
+    return ok
+
+
 def main() -> None:
     failed = False
 
@@ -226,25 +335,36 @@ def main() -> None:
 
     # --- WAL 用例（新增，评审第二轮 #1）：三选一组合，验证"checkpoint(TRUNCATE) +
     # secure_delete 两者都要"这个契约，对 blob 和 vec0 各测一遍。 ---
+    # 每条用例现在带两个独立的期望值：expect_scrubbed（整体 workdir 扫描，含主库
+    # 文件）和 expect_wal_scrubbed（只看 -wal 文件本身的字节）。两者**不总是相等**
+    # ——第 2 条（blob + secure_delete=OFF + checkpoint）就是反例：checkpoint(TRUNCATE)
+    # 会把 -wal 截空（wal_scrubbed=True），但它搬进主库文件的那一页没有被
+    # secure_delete 零化，marker 字节留在主库文件里（scrubbed_overall=False）。
+    # 之前的版本只打印 wal_scrubbed、不断言，这个反例被悄悄放过了；现在两个字段
+    # 都按各自的期望值断言。
     wal_cases = [
         (
             "sqlite-blob WAL + secure_delete=ON + 不 checkpoint",
             lambda: check_blob_wal(secure_delete=True, checkpoint_truncate=False),
-            False,  # 预期残留：WAL 是 append-only，不 checkpoint 就抹不掉旧 frame
+            False,  # 预期整体残留：WAL 是 append-only，不 checkpoint 就抹不掉旧 frame
+            False,  # -wal 本身也残留：secure_delete 的零化写入只是追加新 frame，不动旧 frame
         ),
         (
             "sqlite-blob WAL + secure_delete=OFF + checkpoint(TRUNCATE)",
             lambda: check_blob_wal(secure_delete=False, checkpoint_truncate=True),
-            False,  # 预期残留：checkpoint 只搬运/截断 WAL，不负责零化合并进主库的页
+            False,  # 预期整体残留：checkpoint 只搬运/截断 WAL，不负责零化合并进主库的页
+            True,  # 但 -wal 本身是干净的——TRUNCATE 已经把它截到 0 字节，残留搬进了主库文件
         ),
         (
             "sqlite-blob WAL + secure_delete=ON + checkpoint(TRUNCATE)  [推荐配置]",
             lambda: check_blob_wal(secure_delete=True, checkpoint_truncate=True),
             True,  # 两者都要才真删
+            True,
         ),
         (
             "sqlite-vec (vec0) WAL + secure_delete=ON + 不 checkpoint",
             lambda: check_vec0_wal(secure_delete=True, checkpoint_truncate=False),
+            False,
             False,
         ),
         (
@@ -253,30 +373,55 @@ def main() -> None:
             # 零化"合并进主库的页"这一步；所以对 vec0 来说 checkpoint(TRUNCATE) 单独
             # 就够用，secure_delete=OFF 不影响结果——这条预期是 SCRUBBED，不是残留。
             # （实测过程中先假设"两者都要"套用了 blob 的结论，实测发现对 vec0 不成立，
-            # 已按实测改期望值，不是把测试改到凑预期。）
+            # 已按实测改期望值，不是把测试改到凑预期。这条结论目前只在单个 vec0
+            # chunk（499 行，未跨 chunk 边界）下验证过，见 §8/文末"证据边界"说明。）
             "sqlite-vec (vec0) WAL + secure_delete=OFF + checkpoint(TRUNCATE)",
             lambda: check_vec0_wal(secure_delete=False, checkpoint_truncate=True),
+            True,
             True,
         ),
         (
             "sqlite-vec (vec0) WAL + secure_delete=ON + checkpoint(TRUNCATE)  [推荐配置]",
             lambda: check_vec0_wal(secure_delete=True, checkpoint_truncate=True),
             True,
+            True,
         ),
     ]
-    for label, fn, expect_scrubbed in wal_cases:
+    for label, fn, expect_scrubbed, expect_wal_scrubbed in wal_cases:
         result = fn()
         scrubbed = result["scrubbed_overall"]
+        wal_scrubbed = result["wal_scrubbed"]
         status = "SCRUBBED (真删)" if scrubbed else "残留 (LEAK)"
         note = ""
-        if scrubbed != expect_scrubbed:
+        if scrubbed != expect_scrubbed or wal_scrubbed != expect_wal_scrubbed:
             note = "  <-- 与预期不符！"
             failed = True
         print(
             f"{label}: {status}  "
-            f"(连接关闭前 wal_scrubbed={result['wal_scrubbed']}, "
+            f"(连接关闭前 wal_scrubbed={wal_scrubbed}, "
             f"连接关闭后 scrubbed={result['scrubbed_after_close']}){note}"
         )
+
+    # --- checkpoint busy → 重试 → 抛异常（评审第三轮裁定）---
+    busy_cases = [
+        (
+            "wal_checkpoint(TRUNCATE) 被其它连接的读事务挡住 → 有限重试后抛 CheckpointBusyError",
+            check_checkpoint_busy_raises,
+            True,
+        ),
+        (
+            "wal_checkpoint(TRUNCATE) 无阻塞 → 一次成功、不抛异常",
+            check_checkpoint_succeeds_without_blocker,
+            True,
+        ),
+    ]
+    for label, fn, expect_ok in busy_cases:
+        ok = fn()
+        note = ""
+        if ok != expect_ok:
+            note = "  <-- 与预期不符！"
+            failed = True
+        print(f"{label}: {'符合预期' if ok == expect_ok else '不符合预期'}{note}")
 
     if failed:
         raise SystemExit(1)
