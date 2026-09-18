@@ -61,7 +61,6 @@ SECURE_URL = "https://the-internet.herokuapp.com/secure"
 USERNAME = "tomsmith"
 PASSWORD = "SuperSecretPassword!"
 
-LOCAL_SERVER_PORT = 8899
 LOCAL_COOKIE_NAME = "session_probe"
 
 
@@ -336,11 +335,14 @@ class _LocalLoginHandler(http.server.BaseHTTPRequestHandler):
 
 @contextlib.contextmanager
 def _local_login_server():
-    srv = http.server.HTTPServer(("127.0.0.1", LOCAL_SERVER_PORT), _LocalLoginHandler)
+    # 评审第二轮 #4：端口 0 让系统分配随机空闲端口，而不是硬编码 8899——避免
+    # 本机恰好有别的进程占着 8899 时探针莫名其妙绑定失败或连错服务。
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _LocalLoginHandler)
+    port = srv.server_address[1]
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     try:
-        yield f"http://127.0.0.1:{LOCAL_SERVER_PORT}"
+        yield f"http://127.0.0.1:{port}"
     finally:
         srv.shutdown()
         t.join(timeout=5)
@@ -364,60 +366,90 @@ def _run_copy_scenario(chrome: str, work: str, label: str, login_url: str, secur
     print(f"-- 场景: {label} (cookie={cookie_name}) --")
     prof = os.path.join(work, f"copy_src_{cookie_name}")
     os.makedirs(prof, exist_ok=True)
-
-    with sync_playwright() as pw:
-        ctx = _launch_ctx(pw, chrome, prof)
-        page = ctx.new_page()
-        page.goto(login_url, wait_until="load")
-        if "the-internet" in login_url:
-            page.fill("#username", USERNAME)
-            page.fill("#password", PASSWORD)
-            page.click("button[type=submit]")
-            page.wait_for_selector("#flash", timeout=5000)
-        print(f"  已在源 profile 登录（{label}）。")
-
-        live_copy = os.path.join(work, f"copy_live_{cookie_name}")
-        shutil.rmtree(live_copy, ignore_errors=True)
-        errors = []
-        try:
-            shutil.copytree(prof, live_copy)
-        except shutil.Error as e:
-            errors = e.args[0]
-        found, has_exp, persistent = _inspect_cookie(
-            os.path.join(live_copy, "Default", "Cookies"), cookie_name
-        )
-        print(f"  [运行中复制] copytree 报错条目数={len(errors)}（socket/lock 类特殊文件必然报错）")
-        print(f"  [运行中复制] 复制出的库里能读到 {cookie_name}: {found} has_expires={has_exp} is_persistent={persistent}")
-
-        ctx.close()  # 正常退出
-
-    # 对照组：不复制，直接用同一个 profile 重启，隔离「重启本身」造成的丢失
-    with sync_playwright() as pw:
-        ctx = _launch_ctx(pw, chrome, prof)
-        page = ctx.new_page()
-        page.goto(secure_url, wait_until="load")
-        landed = page.url
-        print(f"  [重启同一 profile / 不复制的对照组] 直接重启后访问受保护页落地 URL = {landed}")
-        page.close()
-        ctx.close()
-
     clean_copy = os.path.join(work, f"copy_after_quit_{cookie_name}")
-    shutil.rmtree(clean_copy, ignore_errors=True)
-    shutil.copytree(prof, clean_copy)
-    found, has_exp, persistent = _inspect_cookie(
-        os.path.join(clean_copy, "Default", "Cookies"), cookie_name
-    )
-    print(f"  [退出后复制] 复制出的库里 {cookie_name} 行是否还在: found={found} has_expires={has_exp} is_persistent={persistent}")
 
-    with sync_playwright() as pw:
-        ctx = _launch_ctx(pw, chrome, clean_copy)
-        page = ctx.new_page()
-        page.goto(secure_url, wait_until="load")
-        print(f"  [退出后复制] 用复制出的 profile 打开受保护页，落地 URL = {page.url}")
-        page.close()
-        ctx.close()
+    # 评审第二轮 #4：原来只有函数末尾一句 _kill_by_userdata(prof)，中途（登录校验
+    # 失败、copytree 出错等）抛异常就跳过了它——sync_playwright() 的 __exit__
+    # 只收拢 driver 连接，不保证杀掉已启动的 Chrome 子进程。外层 try/finally
+    # 把两个会各自拉起 Chrome 的 profile 目录（prof、clean_copy）都收进兜底清理，
+    # 不管在哪一步炸的都不漏。
+    try:
+        with sync_playwright() as pw:
+            ctx = _launch_ctx(pw, chrome, prof)
+            try:
+                # 评审第二轮 #3：这里原来无条件 ctx.new_page()——
+                # launch_persistent_context 在非 headless 下会自带一个初始
+                # about:blank tab，再 new_page() 开第二个 tab 去点提交按钮，会
+                # 撞上 step_cdp_attach 里已经实测过的同一个坑（新开的后台 tab
+                # 被节流，表单提交静默失效，复现 100%）。复用已有 tab，和
+                # step_cdp_attach 保持一致。
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                page.goto(login_url, wait_until="load")
+                if "the-internet" in login_url:
+                    page.fill("#username", USERNAME)
+                    page.fill("#password", PASSWORD)
+                    page.click("button[type=submit]")
+                    page.wait_for_selector("#flash", timeout=5000)
+                    flash = page.inner_text("#flash").strip().splitlines()[0]
+                    print(f"  登录表单提交结果: {flash}")
+                # 评审第二轮 #3：原来登录步骤跑完就直接假定成功，从不校验。这里
+                # 统一用「目标 cookie 是否真的出现在 context 里」做登录成功的
+                # 判定依据（对两种场景都适用，比只对 the-internet 分支查 #flash
+                # 文案更通用），登录失败要立刻报错中止，而不是带着一个没登录
+                # 成功的 profile 继续跑后面的复制实验、得出误导性结论（诚实失败）。
+                cookie_names_now = {c["name"] for c in ctx.cookies()}
+                if cookie_name not in cookie_names_now:
+                    raise RuntimeError(
+                        f"登录校验失败：提交/访问登录页后，context 里没有出现预期 "
+                        f"cookie '{cookie_name}'（当前 cookies: {sorted(cookie_names_now)}）"
+                        f"—— 后续复制实验的前提不成立，中止而不是带着假设继续跑。"
+                    )
+                print(f"  已在源 profile 登录（{label}），已校验 cookie '{cookie_name}' 存在。")
 
-    _kill_by_userdata(prof)
+                live_copy = os.path.join(work, f"copy_live_{cookie_name}")
+                shutil.rmtree(live_copy, ignore_errors=True)
+                errors = []
+                try:
+                    shutil.copytree(prof, live_copy)
+                except shutil.Error as e:
+                    errors = e.args[0]
+                found, has_exp, persistent = _inspect_cookie(
+                    os.path.join(live_copy, "Default", "Cookies"), cookie_name
+                )
+                print(f"  [运行中复制] copytree 报错条目数={len(errors)}（socket/lock 类特殊文件必然报错）")
+                print(f"  [运行中复制] 复制出的库里能读到 {cookie_name}: {found} has_expires={has_exp} is_persistent={persistent}")
+            finally:
+                ctx.close()  # 正常退出（或者带着上面的异常继续往外传播前，至少先把这个 context 关掉）
+
+        # 对照组：不复制，直接用同一个 profile 重启，隔离「重启本身」造成的丢失
+        with sync_playwright() as pw:
+            ctx = _launch_ctx(pw, chrome, prof)
+            try:
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                page.goto(secure_url, wait_until="load")
+                landed = page.url
+                print(f"  [重启同一 profile / 不复制的对照组] 直接重启后访问受保护页落地 URL = {landed}")
+            finally:
+                ctx.close()
+
+        shutil.rmtree(clean_copy, ignore_errors=True)
+        shutil.copytree(prof, clean_copy)
+        found, has_exp, persistent = _inspect_cookie(
+            os.path.join(clean_copy, "Default", "Cookies"), cookie_name
+        )
+        print(f"  [退出后复制] 复制出的库里 {cookie_name} 行是否还在: found={found} has_expires={has_exp} is_persistent={persistent}")
+
+        with sync_playwright() as pw:
+            ctx = _launch_ctx(pw, chrome, clean_copy)
+            try:
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                page.goto(secure_url, wait_until="load")
+                print(f"  [退出后复制] 用复制出的 profile 打开受保护页，落地 URL = {page.url}")
+            finally:
+                ctx.close()
+    finally:
+        _kill_by_userdata(prof)
+        _kill_by_userdata(clean_copy)
 
 
 def step_profile_copy(chrome: str) -> None:

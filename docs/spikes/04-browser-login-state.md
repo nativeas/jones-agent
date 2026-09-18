@@ -2,9 +2,19 @@
 
 对应 Issue #4、PRD FR09、13.2 风险 4、12.3 FR09 验收口径。
 
-> 本文件已按评审意见修订（见文末「修复记录」）。FR09 的接口契约草案已移到
-> `docs/design/00-foundation.md` 第 8 节——按 `docs/DEV.md` 目录所有权表，
-> `docs/spikes/` 只承载验证报告，契约的家是 `docs/design/`。
+> 本文件已按评审意见修订（见文末「修复记录」「修复记录·第二轮」）。FR09 的
+> 接口契约草案已移到 `docs/design/00-foundation.md` 第 8 节——按 `docs/DEV.md`
+> 目录所有权表，`docs/spikes/` 只承载验证报告，契约的家是 `docs/design/`。
+>
+> **第二轮修订提醒**：下表「推荐」一栏里 a) CDP attach 的**技术结论**
+> （必须是 Jones 自己拉起、全程不重启的浏览器进程；不能字面接管用户当前
+> Chrome；等等）仍然成立，但**由谁实现这条 CDP 客户端代码**这一点变了——
+> 控制者裁定 v1 不再由 Jones 自研 `browser.*` 工具集，改为复用现成浏览器
+> MCP Server（Playwright MCP）+ 同一个 Jones 专属 profile，理由与实测证据见
+> `docs/design/00-foundation.md` §8。本文件的 (a)/(b)/(c) 三条路径实测结论
+> 全部不受这次变更影响——它们回答的是「Chrome/Edge 在这种用法下会怎么表现」，
+> 跟「这段自动化代码是 Jones 自己写还是复用别人写好的 MCP Server」是两个
+> 独立的问题。
 
 ## 结论先行
 
@@ -14,7 +24,7 @@
 | b) 复制 profile 目录 | **看 cookie 类型而定**——persistent cookie 实测可行；session-only cookie 实测不可行；读真实用户 profile 的系统权限、Keychain 加密解密两点仍未验证（见下「方案 (b) 补充实验」与「Keychain 加密解密」两节） | 高：需要读另一个 App 的私有数据目录 | 中：对持久登录态可靠，对会话态不可靠，且额外依赖两个未验证前提 | v1 不采用（见理由），非「结构性不可行」的一刀切结论 |
 | c) 扩展 + chrome.debugger | **未验证**（本次修复实测过一次，被 Chrome 当前 stable 频道的一个 GUI-only 开关挡住，见下） | 中：需要用户安装扩展、手动开一次开发者模式、容忍常驻调试提示条 | 未知 | v1 不做，记录为需要人工继续跑的 P1+ 待验证项，**不是**「技术可行但成本太高」的定论 |
 
-**推荐方案不变**：Jones 自己维护一个**专属 Chrome/Edge profile**（不是用户日常用的 Default profile），daemon 首次使用浏览器能力时用 `--remote-debugging-port=0`（随机端口）+ 该专属 `--user-data-dir` 冷启动一个 Chromium 进程，此后所有 turn 都对这个**同一个、常驻的**进程做 `connect_over_cdp`；不主动重启它。用户在这个 Jones 专属窗口里登录一次要用到的网站。**但这次修复把 (b) 的结论从「结构性不可行」改成了「对部分登录态可行、但不满足覆盖所有登录场景的可靠性要求」——这是证据支撑的降级，不是文字游戏**：详见下面「方案 (b) 补充实验」。选 (a) 而不是 (b) 的理由也相应从「(b) 做不到」改成了「(a) 对所有登录态类型都均匀有效，(b) 只对一部分有效，且 (b) 还有两个本次没能验证掉的额外前提」。FR09 的接口草案见 `docs/design/00-foundation.md` §8。
+**推荐方案不变（但第二轮起，这段 CDP 客户端代码由谁写变了——见文首提醒与 §8）**：Jones 自己维护一个**专属 Chrome/Edge profile**（不是用户日常用的 Default profile），首次使用浏览器能力时用 `--remote-debugging-port=0`（随机端口，或复用 MCP Server 自带的等价机制）+ 该专属 `--user-data-dir` 冷启动一个 Chromium 进程，此后所有 turn 都对这个**同一个、常驻的**进程反复挂接；不主动重启它。用户在这个 Jones 专属窗口里登录一次要用到的网站。（这一段描述的 CDP attach 机制本身仍然成立，只是第二轮起「谁来拉起这个进程、谁来发 CDP 请求」从「Jones 自研代码」改成了「复用的浏览器 MCP Server」——daemon 变成这个 MCP Server 的调用方，不再自己直接调 Playwright/CDP。）**但这次修复把 (b) 的结论从「结构性不可行」改成了「对部分登录态可行、但不满足覆盖所有登录场景的可靠性要求」——这是证据支撑的降级，不是文字游戏**：详见下面「方案 (b) 补充实验」。选 (a) 而不是 (b) 的理由也相应从「(b) 做不到」改成了「(a) 对所有登录态类型都均匀有效，(b) 只对一部分有效，且 (b) 还有两个本次没能验证掉的额外前提」。FR09 的接口草案见 `docs/design/00-foundation.md` §8。
 
 ## 为什么不是字面意义的「接管用户当前 Chrome」——三个实测事实
 
@@ -59,6 +69,36 @@
 [重启同一 profile / 不复制的对照组] 落地 URL = http://127.0.0.1:8899/secure   <- 直接重启不丢
 [退出后复制] 用复制出的 profile 打开受保护页，落地 URL = http://127.0.0.1:8899/secure  <- 复制也不丢！
 ```
+
+> **第二轮修复重跑（评审 #3）**：原来的登录步骤对本地测试站场景用 `ctx.new_page()`
+> 开新 tab 去登录，且从不校验登录是否真的成功——这正是 `step_cdp_attach` 里已经
+> 实测过、会被后台 tab 节流静默吃掉表单提交的同一个坑（见上「实测通过的部分」一节），
+> 只是这里原来没人踩过所以没暴露。已修：改用复用已有 tab（与 `step_cdp_attach`
+> 一致），并在登录动作后立刻校验目标 cookie 是否真的出现在 context 里，不出现则
+> 直接抛异常中止（不带着一个没登录成功的 profile 继续跑，诚实失败）。重跑
+> `uv run daemon/spikes/browser_probe.py --step copy` 后的真实输出（端口已改随机，
+> 见评审 #4）：
+>
+> ```
+> -- 场景: session-only cookie (the-internet.herokuapp.com) (cookie=rack.session) --
+>   登录表单提交结果: You logged into a secure area!
+>   已在源 profile 登录（session-only cookie (the-internet.herokuapp.com)），已校验 cookie 'rack.session' 存在。
+>   [运行中复制] 复制出的库里能读到 rack.session: False has_expires=-1 is_persistent=-1
+>   [重启同一 profile / 不复制的对照组] 直接重启后访问受保护页落地 URL = https://the-internet.herokuapp.com/login
+>   [退出后复制] 复制出的库里 rack.session 行是否还在: found=True has_expires=0 is_persistent=0
+>   [退出后复制] 用复制出的 profile 打开受保护页，落地 URL = https://the-internet.herokuapp.com/login
+> -- 场景: persistent cookie (本地测试站) (cookie=session_probe) --
+>   已在源 profile 登录（persistent cookie (本地测试站)），已校验 cookie 'session_probe' 存在。
+>   [运行中复制] 复制出的库里能读到 session_probe: False has_expires=-1 is_persistent=-1
+>   [重启同一 profile / 不复制的对照组] 直接重启后访问受保护页落地 URL = http://127.0.0.1:53687/secure
+>   [退出后复制] 复制出的库里 session_probe 行是否还在: found=True has_expires=1 is_persistent=1
+>   [退出后复制] 用复制出的 profile 打开受保护页，落地 URL = http://127.0.0.1:53687/secure
+> ```
+>
+> **重跑后结论不变**：数值和落地 URL 与原输出一致（端口从原来的固定 8899 换成
+> 这次实际分配到的 53687，是随机端口生效的正常表现，不是结果差异）。多出来的
+> 「已校验 cookie ... 存在」「登录表单提交结果」两行是新增的登录成功校验证据，
+> 不是新结论。
 
 **读法**：
 - session-only 场景里，「不复制、只重启」**同样**丢登录态——证明原结论「关浏览器即失效」是 cookie 生命周期的固有属性，不是复制这个动作额外造成的，原来「结构性问题」这个判断对 session-only cookie 是成立的、有公平对照支撑的。
@@ -109,7 +149,7 @@
 ## 验收对照（Issue #4）
 
 - [x] 能访问一个需登录页面并读取内容 —— `browser_probe.py --step attach`，Chrome + Edge 均实测通过（登录页 the-internet.herokuapp.com，非真实用户账号；见上）。
-- [x] 明确支持的 Chrome / Edge 版本范围 —— Chrome 153、Edge 153 均为本机当前 stable 实测；次新大版本本轮尝试但未在会话时间预算内完成（见「版本兼容性」），发布前仍建议补跑一次，标记为待办，**不再勾成「已明确」的已完成态**，如实反映验证覆盖度。
+- [ ] 明确支持的 Chrome / Edge 版本范围 —— Chrome 153、Edge 153 均为本机当前 stable 实测；但「最近两个稳定大版本」这个验收口径要求的次新大版本（Chrome 152.x、Edge 次新版）本轮都没有实测完成（见「版本兼容性」：Chrome 152 下载在时间预算内没跑完，Edge 次新版本身没有可用渠道）。**评审第二轮 #1（诚实）：这条原来打了 [x]，但正文自己写的是「未完全验证覆盖度」——勾选和文字互相矛盾，已改成 [ ]。** 只测过当前 stable 这一个大版本，不满足「明确支持范围」这个验收项要求的完整覆盖，发布前需要补跑（复现命令见「版本兼容性」一节）。
 - [ ] 不可行则 FR09 降 P1 —— **不适用**：CDP attach 路径可行（Chrome + Edge 均实测），FR09 保持 P0；FR09 的表述与 12.3 验收口径已同 PR 更新为「Jones 专属常驻 profile，登录一次后复用」，不再是本文件单方面的语义澄清。
 
 ## 没做 / 已知缺口（本轮更新）
@@ -131,7 +171,7 @@ uv run spikes/browser_probe.py --step attach --chrome "/path/to/Microsoft Edge" 
 uv run spikes/browser_probe.py --step copy      # session-only vs persistent cookie 对照
 ```
 
-需要本机已装 Google Chrome（默认路径 `/Applications/Google Chrome.app/...`，可用 `--chrome` 指定别的路径/Edge）、可联网访问 `the-internet.herokuapp.com`（公开的自动化测试站，非任何真实账号）；`--step copy` 额外会在 `127.0.0.1:8899` 起一个只服务本机的本地测试站（脚本自带，不发外部请求）。脚本自行拉起/清理它起的 Chrome 进程和临时 profile 目录，用 try/finally 保证异常时也不残留（评审 #8），不触碰、不读取用户的真实 Chrome profile。
+需要本机已装 Google Chrome（默认路径 `/Applications/Google Chrome.app/...`，可用 `--chrome` 指定别的路径/Edge）、可联网访问 `the-internet.herokuapp.com`（公开的自动化测试站，非任何真实账号）；`--step copy` 额外会在本机随机端口（评审第二轮 #4：不再硬编码 8899，避免端口被占用时莫名其妙绑定失败）起一个只服务 `127.0.0.1` 的本地测试站（脚本自带，不发外部请求）。脚本自行拉起/清理它起的 Chrome 进程和临时 profile 目录，用 try/finally 保证异常时也不残留（评审 #8；评审第二轮 #4 把 `_run_copy_scenario` 内部也补上了同样的兜底——原来只有函数最外层一处清理，中途登录校验失败等异常会跳过清理），不触碰、不读取用户的真实 Chrome profile。
 
 ## 修复记录（评审后，同分支 `w1/4-spike-browser-login`）
 
@@ -142,7 +182,23 @@ uv run spikes/browser_probe.py --step copy      # session-only vs persistent coo
 3. **[已处理，如实降级]** 版本兼容性验收项零实测却打勾。Edge 153 本轮补了完整实测（含发现并修掉一个真实坑）；Chrome 152 尝试下载但未在时间预算内完成；验收表相应改为未完全勾选，如实反映覆盖度。
 4. **[已处理，结论实质性修订]** 方案 (b) 「结构性不可行」只测了 session-only 场景。本轮加了 persistent cookie 场景（脚本自带本地测试站）与「重启不复制」的公平对照组，实测结果显示 persistent cookie 场景下复制方案实际可行，(b) 的结论已从「结构性不可行」改写为「因 cookie 类型而异，且有两个未验证的额外前提」。
 5. **[已处理]** 推荐给实现者的 `--remote-debugging-port=0` 配置从未跑过、写死 9222。`browser_probe.py` 的 `attach`/`singleton` 两个 step 均已改为 port=0 + 轮询 `DevToolsActivePort`，并实测通过（Chrome + Edge）。
-6. **[已处理]** 未评估复用 MCP 能力。已在 `docs/design/00-foundation.md` §8 补一段取舍论证：权限闸需要卡在「工具调用前」而不是「进程边界」，外部 MCP Server 是黑盒进程没有天然介入点；CDP 进程生命周期需要跟 daemon 自己的子进程收拢机制统一，交给外部 MCP Server 会分裂成两套生命周期。结论不变（v1 自研），但补上了论证。
+6. **[已处理，第二轮已证明这条本身论证错误，见「修复记录·第二轮」#2]** 未评估复用 MCP 能力。~~已在 `docs/design/00-foundation.md` §8 补一段取舍论证：权限闸需要卡在「工具调用前」而不是「进程边界」，外部 MCP Server 是黑盒进程没有天然介入点；CDP 进程生命周期需要跟 daemon 自己的子进程收拢机制统一，交给外部 MCP Server 会分裂成两套生命周期。结论不变（v1 自研），但补上了论证。~~ **这段论证是事实错误**——daemon 本身就是 MCP Server 的调用方，权限闸只要长在 daemon 发起 `tools/call` 之前就天然介入了，不需要额外代理层。保留删除线而不是直接改写，是为了让这个错误判断本身可追溯（原文照抄画删除线，结论见下面第二轮记录，不是本条目自己悄悄改的）。
 7. **[已处理]** 探针硬编码 9222、不校验端点归属。已改为随机端口 + `lsof` 校验监听该端口的确实是本进程拉起的 Chrome，未通过校验会主动中止而不是继续 attach。
 8. **[已处理]** 三个 step 缺 try/finally，异常时泄漏进程和目录。`browser_probe.py` 全部三个会拉起浏览器进程的 step（`singleton`/`attach`/`copy`）已重写为 try/finally 包裹清理逻辑。
 9. **[已处理]** cookie 检查只复制主 DB 文件、丢 -wal，因果结论证据不足。新增 `_copy_sqlite_with_wal`，复制 Cookies 时一并带上 `-wal`/`-shm` 边车文件再读；结合 #4 的 persistent cookie 实验，「is_persistent=0 场景下运行中复制读不到」这一点不再和「有没有复制到 WAL」这个变量混在一起（因为对 persistent cookie 场景应用同一套 WAL-aware 复制后，运行中复制仍然读不到，说明原因确实是数据尚未写入 Chrome 自己的库文件，不是探针的复制漏洞——见「方案 (b) 补充实验」小节最后一段）。
+
+## 修复记录·第二轮（评审后，同分支 `w1/4-spike-browser-login`）
+
+逐条对照第二轮评审意见处理，全部实测验证过，无静默忽略：
+
+1. **[已处理]** 验收项打勾但文字承认未实测。`## 验收对照（Issue #4）` 里「明确支持的 Chrome / Edge 版本范围」一项原来是 `[x]`，但正文自己写的是「次新大版本本轮尝试但未在时间预算内完成」——勾选和文字互相矛盾。已改为 `[ ]` 并在该行内写清楚具体缺口（只测过当前 stable 一个大版本，不满足「最近两个稳定大版本」这个验收口径要求的覆盖度）。
+2. **[已处理，结论反转]** 否决复用 MCP 的核心论证（「权限闸没有天然介入点，除非再插一层代理」）是事实错误：daemon 本身就是 MCP Server 的 `tools/call` 调用方，闸只要长在 daemon 发起这次调用之前就天然介入了。按控制者裁定（工程原则 1：不重写已有能力）重新调研 + 实测：
+   - 实测 `@playwright/mcp@0.0.81` 与 `chrome-devtools-mcp@1.9.0` 两个候选，均能以指定 `--user-data-dir`/`--userDataDir` 启动 Chrome；用一段独立的 MCP stdio 客户端探针（`daemon/spikes/mcp_reuse_probe/`，新增）跑通「登录 → 完整杀掉 MCP server 子进程（不是只断连接）→ 重新起进程 → 免登录读受保护页」，并通过 `tools/call` 完成导航 + 读页。
+   - 关键发现：Playwright MCP 暴露 `browser_close` 工具，调用后立刻把 cookie 落盘（实测：不调用直接杀进程，重启后 cookie 库里是空的；调用后才会出现）；chrome-devtools-mcp 没有等价原语——`close_page` 拒绝关闭最后一个页面，改用 `navigate_page` 导航到 `about:blank` 再杀进程、或开新页面后 `close_page` 关掉登录页，两种路径实测 cookie 均未落盘，只有等 Chromium 内部约 30s 的周期性 flush 才会自发落盘（同样实测确认：sleep 35s 后再杀进程，cookie 在）。这是本轮取舍的决定性证据，不是空对比。
+   - 比较结果（工具粒度、维护活跃度、依赖体积）写入 `docs/design/00-foundation.md` §8.1 的表格；三项大体相当，不构成决定性差异，决定性差异是上面这条 cookie 落盘可控性。
+   - 结论：v1 选型改为 **Playwright MCP + Jones 专属常驻 profile**，Jones 不再自研 `browser.*` 工具集。`docs/design/00-foundation.md` §8 已整段重写（旧的五个自研工具定义、旧的错误论证整段删除）；PRD `docs/PRD.md` FR09 一行（8.1 表）与 12.3 验收口径同 PR 更新，改动限制在语义澄清 + 权限分级口径这两处，没有扩大改动面。
+3. **[已处理，重跑]** `step_profile_copy`（对应 `browser_probe.py` 的 `_run_copy_scenario`）登录步骤原来无条件 `ctx.new_page()`，撞的是和 `step_cdp_attach` 里同一个「新开后台 tab 表单提交被节流吞掉」的坑，且登录后从不校验是否真的成功。已修：复用已有 tab（`ctx.pages[0] if ctx.pages else ctx.new_page()`，三处调用点全改），登录后用「目标 cookie 是否出现在 context 里」做校验，失败则抛异常中止而不是带着假设继续跑。重跑 `uv run daemon/spikes/browser_probe.py --step copy`（以及完整 `--step all`）：**重跑后结论不变**——两种 cookie 场景的数值和落地 URL 与原报告一致，完整新输出见上文「方案 (b) 补充实验」小节内的第二轮重跑区块。
+4. **[已处理]**
+   - 本地测试站端口从硬编码 `8899` 改成 `("127.0.0.1", 0)` 由系统分配随机端口（`_local_login_server`），重跑已验证（上面 #3 的重跑输出里端口是随机分配到的 53687，不是 8899）。
+   - `_run_copy_scenario` 原来只在函数最外层结尾调一次 `_kill_by_userdata(prof)`，中途（登录校验失败、copytree 报错等）抛异常会跳过它，且完全没覆盖它后面额外起的 `clean_copy` 这个 profile。已重写为外层 `try/finally` 统一兜底 `_kill_by_userdata(prof)` 与 `_kill_by_userdata(clean_copy)`，内层三个 `with sync_playwright()` 块各自的 `ctx.close()` 也都包进 `try/finally`，任意一步炸了都不漏清理；重跑 `--step all` 后确认没有残留的 `jones_browser_probe_*` 进程或临时目录（`pgrep`/`ls $TMPDIR` 均为空）。
+   - 本文件（`docs/spikes/04-browser-login-state.md`）与 scratchpad 报告（`spike4-browser-report.md`）已同步更新，不再各自一份互相矛盾的记录。
