@@ -88,9 +88,11 @@ Jones Agent 是一台装在用户自己电脑上、自主运行的通用 AI 工�
 |---|---|
 | Electron Renderer ↔ Electron Main | Electron IPC（contextBridge 白名单） |
 | Electron Main ↔ 运行时守护进程 | 本地 socket（Unix socket / Named pipe），JSON-RPC |
-| 运行时 ↔ 内核 worker | 同为 Python；运行时按会话拉起独立 worker 子进程，stdio 通信，保证会话间隔离、单个 worker 崩溃不拖垮守护进程 |
+| 运行时 ↔ 内核 worker | 同为 Python；运行时按会话拉起独立 worker 子进程，stdio 上跑 Hermes 自带的 ACP（Agent Client Protocol）server（`acp_adapter/`，JSON-RPC 2.0），保证会话间隔离、单个 worker 崩溃不拖垮守护进程；结论见 spike #1（[docs/spikes/01-hermes-hook.md](spikes/01-hermes-hook.md)） |
 | 运行时 ↔ IM 平台 | 各平台官方 SDK / Bot API（长连接或 Webhook） |
 | 内核 ↔ 能力域 | Hermes 原生 tool 协议 + MCP client；Skill 以文件形式加载 |
+
+**Step 级权限拦截（FR05 的落地点，spike #1 结论）**：ACP 的 `session/request_permission` 只挂在 Hermes 自带的“危险 shell 命令”侦测上，覆盖不到任意工具调用。真正的全覆盖拦截点是 Hermes 的 `pre_tool_call` 插件 hook（`hermes_cli.plugins`，在 `agent/agent_runtime_helpers.py::invoke_tool()` 里、任何工具真正执行前同步触发，对 registry 工具和内联工具一视同仁）：worker 启动时加载一个 Jones 自研插件，其 `pre_tool_call` 回调对每次工具调用做出 `block`（工具从不执行，`{"error": message}` 原样进入 agent 的工具结果，agent 收到明确拒绝）/`modify`（改写参数）/放行三选一。规则闸能本地同步决出的（硬性禁止、项目级 `permissions.json` 命中）直接在 worker 内返回，不打一次 IPC；审查闸/用户闸需要人工裁决的，通过 worker 已经开着的 ACP 连接把 daemon 当作 ACP client，发一次标准 `session/request_permission` 等回复——这段等待**不**计入 Hermes 的 `plugins.hook_callback_timeout`（默认 30s，配置项，这 30s 只卡 hook 回调本身，不够人工审批用；实测见 spike #1）。
 
 ### 6.4 存储
 

@@ -58,7 +58,7 @@ Electron main ──(socket client)──> daemon
 
 - 守护进程启动：写 `~/.jones/runtime/daemon.pid` 与 `daemon.sock`；已有活实例则退出（PID + socket 探活）。
 - Electron main 启动：先连 socket；连不上则尝试 `launchctl kickstart`（已安装）或直接 spawn daemon（开发模式），最多重试 3 次后向 renderer 报错（PRD 11.3）。
-- worker：由 daemon 按 Session 拉起，`python -m jones_daemon.workers.entry --session <id>`，stdio 上跑同一套 NDJSON JSON-RPC（daemon 是客户端）。worker 内加载 Hermes。
+- worker：由 daemon 按 Session 拉起，`python -m jones_daemon.workers.entry --session <id>`，stdio 上跑 Hermes 自带的 ACP（Agent Client Protocol）server（`acp_adapter/`，本身就是 JSON-RPC 2.0，不是自定义协议）；daemon 是 ACP client。worker 进程内启动时额外加载一个 Jones 自研的 `pre_tool_call` 插件，做 Step 级权限拦截（见 §7 spike #1 结论、PRD 6.3）。
 
 ## 4. RPC 契约 v0（daemon ⇄ 前端）
 
@@ -136,5 +136,10 @@ JSON-RPC 标准码 + 应用码：`1001 not_found`、`1002 invalid_state`（如�
 
 ## 7. 待 spike 决定的开放点
 
-- **Hermes 接入形态**（spike #1）：A) 库形式 `from run_agent import AIAgent` + 工具调用前 hook；B) Hermes 自带 `acp_adapter`（Agent Client Protocol，stdio，内建 `session/request_permission`）作为 worker 协议。**倾向 B**——权限请求、流式事件、会话是 ACP 原生概念，与 PRD 的 stdio worker 决定完全吻合；若 B 可用，`workers/` 的 stdio 协议直接采用 ACP 而非自定义 JSON-RPC。
+- **Hermes 接入形态**（spike #1，已完成，结论详见 [docs/spikes/01-hermes-hook.md](../spikes/01-hermes-hook.md)）：**A + B 都要，不是二选一**。
+  - **A（`pre_tool_call` hook）实测可行**：`hermes_cli.plugins` 在 `agent/agent_runtime_helpers.py::invoke_tool()` 里、任何工具真正派发前同步调用注册的 `pre_tool_call` 回调；回调可以真的阻塞调用线程等外部裁决（demo 里实测阻塞 1.2s+），返回 `block` 时工具从不执行、`{"error": message}` 原样成为该工具调用的结果回到 agent（demo 逐条断言通过，`docs/spikes/hermes_hook_demo.py` 可独立重跑）。这是唯一覆盖**任意**工具调用（不只是 Hermes 自己认的"危险命令"）的拦截点，FR05 的 Step 级权限闸必须靠它，不是靠 ACP。
+  - **B（`acp_adapter` 作为 worker 协议）也实测可行，且比自定义协议成熟得多**：stdio 上的标准 ACP JSON-RPC，`session/update` 推工具调用 start/complete 事件与流式文本/思考 delta，`cancel()` 真的设置 agent 会检查的 `cancel_event`，`session/request_permission` 有现成实现（`acp_adapter/permissions.py::make_approval_callback`）。**但 ACP 的 `request_permission` 只接在 Hermes 自己的"危险 shell 命令"侦测上**，不会替我们覆盖任意工具——它是 A 的传输层备选，不是 A 的替代品。
+  - **组合结论**：worker 跑 ACP server（daemon 是 ACP client，直接复用 `acp_adapter/` 的会话生命周期、流式事件、cancel，不重造 stdio 协议）；Jones 自研一个 `pre_tool_call` 插件做 Step 级拦截，规则闸能本地决出的直接在 worker 内返回（不打 IPC，符合"空闲不轮询"），审查闸/用户闸需要人工裁决的复用 ACP 已经开着的连接发 `session/request_permission`。
+  - **一个必须记住的坑**：`pre_tool_call` 回调本身受 `plugins.hook_callback_timeout` 限制（config 项，默认 30s，超时直接 fail-closed 拒绝）。这个 30s 只卡"决定阶段"，不够真人点审批用的；Hermes 自己的 `request_tool_approval`（危险命令那条路）把人工等待放在这个计时窗口**之外**，Jones 的插件也必须照抄这个两段式设计——决定阶段快速返回，人工等待走 ACP 请求-响应，不要把 `queue.get()` 直接杵在 hook 回调里等到天荒地老。
+  - **复用范围**：`hermes_state_*.py`（Session/Message/Turn 的 SQLite facade）建议直接作为 worker 内的会话存储，Jones 的 `sessions`/`messages` 表退化成引用 Hermes session_id 的外键，不重复造；`tools/`、`skills/`、MCP client 原样复用（PRD 6.2 本来的意思）；`cron/` 和 `gateway/`（Hermes 自己的 IM 网关，注意和 PRD 里 Jones 的 Channel Gateway 撞名，不是一个东西）功能对得上但没有在本 spike 验证，留给后续 spike。Jones 独有、Hermes 没有对应物的：`runs`/`steps`/`permission_decisions` 回放表——这条审计链只能由 Jones 自己的 `pre_tool_call` 插件 + ACP 工具调用事件拼出来。
 - 向量库（spike #3）、浏览器登录态（spike #4）、打包（spike #2）。
