@@ -137,4 +137,4 @@ JSON-RPC 标准码 + 应用码：`1001 not_found`、`1002 invalid_state`（如�
 ## 7. 待 spike 决定的开放点
 
 - **Hermes 接入形态**（spike #1）：A) 库形式 `from run_agent import AIAgent` + 工具调用前 hook；B) Hermes 自带 `acp_adapter`（Agent Client Protocol，stdio，内建 `session/request_permission`）作为 worker 协议。**倾向 B**——权限请求、流式事件、会话是 ACP 原生概念，与 PRD 的 stdio worker 决定完全吻合；若 B 可用，`workers/` 的 stdio 协议直接采用 ACP 而非自定义 JSON-RPC。
-- 向量库（spike #3）、浏览器登录态（spike #4）、打包（spike #2）。
+- 向量库（spike #3）、浏览器登录态（spike #4）。

@@ -17,7 +17,7 @@
 #
 # 用法：./measure.sh <daemon 可执行文件或启动脚本> [重复次数，默认 3]
 #   ./measure.sh ../standalone/dist/arm64/run.sh
-#   ./measure.sh ../pyinstaller/dist/jones-daemon-spike/jones-daemon-spike
+#   ./measure.sh ../legacy/pyinstaller/dist/jones-daemon-spike/jones-daemon-spike
 set -euo pipefail
 
 EXE="${1:?usage: measure.sh <path-to-daemon-executable> [runs]}"
