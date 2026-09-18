@@ -90,13 +90,18 @@ def test_main_session_uniqueness_is_enforced(tmp_path):
         conn.close()
 
 
+def _backups(tmp_path):
+    return set(tmp_path.glob("jones.db.bak-*"))
+
+
 def test_apply_pending_backs_up_the_db_file_before_migrating(tmp_path):
     db_path = tmp_path / "jones.db"
     conn = connect(db_path)
     try:
         migrator.apply_pending(conn)
-        backup = tmp_path / "jones.db.bak"
-        assert backup.exists()
+        backups = _backups(tmp_path)
+        assert len(backups) == 1
+        assert backups.pop().name.startswith("jones.db.bak-1-")
     finally:
         conn.close()
 
@@ -106,11 +111,36 @@ def test_apply_pending_skips_backup_when_nothing_is_pending(tmp_path):
     conn = connect(db_path)
     try:
         migrator.apply_pending(conn)  # v0 -> v1: db file exists by now, gets backed up
-        backup = tmp_path / "jones.db.bak"
-        backup.unlink()  # prove the *next* (no-op) call doesn't recreate it
+        for backup in _backups(tmp_path):
+            backup.unlink()  # prove the *next* (no-op) call doesn't recreate one
 
         migrator.apply_pending(conn)  # already at v1: nothing pending
-        assert not backup.exists()
+        assert not _backups(tmp_path)
+    finally:
+        conn.close()
+
+
+def test_apply_pending_backs_up_each_pending_migration_under_its_own_filename(tmp_path):
+    # Regression test: a single fixed `jones.db.bak` filename meant each
+    # migration's backup overwrote the previous one — if several versions were
+    # pending in one run and a later one failed, there was no way back to the
+    # state before an *earlier*, already-successful migration. Each version
+    # must get its own file, and none of them get overwritten by the next.
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    (migrations_dir / "001_init.sql").write_text(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);\n"
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"
+    )
+    (migrations_dir / "002_noop.sql").write_text("CREATE TABLE t2 (id INTEGER PRIMARY KEY);\n")
+    db_path = tmp_path / "jones.db"
+    conn = connect(db_path)
+    try:
+        migrator.apply_pending(conn, migrations_dir=migrations_dir)
+        backups = _backups(tmp_path)
+        assert len(backups) == 2
+        names = {b.name.split("-", 3)[1] for b in backups}  # the "<version>" segment
+        assert names == {"1", "2"}
     finally:
         conn.close()
 
@@ -137,13 +167,55 @@ def test_backup_captures_committed_wal_data_via_checkpoint(tmp_path):
         (migrations_dir / "002_noop.sql").write_text("CREATE TABLE t2 (id INTEGER PRIMARY KEY);\n")
         migrator.apply_pending(conn, migrations_dir=migrations_dir)
 
-        backup_conn = sqlite3.connect(str(tmp_path / "jones.db.bak"))
+        v2_backup = next(b for b in _backups(tmp_path) if b.name.split("-", 3)[1] == "2")
+        backup_conn = sqlite3.connect(str(v2_backup))
         try:
             row = backup_conn.execute("SELECT v FROM t WHERE id = 1").fetchone()
             assert row == ("hello",)
         finally:
             backup_conn.close()
     finally:
+        conn.close()
+
+
+def test_backup_refuses_to_proceed_when_wal_checkpoint_cannot_fully_flush(tmp_path):
+    # A second connection holding an open read snapshot blocks
+    # wal_checkpoint(TRUNCATE) from fully flushing the WAL — this is the actual
+    # condition the busy/incomplete check guards against, not a mocked return
+    # value. Silently backing up (and migrating) anyway would produce a backup
+    # that looks fine but is missing committed data.
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    (migrations_dir / "001_init.sql").write_text(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);\n"
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"
+    )
+    db_path = tmp_path / "jones.db"
+    conn = connect(db_path)
+    reader = None
+    try:
+        migrator.apply_pending(conn, migrations_dir=migrations_dir)  # v0 -> v1, backs up fine
+
+        reader = sqlite3.connect(str(db_path))
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM t")  # opens a read snapshot the checkpoint can't pass
+
+        conn.execute("INSERT INTO t (id) VALUES (1)")
+        conn.commit()
+        (migrations_dir / "002_noop.sql").write_text("CREATE TABLE t2 (id INTEGER PRIMARY KEY);\n")
+
+        backups_before = _backups(tmp_path)
+        with pytest.raises(RuntimeError, match="wal_checkpoint"):
+            migrator.apply_pending(conn, migrations_dir=migrations_dir)
+
+        # No new (possibly-incomplete) backup was left behind, and the failed
+        # backup attempt must have aborted the migration too, not just logged
+        # a warning and continued.
+        assert _backups(tmp_path) == backups_before
+        assert migrator.current_version(conn) == 1
+    finally:
+        if reader is not None:
+            reader.close()
         conn.close()
 
 

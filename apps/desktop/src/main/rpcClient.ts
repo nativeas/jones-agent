@@ -43,39 +43,77 @@ interface PendingCall {
 
 const RECONNECT_DELAYS_MS = [200, 500, 1000, 2000, 5000]
 
+/**
+ * Explicit connection state machine. At any instant there is at most one live
+ * socket and at most one pending timer (the reconnect backoff), because every
+ * place that could open a socket or arm a timer goes through `beginConnecting()`
+ * / `handleClose()`, which check and set this field instead of inferring
+ * "are we connected" from `socket`/`socket.destroyed` (see `beginConnecting()`
+ * for why that inference was the actual bug).
+ */
+type ConnState = 'disconnected' | 'connecting' | 'connected' | 'closing'
+
 export class RpcClient {
   private socket: net.Socket | null = null
   private leftover: Buffer = Buffer.alloc(0)
   private nextId = 1
-  private pending = new Map<string | number, PendingCall>()
+  private pending = new Map<string, PendingCall>()
   private notificationHandlers = new Map<string, Set<NotificationHandler>>()
   private anyNotificationHandlers = new Set<(method: string, params: unknown) => void>()
   private reconnectAttempt = 0
   private reconnectTimer: NodeJS.Timeout | null = null
   private stopped = false
-  private connected = false
+  private state: ConnState = 'disconnected'
   private connectedWaiters: Array<{ resolve: () => void; reject: (err: Error) => void }> = []
 
   constructor(private readonly socketPath: string) {}
 
   connect(): void {
     this.stopped = false
-    // Idempotent: a second call while a socket is already open or mid-connect
-    // (e.g. macOS `activate` firing connect() again after window-all-closed
-    // already stopped and reopened one) must not leak a duplicate socket.
-    if (this.socket && !this.socket.destroyed) return
+    this.beginConnecting()
+  }
+
+  private beginConnecting(): void {
+    // Idempotent by construction: a caller re-triggering connect() while a
+    // socket is already open or mid-connect (macOS `activate` firing after
+    // window-all-closed, or ensureDaemonRunning's own retry loop calling
+    // connect() on its own cadence) must never open a *second* socket
+    // alongside the one already in flight — that's exactly how a daemon that
+    // keeps crashing used to multiply socket connections: each manual
+    // connect() call tested `socket.destroyed`, which is already `true` the
+    // instant `close` fires (handleClose() never nulled `this.socket`), so it
+    // opened a new socket in addition to the reconnect timer handleClose()
+    // had just armed for the same disconnect. Gating on `state` instead of
+    // socket identity closes that gap: only 'disconnected' may proceed.
+    if (this.state === 'connecting' || this.state === 'connected') return
+    if (this.state === 'closing') return // stop() is mid-teardown; it settles to 'disconnected' synchronously before returning, so this should not be observable, but never race ahead of it regardless
+    // A caller asking to connect *now* supersedes any pending backoff wait —
+    // cancel it so we never end up with a timer *and* a socket in flight.
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    this.state = 'connecting'
     this.openSocket()
   }
 
   stop(): void {
     this.stopped = true
-    this.connected = false
+    this.state = 'closing'
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
-    this.socket?.destroy()
+    const socket = this.socket
     this.socket = null
+    socket?.destroy()
+    // destroy() emits 'close' asynchronously (or not at all if the socket was
+    // never actually opened at the OS level yet); settle the state machine
+    // synchronously here rather than waiting for that event, so a connect()
+    // call immediately after stop() is never blocked on it. handleClose(), if
+    // it does still fire for `socket`, will no-op: it only acts when the
+    // socket it was called for is still the one this client is tracking.
+    this.state = 'disconnected'
     for (const [, call] of this.pending) {
       call.reject(new Error('rpc client stopped'))
     }
@@ -90,22 +128,32 @@ export class RpcClient {
     this.socket = socket
 
     socket.on('connect', () => {
-      this.connected = true
+      if (this.socket !== socket) return // stale: superseded by a later stop()/connect()
+      this.state = 'connected'
       this.reconnectAttempt = 0
       const waiters = this.connectedWaiters
       this.connectedWaiters = []
       waiters.forEach(({ resolve }) => resolve())
     })
-    socket.on('data', (chunk) => this.handleData(chunk))
+    socket.on('data', (chunk) => {
+      if (this.socket === socket) this.handleData(chunk)
+    })
     socket.on('error', () => {
       // 'close' fires right after; reconnect scheduling happens there so it only
       // happens once per disconnect.
     })
-    socket.on('close', () => this.handleClose())
+    socket.on('close', () => this.handleClose(socket))
   }
 
-  private handleClose(): void {
-    this.connected = false
+  private handleClose(socket: net.Socket): void {
+    // Ignore a close event from a socket that isn't the one we're currently
+    // tracking — e.g. stop() already replaced/cleared `this.socket` before
+    // this (async) event had a chance to fire. Acting on it here would null
+    // out a *newer* socket's reference and/or arm a second reconnect timer
+    // alongside whatever the newer socket's own lifecycle is doing.
+    if (this.socket !== socket) return
+    this.socket = null
+    this.state = 'disconnected'
     this.leftover = Buffer.alloc(0)
     for (const [, call] of this.pending) {
       call.reject(new Error('daemon connection closed'))
@@ -125,7 +173,8 @@ export class RpcClient {
       RECONNECT_DELAYS_MS[Math.min(this.reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)]
     this.reconnectAttempt += 1
     this.reconnectTimer = setTimeout(() => {
-      if (!this.stopped) this.openSocket()
+      this.reconnectTimer = null
+      if (!this.stopped) this.beginConnecting()
     }, delay)
   }
 
@@ -156,9 +205,14 @@ export class RpcClient {
 
     const response = message as JsonRpcResponse
     if (response.id === null || response.id === undefined) return
-    const call = this.pending.get(response.id)
+    // `pending` is keyed by the string ids this client generates (see call());
+    // coerce here so a well-behaved daemon echoing back exactly what we sent
+    // (always a string) still matches, without widening the map's key type to
+    // also accept a bare number for a case that should never happen.
+    const id = String(response.id)
+    const call = this.pending.get(id)
     if (!call) return
-    this.pending.delete(response.id)
+    this.pending.delete(id)
     if (response.error) {
       call.reject(new RpcError(response.error.code, response.error.message, response.error.data))
     } else {
@@ -171,7 +225,7 @@ export class RpcClient {
     // after `destroy()`, so during a disconnect/reconnect window a live-looking
     // socket reference would make this resolve immediately and hand back a
     // socket that's about to reject every write. Track connectedness explicitly.
-    if (this.connected) return Promise.resolve()
+    if (this.state === 'connected') return Promise.resolve()
     return new Promise((resolve, reject) => this.connectedWaiters.push({ resolve, reject }))
   }
 
@@ -184,8 +238,19 @@ export class RpcClient {
     // lets a single timer own both phases.
     return new Promise((resolve, reject) => {
       let settled = false
+      // Set only once the request is actually registered in `pending` (i.e. once
+      // it's been written, not just queued behind whenConnected()), so the
+      // timeout handler knows whether there's an entry it needs to clean up.
+      let sentId: string | null = null
       const timer = setTimeout(() => {
         settled = true
+        // Without this, a timed-out call left its entry in `pending` forever —
+        // nothing else ever deletes it (a real response can't arrive for an id
+        // the daemon was never going to answer, and the map is otherwise only
+        // cleared wholesale on stop()/disconnect), so a client that keeps
+        // timing out (a wedged daemon, a method that never replies) leaks one
+        // Map entry per call indefinitely.
+        if (sentId !== null) this.pending.delete(sentId)
         reject(new Error(`rpc call timed out: ${method}`))
       }, timeoutMs)
 
@@ -199,8 +264,13 @@ export class RpcClient {
       this.whenConnected()
         .then(() => {
           if (settled) return // already timed out while still waiting to connect
-          // design §4: RPC ids are strings.
-          const id = String(this.nextId++)
+          // design §4: RPC ids are strings. Prefixed (not a bare stringified
+          // counter) so they read unambiguously as client-generated correlation
+          // ids, distinct from the ULID ids design §5 uses for persisted domain
+          // objects (session/agent/project rows) — the two are different id
+          // spaces that happen to share the RPC envelope's `id` field name.
+          const id = `c-${this.nextId++}`
+          sentId = id
           const payload = JSON.stringify({ jsonrpc: '2.0', id, method, params: params ?? {} }) + '\n'
 
           this.pending.set(id, {

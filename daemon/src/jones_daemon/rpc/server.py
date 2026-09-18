@@ -26,6 +26,7 @@ from jones_daemon.rpc.errors import (
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
     PARSE_ERROR,
+    TOO_MANY_REQUESTS,
     RpcError,
 )
 
@@ -39,6 +40,29 @@ Handler = Callable[[dict[str, Any], "Connection"], Awaitable[Any]]
 # a single connection's per-line memory.
 MAX_LINE_BYTES = 16 * 1024 * 1024
 
+# Caps how many requests from a single connection may be awaiting a handler at
+# once. Without this, a connection that dispatches faster than handlers finish
+# (or one stuck behind a slow/misbehaving handler) queues an unbounded number of
+# tasks — each holding its parsed line and a Task object — with nothing ever
+# rejecting the overflow. 64 matches the global dispatch semaphore below: a
+# single connection hitting this cap is already using the daemon's entire
+# concurrent-handler budget.
+MAX_INFLIGHT_PER_CONNECTION = 64
+
+
+def _peek_request_id(line: bytes) -> Any:
+    """Best-effort extraction of `id` from a line we're rejecting without a full
+    dispatch (the in-flight cap) — so the error response still correlates to the
+    right pending call on the client side instead of always using `null`. Never
+    raises: a line that isn't valid JSON just gets `id: null`, same as any other
+    envelope we can't make sense of (see `_dispatch`'s own INVALID_REQUEST path).
+    """
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return obj.get("id") if isinstance(obj, dict) else None
+
 
 class Connection:
     """Per-client connection handle, passed to handlers so they can push notifications."""
@@ -46,6 +70,9 @@ class Connection:
     def __init__(self, writer: asyncio.StreamWriter) -> None:
         self._writer = writer
         self._lock = asyncio.Lock()
+        # Requests from this connection currently dispatched (task created) but
+        # not yet responded to — see MAX_INFLIGHT_PER_CONNECTION.
+        self.inflight = 0
 
     async def _send(self, obj: dict[str, Any]) -> None:
         line = json.dumps(obj, ensure_ascii=False) + "\n"
@@ -135,11 +162,28 @@ class RpcServer:
                     continue
                 if not line.strip():
                     continue
+                if conn.inflight >= MAX_INFLIGHT_PER_CONNECTION:
+                    # Reject immediately rather than creating a task: creating one
+                    # anyway and having it self-reject on entry would still let an
+                    # unbounded number of already-parsed lines pile up as Task
+                    # objects between here and whenever the event loop gets around
+                    # to running each of them.
+                    await self._respond_error(
+                        conn,
+                        _peek_request_id(line),
+                        TOO_MANY_REQUESTS,
+                        "too many in-flight requests on this connection "
+                        f"(max {MAX_INFLIGHT_PER_CONNECTION})",
+                    )
+                    continue
+                conn.inflight += 1
                 task = asyncio.create_task(self._dispatch_bounded(conn, line))
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
         except ConnectionResetError:
-            pass
+            logger.debug(
+                "connection reset while reading", extra={"detail": {"peer": str(peer)}}
+            )
         finally:
             for task in tasks:
                 task.cancel()
@@ -151,8 +195,11 @@ class RpcServer:
             logger.info("client disconnected", extra={"detail": {"peer": str(peer)}})
 
     async def _dispatch_bounded(self, conn: Connection, line: bytes) -> None:
-        async with self._dispatch_semaphore:
-            await self._dispatch(conn, line)
+        try:
+            async with self._dispatch_semaphore:
+                await self._dispatch(conn, line)
+        finally:
+            conn.inflight -= 1
 
     async def _dispatch(self, conn: Connection, line: bytes) -> None:
         try:

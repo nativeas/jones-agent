@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import os from 'node:os'
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { app, BrowserWindow, ipcMain } from 'electron'
 import { RpcClient } from './rpcClient'
 
@@ -41,7 +41,7 @@ function createWindow(): void {
       preload: join(__dirname, '../preload/index.mjs'),
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: false
+      sandbox: true
     }
   })
 
@@ -68,16 +68,32 @@ function findDaemonProjectDir(): string | null {
   return null
 }
 
-function attemptLaunchdKickstart(): void {
-  if (process.platform !== 'darwin') return
-  spawnSync(
-    'launchctl',
-    ['kickstart', '-k', `gui/${process.getuid?.() ?? 0}/${DAEMON_LAUNCHD_LABEL}`],
-    { timeout: 3000, stdio: 'ignore' }
-  )
-  // Result intentionally ignored either way: success means the daemon is (re)starting,
-  // failure just means the service isn't installed yet (pre-packaging) or launchctl
-  // isn't available — the ping retry below is what actually decides success.
+function attemptLaunchdKickstart(): Promise<void> {
+  if (process.platform !== 'darwin') return Promise.resolve()
+  // Async, not spawnSync: this runs on Electron's main process thread, which
+  // also owns window/menu/IPC event handling — blocking it synchronously for
+  // up to 3s on every unreachable-daemon retry would freeze the whole UI for
+  // that long (DEV.md 工程原则 #3: 性能是需求).
+  return new Promise((resolve) => {
+    const child = spawn(
+      'launchctl',
+      ['kickstart', '-k', `gui/${process.getuid?.() ?? 0}/${DAEMON_LAUNCHD_LABEL}`],
+      { stdio: 'ignore' }
+    )
+    const timer = setTimeout(() => {
+      child.kill()
+      resolve()
+    }, 3000)
+    const done = (): void => {
+      clearTimeout(timer)
+      resolve()
+    }
+    // Result intentionally ignored either way: success means the daemon is (re)starting,
+    // failure just means the service isn't installed yet (pre-packaging) or launchctl
+    // isn't available — the ping retry below is what actually decides success.
+    child.on('error', done)
+    child.on('exit', done)
+  })
 }
 
 function spawnDevDaemon(): void {
@@ -131,7 +147,7 @@ async function ensureDaemonRunning(): Promise<void> {
   if (await pingOnce(DAEMON_PING_TIMEOUT_MS)) return
 
   for (let attempt = 1; attempt <= MAX_DAEMON_START_ATTEMPTS; attempt++) {
-    attemptLaunchdKickstart()
+    await attemptLaunchdKickstart()
     spawnDevDaemon()
     rpcClient.connect()
     await new Promise((resolve) => setTimeout(resolve, DAEMON_RETRY_WAIT_MS))

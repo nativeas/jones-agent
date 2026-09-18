@@ -44,7 +44,9 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS ix_sessions_project_id ON sessions(project_id);
 CREATE INDEX IF NOT EXISTS ix_sessions_parent_id ON sessions(parent_id);
--- Exactly one main session may exist at a time (design §5).
+-- Exactly one main session may exist at a time — globally, not per project
+-- (design §5: PRD 要求"主会话唯一、常驻"，未按 project 切分；裁定为全局唯一，
+-- 索引不带 project_id 前缀，是最终决定，不是待评审的临时选择).
 CREATE UNIQUE INDEX IF NOT EXISTS ux_sessions_is_main ON sessions(is_main) WHERE is_main = 1;
 
 CREATE TABLE IF NOT EXISTS turns (

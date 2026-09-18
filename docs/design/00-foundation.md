@@ -62,7 +62,7 @@ Electron main ──(socket client)──> daemon
 
 ## 4. RPC 契约 v0（daemon ⇄ 前端）
 
-传输：NDJSON，每行一个 JSON-RPC 2.0 对象。请求/响应/通知三种。id 为字符串。所有时间为 ISO-8601 UTC。所有 id 为 ULID 字符串。
+传输：NDJSON，每行一个 JSON-RPC 2.0 对象。请求/响应/通知三种。JSON-RPC 信封的 `id` 字段（请求/响应关联用）只要求是字符串，由前端自行生成（如客户端自增计数器加前缀 `c-<n>`），不要求是 ULID——ULID 是 §5 领域对象（`session`/`project`/... 的主键）的 id 格式，是另一套 id 空间，两者共用「id」这个字段名但含义不同。所有时间为 ISO-8601 UTC。
 
 ### 4.1 方法（前端 → daemon）
 
@@ -105,7 +105,7 @@ Electron main ──(socket client)──> daemon
 
 ### 4.3 错误码
 
-JSON-RPC 标准码 + 应用码：`1001 not_found`、`1002 invalid_state`（如对纯对话模式发工具调用）、`1003 permission_denied`、`1004 provider_error`、`1005 budget_exceeded`、`1006 kernel_error`。`data` 里带人可读 `message` 与结构化 `detail`。
+JSON-RPC 标准码 + 应用码：`1001 not_found`、`1002 invalid_state`（如对纯对话模式发工具调用）、`1003 permission_denied`、`1004 provider_error`、`1005 budget_exceeded`、`1006 kernel_error`、`1007 too_many_requests`（单连接在途请求数超过上限，见 foundation 实现的每连接并发闸）。`data` 里带人可读 `message` 与结构化 `detail`。
 
 ## 5. 领域模型 → SQLite schema v1（PRD 7）
 
@@ -128,7 +128,7 @@ JSON-RPC 标准码 + 应用码：`1001 not_found`、`1002 invalid_state`（如�
 | `providers` | `name, has_key BOOL, key_hint, default_model`（Key 本体在 vault，不在库） |
 | `schema_version` | `version INT` |
 
-主会话：`sessions.is_main = 1` 唯一（部分唯一索引），随首次启动创建，不可删除。
+主会话：`sessions.is_main = 1` 全局唯一（部分唯一索引，索引键仅 `is_main`、不带 `project_id`，跨所有 project 只允许一条），随首次启动创建，不可删除。
 
 ## 6. 路径（PRD 10.2）
 

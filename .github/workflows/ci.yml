@@ -8,7 +8,11 @@ on:
 jobs:
   daemon:
     name: daemon (lint + test)
-    runs-on: macos-14
+    # Unix domain sockets (the daemon's whole transport) work the same way on
+    # Linux; nothing here is macOS-specific, so this doesn't need the pricier
+    # macOS runner — only the desktop job, which builds/tests the actual macOS
+    # target shell, does.
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: daemon
@@ -51,3 +55,5 @@ jobs:
         run: pnpm typecheck
       - name: vitest
         run: pnpm test
+      - name: build
+        run: pnpm build

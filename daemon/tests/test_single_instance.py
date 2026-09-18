@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from jones_daemon import paths
-from jones_daemon.__main__ import _acquire_single_instance_lock
+from jones_daemon.__main__ import _acquire_single_instance_lock, _release_single_instance_lock
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +59,50 @@ def test_missing_pid_file_does_not_bypass_the_lock_check():
             _acquire_single_instance_lock()
     finally:
         fh.close()
+
+
+def test_release_unlinks_the_pid_file_before_releasing_the_flock(monkeypatch):
+    # Regression test for the exit-order bug: releasing the flock (closing fh)
+    # before unlinking the PID file reopens a window where a second daemon can
+    # acquire the now-free lock and write *its own* PID into the file, only for
+    # this process to then unlink that live file out from under it. The fix is
+    # strictly about order, so assert the order directly: unlink must be
+    # observed before close.
+    fh = _acquire_single_instance_lock()
+    pid_path = paths.pid_file()
+    call_order: list[str] = []
+
+    real_unlink = Path.unlink
+
+    def tracked_unlink(self, *args, **kwargs):
+        if self == pid_path:
+            call_order.append("unlink")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", tracked_unlink)
+    real_close = fh.close
+
+    def tracked_close():
+        call_order.append("close")
+        return real_close()
+
+    monkeypatch.setattr(fh, "close", tracked_close)
+
+    _release_single_instance_lock(fh)
+
+    assert call_order == ["unlink", "close"]
+    assert not pid_path.exists()
+
+
+def test_release_lets_a_new_instance_acquire_the_lock_afterwards():
+    fh = _acquire_single_instance_lock()
+    _release_single_instance_lock(fh)
+
+    fh2 = _acquire_single_instance_lock()  # must not raise SystemExit
+    try:
+        assert paths.pid_file().read_text().strip() == str(os.getpid())
+    finally:
+        fh2.close()
 
 
 def test_stale_pid_file_from_a_crashed_process_does_not_block_a_new_instance():

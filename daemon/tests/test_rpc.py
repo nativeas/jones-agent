@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import shutil
 import stat
 import tempfile
@@ -7,9 +8,15 @@ from pathlib import Path
 
 import pytest
 
-from jones_daemon.rpc.errors import INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, RpcError
+from jones_daemon.rpc.errors import (
+    INVALID_REQUEST,
+    METHOD_NOT_FOUND,
+    PARSE_ERROR,
+    TOO_MANY_REQUESTS,
+    RpcError,
+)
 from jones_daemon.rpc.methods import register_builtin_methods
-from jones_daemon.rpc.server import MAX_LINE_BYTES, RpcServer
+from jones_daemon.rpc.server import MAX_INFLIGHT_PER_CONNECTION, MAX_LINE_BYTES, RpcServer
 
 
 @pytest.fixture
@@ -53,7 +60,13 @@ async def test_daemon_status_roundtrip(server):
     response = await _roundtrip(
         server.socket_path, {"jsonrpc": "2.0", "id": "2", "method": "daemon.status"}
     )
-    assert response["result"] == {"sessions_active": 0, "workers": 0, "memory_mb": 0}
+    result = response["result"]
+    assert result["sessions_active"] == 0
+    assert result["workers"] == 0
+    # memory_mb must be a real measurement (resource.getrusage), not a fabricated
+    # constant — a running process always has *some* RSS, so it must be > 0.
+    assert isinstance(result["memory_mb"], (int, float))
+    assert result["memory_mb"] > 0
 
 
 async def test_unknown_method_returns_method_not_found(server):
@@ -197,5 +210,98 @@ async def test_concurrent_requests_on_one_connection_do_not_serialize(server):
         release.set()
         slow_response = json.loads(await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2))
         assert slow_response["id"] == "slow"
+    finally:
+        writer.close()
+
+
+async def test_connection_reset_while_reading_is_logged_not_silently_dropped(caplog):
+    # Regression test: `except ConnectionResetError: pass` swallowed a genuine
+    # disconnect condition with zero trace — DEV.md 工程原则 #4 (诚实失败) requires
+    # every `except` to at least log with context, never bare `pass`.
+    srv = RpcServer(None)
+
+    class ResetReader:
+        async def readuntil(self, separator):
+            raise ConnectionResetError("reset by peer")
+
+    class FakeWriter:
+        def write(self, data):
+            pass
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            return None
+
+        def get_extra_info(self, name):
+            return "test-peer"
+
+    with caplog.at_level(logging.DEBUG, logger="jones_daemon.rpc"):
+        await srv._handle_client(ResetReader(), FakeWriter())
+
+    assert any(
+        "connection reset" in record.message and record.levelname == "DEBUG"
+        for record in caplog.records
+    )
+
+
+async def test_connection_inflight_cap_rejects_overflow_instead_of_queueing(server):
+    # Regression test: without a per-connection cap, a connection that dispatches
+    # faster than its handlers finish could pile up an unbounded number of tasks
+    # behind the global semaphore. Fill this connection's entire in-flight budget
+    # with requests that block until released, then confirm one more gets an
+    # immediate JSON-RPC error instead of joining an ever-growing queue.
+    release = asyncio.Event()
+    started = 0
+
+    async def blocking(params, conn):
+        nonlocal started
+        started += 1
+        await release.wait()
+        return {"ok": True}
+
+    server.register("test.block", blocking)
+
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        payload = "".join(
+            json.dumps({"jsonrpc": "2.0", "id": f"b{i}", "method": "test.block"}) + "\n"
+            for i in range(MAX_INFLIGHT_PER_CONNECTION)
+        )
+        writer.write(payload.encode())
+        await writer.drain()
+
+        for _ in range(200):
+            if started >= MAX_INFLIGHT_PER_CONNECTION:
+                break
+            await asyncio.sleep(0.01)
+        assert started == MAX_INFLIGHT_PER_CONNECTION
+
+        overflow_req = json.dumps({"jsonrpc": "2.0", "id": "overflow", "method": "daemon.ping"})
+        writer.write((overflow_req + "\n").encode())
+        await writer.drain()
+        overflow_response = json.loads(await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2))
+        assert overflow_response["id"] == "overflow"
+        assert overflow_response["error"]["code"] == TOO_MANY_REQUESTS
+
+        release.set()
+        # Drain the 64 blocked responses so they don't race writer.close() below.
+        for _ in range(MAX_INFLIGHT_PER_CONNECTION):
+            await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2)
+
+        # The cap is per-connection headroom, not a one-shot trip: once those 64
+        # requests finished and freed their slots, this same connection can
+        # dispatch again normally.
+        writer.write(
+            (json.dumps({"jsonrpc": "2.0", "id": "after", "method": "daemon.ping"}) + "\n").encode()
+        )
+        await writer.drain()
+        after_response = json.loads(await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2))
+        assert after_response["id"] == "after"
+        assert "error" not in after_response
     finally:
         writer.close()

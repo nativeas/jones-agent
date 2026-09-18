@@ -18,6 +18,7 @@ PERMISSION_DENIED = 1003
 PROVIDER_ERROR = 1004
 BUDGET_EXCEEDED = 1005
 KERNEL_ERROR = 1006
+TOO_MANY_REQUESTS = 1007
 
 APP_ERROR_CODES = {
     NOT_FOUND: "not_found",
@@ -26,6 +27,7 @@ APP_ERROR_CODES = {
     PROVIDER_ERROR: "provider_error",
     BUDGET_EXCEEDED: "budget_exceeded",
     KERNEL_ERROR: "kernel_error",
+    TOO_MANY_REQUESTS: "too_many_requests",
 }
 
 

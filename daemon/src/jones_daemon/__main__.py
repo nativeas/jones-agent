@@ -13,6 +13,7 @@ import contextlib
 import fcntl
 import os
 import signal
+import sqlite3
 import sys
 from typing import TextIO
 
@@ -20,7 +21,7 @@ from jones_daemon import paths
 from jones_daemon.logging import configure_logging, get_logger
 from jones_daemon.rpc.methods import register_builtin_methods
 from jones_daemon.rpc.server import RpcServer
-from jones_daemon.store import apply_pending, connect
+from jones_daemon.store import apply_pending, connect, run_in_db_thread
 
 logger = get_logger("main")
 
@@ -55,13 +56,39 @@ def _acquire_single_instance_lock() -> TextIO:
     return fh
 
 
+def _release_single_instance_lock(fh: TextIO) -> None:
+    """Release the lock acquired by `_acquire_single_instance_lock`, in the only
+    order that keeps "holds the lock" and "the PID file exists" consistent at
+    every instant: unlink the PID file *while still holding the flock*, and only
+    then close the fd (which is what actually releases the lock).
+
+    Reversed, this reopens the exact race the lock exists to close: closing the
+    fd first releases the lock immediately, and in the window before this
+    process gets around to unlinking, a second daemon can acquire the
+    now-free lock and write *its own* PID into the file — which this process
+    then deletes out from under it on its next line, leaving the new instance's
+    PID file gone while it's still very much running.
+    """
+    paths.pid_file().unlink(missing_ok=True)
+    fh.close()
+
+
 async def _run() -> None:
     configure_logging()
     lock_fh = _acquire_single_instance_lock()
 
     try:
-        conn = connect(paths.db_path())
-        version = apply_pending(conn)
+        # connect() *and* apply_pending() must run on the same dedicated DB
+        # thread: connect() is what establishes a check_same_thread=True
+        # connection's home thread, so opening it on the event loop thread and
+        # then only offloading later queries would still violate that
+        # invariant (see store/db.py's module docstring).
+        def _open_store() -> tuple[sqlite3.Connection, int]:
+            db_conn = connect(paths.db_path())
+            schema_version = apply_pending(db_conn)
+            return db_conn, schema_version
+
+        conn, version = await run_in_db_thread(_open_store)
         logger.info("store ready", extra={"detail": {"schema_version": version}})
 
         server = RpcServer(paths.sock_file())
@@ -85,13 +112,15 @@ async def _run() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await serve_task
         await server.stop()
-        conn.close()
+        # close() is also a synchronous sqlite3 call bound to the connection's
+        # home thread (check_same_thread=True) — it must run there too.
+        await run_in_db_thread(conn.close)
     finally:
-        # Closing the fd releases the flock, so this must happen last: anything
-        # above that fails (or a future exception) still leaves the lock held
-        # until here rather than opening a window for a second instance to start.
-        lock_fh.close()
-        paths.pid_file().unlink(missing_ok=True)
+        # Anything above that fails (or a future exception) still leaves the
+        # lock held until here rather than opening a window for a second
+        # instance to start — see _release_single_instance_lock for why the
+        # unlink-then-close order (not the reverse) is what makes that true.
+        _release_single_instance_lock(lock_fh)
 
 
 def main() -> None:
