@@ -1,0 +1,40 @@
+# electron-builder 配置 spike。真实 apps/desktop 会有自己的完整配置；这里只验证
+# extraResources 把 PyInstaller onedir 目录整体塞进 .app 且路径可被 main.js 找到。
+appId: dev.jones.packagingspike
+productName: JonesPackagingSpike
+directories:
+  output: dist
+files:
+  - main.js
+  - package.json
+extraResources:
+  # 用 python-build-standalone 方案的产物（见 packaging/standalone/build.sh），因为它能在
+  # Apple Silicon 主机上同时正确产出 arm64 与 x86_64 两份资源（PyInstaller 做不到，见 spike 报告）。
+  # ${arch} 是 electron-builder 内置宏，按当前 --arm64/--x64 构建目标展开成 arm64/x64。
+  - from: ../standalone/dist/${arch}
+    to: daemon
+mac:
+  category: public.app-category.developer-tools
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: entitlements.mac.plist
+  entitlementsInherit: entitlements.mac.plist
+  # identity: null 不是「退回 ad-hoc 签名」——已在 app-builder-lib@25.1.8 的
+  # out/macPackager.js:183-188 核实：qualifier === null 时整段 mac 签名直接 return false，
+  # 完全跳过，一次都不执行。也就是说上面的 hardenedRuntime / entitlements /
+  # entitlementsInherit 三项在本 spike 里从未真正生效过——本 spike 验证过的是
+  # packaging/sign/sign-adhoc.sh 手工签名那条路径（对 dist/mac-arm64/*.app 事后补签），
+  # 不是这份 yml 配置本身的签名路径。electron-builder 签名路径（含 entitlements 相对路径
+  # 解析、entitlementsInherit 对各 Helper 进程是否生效）本 spike 未验证，需要真实
+  # Developer ID 证书才能跑一遍，见 docs/spikes/02-packaging.md §3 与 §7。
+  # 正式发布前把这里换成 "Developer ID Application: <公司名> (<TEAMID>)"，
+  # 让 electron-builder 走它自己的 Frameworks/Helpers 签名逻辑（不要照搬 sign-adhoc.sh
+  # 的 --deep 手工签整个 .app，见该脚本末尾注释）。
+  identity: null
+dmg:
+  sign: false

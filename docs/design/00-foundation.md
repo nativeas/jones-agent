@@ -26,7 +26,7 @@ jones-agent/
 │   ├── src/preload/         # 仅暴露 `window.jones` 的白名单 API
 │   ├── src/renderer/        # React 三栏 UI（无 Node 权限）
 │   └── tests/
-├── packaging/               # launchd plist、PyInstaller spec、electron-builder 配置、签名脚本
+├── packaging/               # launchd plist、python-build-standalone 打包脚本、electron-builder 配置、签名脚本
 ├── docs/                    # PRD、design、spikes
 ├── .github/workflows/ci.yml # pytest + ruff + pnpm test + tsc
 └── Makefile                 # make check = 全部 lint + test
@@ -42,7 +42,7 @@ jones-agent/
 | RPC | JSON-RPC 2.0，NDJSON，Unix domain socket | 流式、简单、无 TCP（PRD 11.3） |
 | 桌面 | Electron 33+，electron-vite，React 18，TypeScript strict，Zustand | 轻、快、够用 |
 | 测试 | pytest / vitest；ruff；tsc --noEmit | |
-| 打包 | PyInstaller（daemon 单目录）+ electron-builder（把 daemon 作为 extraResources） | spike #2 验证 |
+| 打包（**已定案**，见 spike #2 与控制者裁定） | python-build-standalone：各架构分别用 `uv python install <target-triple>` 拿到该架构的预编译解释器，直接拷贝成 daemon 单目录（arm64 一份、x86_64 一份，不是 universal2 fat 二进制）；electron-builder 按目标架构选对应目录作为 `extraResources`（`${arch}` 宏，一份配置覆盖两次构建） | spike #2 验证：跟本仓库解释器管理工具 `uv` 一致（`uv python install <target-triple>` 零额外步骤拿到对应架构解释器），不需要装 uv 管理之外的 universal2 安装器；PyInstaller 并非做不到跨架构（给 universal2 基础解释器同样可行），只是需要多一条脱离 uv 的安装路径，见 `docs/spikes/02-packaging.md` §1 |
 
 ## 3. 进程模型
 
@@ -145,7 +145,7 @@ JSON-RPC 标准码 + 应用码：`1001 not_found`、`1002 invalid_state`（如�
   - **复用范围**：`hermes_state_*.py`（Session/Message/Turn 的 SQLite facade）建议直接作为 worker 内的会话存储，Jones 的 `sessions`/`messages` 表退化成引用 Hermes session_id 的外键，不重复造；`tools/`、`skills/`、MCP client 原样复用（PRD 6.2 本来的意思）；`cron/` 和 `gateway/`（Hermes 自己的 IM 网关，注意和 PRD 里 Jones 的 Channel Gateway 撞名，不是一个东西）功能对得上但没有在本 spike 验证，留给后续 spike。Jones 独有、Hermes 没有对应物的：`runs`/`steps`/`permission_decisions` 回放表——**daemon 侧写**，不是 Jones 的 `pre_tool_call` 插件里写（插件对 approve 分支立即返回，从不知道最终结果）：规则闸的决定 daemon 只能从 ACP `session/update` 事件流异步得知，审查闸/用户闸的决定 daemon 自己就是拍板者、写库要排在回 ACP 响应之前；完整三条时序图、`steps`↔`permission_decisions` 关联方式的已知缺口、写库失败时的诚实失败要求，见 [docs/spikes/01-hermes-hook.md](../spikes/01-hermes-hook.md) §"审计写入时序"（2026-09-19 评审新增，取代了本节此前"由 pre_tool_call 插件 + ACP 工具调用事件拼出来"这句不够精确的旧表述）。
   - **Hermes 内置的批准绕过路径必须在 worker 启动时禁用**（2026-09-19 评审新增；第三轮评审订正了归属并补了第 4 条，源码证据见 [docs/spikes/01-hermes-hook.md](../spikes/01-hermes-hook.md) §"Hermes 内置的批准绕过路径"）：Jones 把用户闸"委托"给 Hermes 自己的 `request_tool_approval()` 走 ACP，这条路径实际只受两道短路影响——进程级 `HERMES_YOLO_MODE` 环境变量（冻结于 `tools.approval` 模块 import 时）、命中持久化 `command_allowlist`（`tools/approval.py` 模块级代码在 import 时无条件从活动 profile 的 `config.yaml` 加载）；`config.yaml` 里的 `approvals.mode: off` 短路的是另一个独立机制——`terminal_tool`/`code_execution_tool` 自己内建的 Tier-1/2 危险命令/代码扫描，不影响 Jones 转发的 `approve` 请求，但同样必须禁用（否则少一层跟 Jones 插件并行的防线）。第四条性质完全不同：`HERMES_SAFE_MODE=1` 会让 `PluginManager.discover_and_load()` 直接跳过扫描（`hermes_cli/plugins.py:1221-1222`），Jones 的插件根本不会被加载——规则闸/审查闸/用户闸三道闸静默全部消失，不是某一道被短路。daemon 拉起 worker 子进程时必须：不传 `HERMES_YOLO_MODE`、不传 `HERMES_SAFE_MODE`、worker 的 `config.yaml` 不写 `approvals.mode: off`、worker 的 `HERMES_HOME` 与用户默认的 `~/.hermes` 相互隔离（Hermes 自己按 `HERMES_HOME` 分 profile 隔离永久 allowlist，直接复用这个机制即可）。已建议列为 FR05 验收项（见 `docs/PRD.md` §12.3、§6.3）。
   - **未验证**：并发工具调用（`tool_executor.py` 的 8 线程池）下审批回调这个按线程槽会不会跨线程丢失——`agent/tool_executor.py` 有 `propagate_context_to_thread` 把 thread-local 的审批回调带进 worker 线程，源码看设计上没问题，但本 spike 没有并发场景的实测，留给 daemon 骨架落地时的集成测试覆盖（见下方"下一步"）。
-- 向量库（spike #3）、浏览器登录态（spike #4）、打包（spike #2）。
+- 向量库（spike #3）、浏览器登录态（spike #4）。
 
 ## 8. 给 W2/W3 实现者的接入清单（2026-09-19 评审新增，spike #1 源码核对；对应 issue #1 评审第 4 条）
 
