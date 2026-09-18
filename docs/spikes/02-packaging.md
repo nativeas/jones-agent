@@ -2,19 +2,27 @@
 
 对应 Issue #2，PRD 13.2 风险 3、11.4 兼容性、12.1 G18。
 
-结论先行：**两条打包路径都能让 Python 守护进程随 .app 一起分发、不依赖用户系统 Python**；但只有
-**python-build-standalone（直接拷贝解释器分发包）** 能在一台 Apple Silicon 开发机上同时正确产出
-arm64 与 x86_64 两份守护进程资源。**PyInstaller 做不到**——它在 freeze 时要 `exec` 本机解释器，
-产物的原生库（`libpython*.dylib`）永远是宿主机架构，`--target-architecture x86_64` 只会重标记
-bootloader 的架构位而不换库，产出一个签名合法但完全跑不起来（`Bad CPU type in executable`）的假
-x86_64 二进制——这是本次 spike 实测复现的一个真实陷阱，不是理论推测（见 §3）。
+结论先行：**两条打包路径都能让 Python 守护进程随 .app 一起分发、不依赖用户系统 Python**，本
+Issue 最终采用 **python-build-standalone（直接拷贝解释器分发包）**。
+
+**更正（评审后重新实测，见 §1 末尾「根因更正」）**：早期版本的本文档把这个选择的唯一支柱写成
+「PyInstaller 在 macOS 上无法跨架构」，并归因为 PyInstaller 的固有限制。**这个归因是错的**。
+真正的约束是：PyInstaller 从基础解释器的 `libpython`/`Python` 动态库里**提取**目标架构的切片，
+如果基础解释器是 thin（单架构）build，就没有 x86_64 切片可提取，`--target-architecture x86_64`
+只会转换 bootloader 的 Mach-O 架构标记、内部动态库仍是宿主机架构——这不是"PyInstaller 做不到
+跨架构"，而是"喂给它单架构的解释器就得不到多架构的输出"。**给它一个真正 universal2（同时含
+arm64 + x86_64 切片）的基础解释器，PyInstaller 能正确产出跑得起来的 x86_64 二进制**——已实测
+验证，见下方「根因更正」。
+
+选 python-build-standalone 的真实理由（见下）不是"PyInstaller 做不到"，而是它跟本仓库已有的
+`uv` 工具链管理解释器的方式一致、不需要额外的管理员权限安装步骤。
 
 ## 0. 产物一览
 
 ```
 packaging/
 ├── daemon-min/ping_daemon.py     # 最小 Python 守护进程：Unix socket，收 {"cmd":"ping"} 回 pong
-├── pyinstaller/build.sh          # 方案 A：PyInstaller onedir（只能产出宿主机架构）
+├── pyinstaller/build.sh          # 方案 A：PyInstaller onedir（本机基础解释器是 thin arm64，只能产出宿主机架构；给 universal2 基础解释器能跨架构，见 §1 根因更正）
 ├── standalone/build.sh           # 方案 B：python-build-standalone + 直接拷贝（可跨架构）
 ├── electron-shell/               # 最小 Electron 壳 + electron-builder 配置
 │   ├── main.js
@@ -28,23 +36,84 @@ packaging/
 
 ## 1. 两种打包方案对比（实测）
 
-| | PyInstaller onedir | python-build-standalone（直接拷贝） |
-|---|---|---|
-| 产物体积（daemon 目录，空壳脚本） | 20 MB | 50 MB |
-| 冷启动到 socket 可用（本机 M-series，5 次均值） | 56 ms | 55 ms（首次 1.35s，磁盘缓存冷时；之后稳定在 ~55ms） |
-| 空闲 RSS | ~23.5 MB | ~18.3 MB |
-| **能否在 arm64 主机上产出正确的 x86_64 产物** | **不能**：`--target-architecture x86_64` 只转换 bootloader 的 Mach-O 架构标记，内部 `libpython3.12.dylib` 仍是宿主机（arm64）编译的，产物在 Rosetta 下直接 `Bad CPU type in executable` | **能**：只是下载对应架构的官方预编译解释器 tarball 再拷贝文件，不需要执行任何目标架构代码，天然跨架构 |
-| 适用场景 | 单架构 CI（各架构一台 runner 或至少各自 native 构建一次） | 单机也能产出全部目标架构；代价是体积略大、需要自己管理 site-packages（真实 daemon 有 `hermes-agent` 等第三方依赖时要把 venv 的 site-packages 一起拷进去） |
+冷启动 / 空闲 RSS 数字用 `packaging/daemon-min/measure.sh <daemon 可执行文件> [重复次数]`
+复现（外部计时：spawn 到 socket 可连接为止；daemon 进程自己测不出这段时间，见该脚本头部
+注释与 `ping_daemon.py` 里删掉的 `boot_s` 字段——那个字段之前恒为 0，因为两行代码之间的
+`time.time()` 减法什么都没测到）。
 
-**结论**：W1 阶段本机只有 Apple Silicon，若坚持用 PyInstaller，Intel 版就打不出来（除非接入
-x86_64 CI runner 或在 Rosetta 里跑一个 x86_64 的 uv/venv 环境后再 freeze）。python-build-standalone
-路线不受此限制，本 spike 最终的 electron-builder 配置采用这条路线（见
+| | PyInstaller onedir | python-build-standalone（直接拷贝，已裁剪 tcl/tk） |
+|---|---|---|
+| 产物体积（daemon 目录，空壳脚本） | 20 MB | 39 MB（裁剪前 50MB，见下方修复记录：standalone 默认带 tcl/tk，headless daemon 用不到，PyInstaller 会自动裁剪、之前不是同口径对比） |
+| 冷启动到 socket 可用（`measure.sh` 复现，5 次，排除首次磁盘缓存冷启动后取稳态均值） | ~69 ms | ~78 ms |
+| 空闲 RSS | ~23.7 MB | ~18.3 MB |
+| **能否在 arm64 主机上产出正确的 x86_64 产物** | **取决于基础解释器**（见下方「根因更正」）：给 `uv python install cpython-3.12-macos-x86_64-none` 这种 thin 解释器——不能，`--target-architecture x86_64` 只转换 bootloader 的 Mach-O 架构标记，内部 `libpython3.12.dylib` 仍是宿主机（arm64）编译的；给 python.org 官方 universal2 安装器装出来的解释器——**能**，已实测确认内部 `Python`/`.so` 全部是真正的 x86_64 切片 | **能**：只是下载对应架构的官方预编译解释器 tarball 再拷贝文件，不需要执行任何目标架构代码，天然跨架构，且直接用本仓库已有的 `uv python install`，不需要额外装什么 |
+| 拿到可用基础解释器的方式 | 需要 python.org 官方 **universal2** 安装器（`.pkg`，装到 `/Library/Frameworks`，需要管理员权限）——`uv python install` 不提供 universal2 build，只有 thin per-arch build | `uv python install cpython-3.12-macos-{aarch64,x86_64}-none`，本仓库其他地方（`daemon/`）已经在用 uv 管理解释器，零额外步骤，不需要管理员权限 |
+| 适用场景 | 有 universal2 基础解释器时单机可跨架构；否则退化为单架构 CI（各架构一台 runner，或至少各自 native 构建一次） | 单机零配置产出全部目标架构；代价是体积略大、需要自己管理 site-packages（真实 daemon 有 `hermes-agent` 等第三方依赖时要把 venv 的 site-packages 一起拷进去） |
+
+**结论**：两条路线都能在 arm64 开发机上产出正确的 x86_64 产物，**但前提不同**。PyInstaller 需要
+一个 universal2 基础解释器，本仓库的解释器管理工具 `uv`（`daemon/` 已经在用）不提供这种 build，
+只能额外装 python.org 的官方安装器（需要管理员权限，且这个安装器脱离了 uv 的解释器版本管理，
+后续升级 Python 版本要多维护一条路径）。python-build-standalone 直接用 `uv python install
+<target-triple>` 就能拿到对应架构的解释器，和仓库其余部分的解释器管理方式一致，零额外步骤、
+不需要管理员权限。**这是本 spike 最终选 python-build-standalone 的真实理由**——不是"PyInstaller
+在 macOS 上做不到跨架构"（这个说法不成立，见下方根因更正），是"给定本仓库已选定的工具链（uv），
+python-build-standalone 零额外步骤，PyInstaller 需要多一条脱离 uv 管理的安装路径"。
+
+本 spike 最终的 electron-builder 配置采用 python-build-standalone（见
 `packaging/electron-shell/electron-builder.yml` 的 `extraResources`，用 `${arch}` 宏选对应产物）。
 
 真实 daemon 一旦引入 `hermes-agent` 等第三方依赖，两条路线都要多带一份 site-packages；
 python-build-standalone 需要额外一步 `uv pip install --target <bundle>/python/lib/python3.12/site-packages`
 （跨架构安装纯 Python 依赖同样只是文件拷贝，能做；有 C 扩展的依赖则需要该架构的 wheel，
 PyPI 大厂商模型 SDK 一般都发 arm64/x86_64 双 wheel，可行但需要在实现 daemon 打包脚本时验证）。
+
+### 根因更正：PyInstaller 能否跨架构，取决于基础解释器是不是 universal2
+
+评审指出：本文档早期版本把"PyInstaller 在 macOS 上无法跨架构"写成 PyInstaller 的固有属性，但
+`build.sh` 用的基础解释器（`uv venv --python 3.12` 解析到
+`~/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`）本身就是 thin
+arm64 build——PyInstaller 在 macOS 上的跨架构支持前提是基础 CPython 必须是 universal2 build
+（它从 fat 二进制里按需提取对应架构的切片，不是凭空生成机器码），给它一个 thin 解释器，产出
+"标签对、内容错"的假 x86_64 产物正是预期行为，不是 PyInstaller 的 bug。这个对照实验此前没做，
+本次评审后补上：
+
+**对照实验**（在本分支之外的 scratchpad 里做的，不影响本分支任何产物）：
+
+1. 下载 python.org 官方 `python-3.12.8-macos11.pkg`（universal2 安装器），确认
+   `lipo -info` 显示 `x86_64 arm64` 两个真实架构切片（不是重标记）。
+2. 该安装器默认要装到 `/Library/Frameworks/Python.framework`（需要 root）；本机无 sudo，
+   用 `pkgutil --expand-full` 解包到本地目录，再用 `install_name_tool -change` 把所有
+   引用 `/Library/Frameworks/Python.framework/...` 的 Mach-O（`bin/python3.12`、
+   `Resources/Python.app/Contents/MacOS/Python`、`_ssl`/`_hashlib` 等扩展模块，共 13 个文件）
+   改成指向本地路径，`codesign --sign -` 重签——这是本机无管理员权限时的变通做法，**正常开发
+   机上直接 `sudo installer -pkg python-3.12.8-macos11.pkg -target /` 不需要这些步骤**。
+3. 用这个可运行的 universal2 解释器建 venv、装 `pyinstaller==6.11.1`，对
+   `packaging/daemon-min/ping_daemon.py` 跑 `--target-architecture x86_64`：
+   ```
+   $ file dist/jones-daemon-spike-x86/_internal/Python
+   dist/.../_internal/Python: Mach-O 64-bit dynamically linked shared library x86_64
+   $ file dist/jones-daemon-spike-x86/_internal/lib-dynload/_socket.cpython-312-darwin.so
+   dist/.../_socket.cpython-312-darwin.so: Mach-O 64-bit bundle x86_64
+   ```
+   `_internal/Python`（真正的 libpython）和所有扩展模块都是**真实的 x86_64 切片**，不是重标记。
+4. 对照组：用原来 `build.sh` 那个 thin arm64 解释器（`uv python install
+   cpython-3.12-macos-aarch64-none`）重复同一条 PyInstaller 命令：
+   ```
+   $ file dist/jones-daemon-spike-thinrepro/_internal/libpython3.12.dylib
+   dist/.../libpython3.12.dylib: Mach-O 64-bit dynamically linked shared library arm64
+   ```
+   复现了原文档的发现：bootloader 可执行文件标签是 x86_64，内部 `libpython3.12.dylib`
+   却是 arm64——这正是"基础解释器是 thin build"导致的，不是 PyInstaller 在 macOS 上
+   跨架构能力的固有缺陷。
+
+（本机仍然没有 Rosetta 2，两组产物都无法在本机实际跑起来验证运行时行为——这一限制与更正前
+一致，没有变化，见 §5、§6。）
+
+**结论没有翻转，理由整个换了**：本 spike 仍然建议用 python-build-standalone（见上），但不是
+因为"PyInstaller 做不到"，是因为它更贴合本仓库已经选定的 uv 工具链、不需要在 CI/开发机上
+额外安装一个脱离 uv 管理的 python.org universal2 解释器。如果团队后续决定要接入 x86_64 CI
+runner，或者不介意让 uv 之外的官方安装器进入构建链路，PyInstaller + universal2 基础解释器
+是一条同样可行的路径。
 
 ## 2. Electron 集成：extraResources 跑通
 
@@ -58,7 +127,17 @@ PyPI 大厂商模型 SDK 一般都发 arm64/x86_64 双 wheel，可行但需要�
   `app.getPath("userData")` 下的运行时目录（真实实现会是 `~/.jones/runtime`）。
 - **实测跑通**：`open JonesPackagingSpike.app` → Electron main 进程 spawn 守护进程 → 用独立 Python
   脚本连 `~/Library/Application Support/jones-packaging-spike/spike-runtime/daemon.sock` 发
-  `{"cmd":"ping"}`，收到 `{"pong": true, "pid": ..., "uptime_s": ...}`。签名前后各验证一次，行为一致。
+  `{"cmd":"ping"}`，收到 `{"pong": true, "pid": ..., "uptime_s": ...}`。
+
+  **更正**：ping_daemon.py 的探活逻辑是「socket 能连上就直接退出，不抢占」（见 §0 的 daemon-min），
+  main.js 原来只挂 `window-all-closed`，Cmd+Q 走的是 `app.quit()` → `will-quit`，不会先发
+  `window-all-closed`（Electron 文档明确的行为），旧 daemon 会变成孤儿进程继续占着 socket。
+  这意味着「签名前后各验证一次，行为一致」这个结论有被污染的风险：如果第一次验证后用 Cmd+Q
+  关闭、daemon 没被杀掉，第二次 `open .app` 时新 spawn 的 daemon 会因为探活到旧实例而立刻退出，
+  外部脚本连上的其实是上一轮的旧进程，签名后的验证可能根本没有跑在签名后的二进制上。
+  已修复 `main.js`（`will-quit` 也挂清理逻辑，`spawnDaemon` 打印 `spawned daemon pid=...`），
+  验证时应对比这个 pid 与 `pong` 响应里的 `pid` 字段，确认连的是本轮刚起的实例，不是遗留进程
+  （见「修复记录」）。
 
 ## 3. 签名（本机无 Developer ID，做到 ad-hoc）
 
@@ -66,7 +145,13 @@ PyPI 大厂商模型 SDK 一般都发 arm64/x86_64 双 wheel，可行但需要�
 再签 Python 解释器主体，最后 `--deep` 签整个 `.app`），实测结果：
 
 - `codesign --verify --deep --strict`：**valid on disk, satisfies its Designated Requirement**——
-  说明签名结构、entitlements、嵌套 bundle 的封装关系是对的。
+  但这条只证明 `.app` 本体与 `--deep` 会遍历的标准嵌套位置（`Contents/Frameworks` 下的
+  Framework / Helper.app 等）签名结构是对的。**实测确认它不覆盖 `Contents/Resources/daemon`**：
+  在本分支产物上跑 `codesign -dv --deep --strict --verbose=4`，输出里涉及
+  `Resources/daemon` 路径的条数是 0——`--deep` 只走 Apple 认识的标准嵌套 code 位置，
+  `Resources` 下的文件只是作为资源被哈希封装进外层签名，不会被当作独立代码校验。
+  daemon 载荷本身（Python 解释器与其 `.dylib`/`.so`）的签名结构是否正确，这条命令
+  证明不了——真正会做这项检查的是 notarytool 扫描（见 §3.2 与 Issue #33）。
 - `spctl --assess --type execute`：**rejected**——这是**预期行为**，不是 bug。ad-hoc 签名
   （`--sign -`）没有 Apple 信任的 Developer ID，Gatekeeper 必然拒绝，任何本机没有付费开发者账号的
   情况下都会是这个结果。签名后重新 `open` 验证：daemon 依旧能正常拉起并回 pong，说明签名（含
@@ -125,18 +210,17 @@ daemon 空壳本身的冷启动/内存数据（§1 表格）是在本机 arm64 �
 | 验收项 | 结果 |
 |---|---|
 | 全新 mac 上安装并启动成功 | **未验证**——需要真实的全新 mac（本机是开发机，有大量已装软件/缓存），也需要正式签名+公证（ad-hoc 包在全新 mac 上会被 Gatekeeper 挡住，这不是「安装启动失败」而是「没有开发者证书的必然结果」，已在 §3 复现并解释） |
-| Gatekeeper 不拦 | **未达成，原因明确**：本机没有 Apple Developer 账号，只能做 ad-hoc 签名；`spctl --assess` 已实测确认 ad-hoc 必被拒，正式签名+公证所需的完整命令序列见 §3.2，逻辑已用 `codesign --verify` 验证过（签名结构对，只是身份不是 Developer ID） |
+| Gatekeeper 不拦 | **未达成，原因明确**：本机没有 Apple Developer 账号，只能做 ad-hoc 签名；`spctl --assess` 已实测确认 ad-hoc 必被拒，正式签名+公证所需的完整命令序列见 §3.2。`codesign --verify` 只验证了 `.app` 本体与标准嵌套位置的签名结构，**不能**证明 daemon 载荷（`Resources/daemon` 下的 Python 解释器与其动态库）的签名/entitlements/hardened runtime 是对的——见 §3 的更正。这条风险实际尚未退休，后续追踪见 [Issue #33](https://github.com/nativeas/jones-agent/issues/33) |
 | Apple Silicon 与 Intel 各一份 | **Apple Silicon：完整达成**（打包、签名、启动、daemon 通信全部实测通过）。**Intel：打包产物已生成且架构标记正确，但因本机无 Rosetta 2、无法执行验证**，见 §5 |
 
 ## 7. 给评审者的关注点
 
-1. **核心结论是路线选择，不是"两个都能用"**：真实 daemon 打包应该用 python-build-standalone
-   而不是 PyInstaller，因为 W1-W6 全程本机只有 Apple Silicon 开发机，PyInstaller 路线会让 Intel
-   包完全打不出来直到接入专门的 x86_64 CI。这个判断改变了 `docs/design/00-foundation.md` §2
-   技术栈表里「打包：PyInstaller」的选择——**建议把设计文档改成 python-build-standalone**，我没有
-   在本 spike 里改 `docs/design/`（按 DEV.md 要求"改接口先改文档"，但打包方式不是 daemon⇄前端的
-   接口契约，是否要正式改文档由评审者判断；我在这里把证据和建议摆出来，不越权替 W6 打包实现者
-   决定）。
+1. **核心结论是路线选择，不是"两个都能用"**：真实 daemon 打包用 python-build-standalone 而不是
+   PyInstaller，理由是它和本仓库已选定的解释器管理工具 `uv` 一致、零额外步骤、不需要管理员权限
+   （见上方「根因更正」）——**不是**"PyInstaller 在 macOS 上做不到跨架构"，那个说法已被证明不成立
+   （给它一个 universal2 基础解释器，PyInstaller 一样能产出正确的 x86_64 产物，已实测）。
+   `docs/design/00-foundation.md` §2 技术栈表已经在本次修复里同步改成 python-build-standalone，
+   理由写的是这条更正后的真实理由，不是被撤回的错误断言。
 2. **Intel 侧没有实机验证**，只做到了「资源架构正确 + 打包结构正确」。如果 W6 前团队拿不到 Intel
    测试机，需要接入带 Rosetta 或原生 x86_64 的 CI runner（GitHub Actions `macos-13` 系列是 Intel
    原生的）才能补上这块。
@@ -145,8 +229,9 @@ daemon 空壳本身的冷启动/内存数据（§1 表格）是在本机 arm64 �
    daemon 引入 `hermes-agent` 之后这些库会更多，需要在打包脚本里做「签目录下所有 .dylib/.so」
    的遍历（`sign-adhoc.sh` 已经是这个写法，可以直接复用）。
 4. **性能数字只测了空壳**：真实 daemon 加载 `hermes-agent`、SQLite migration 等之后，冷启动
-   和内存会显著高于本 spike 的 55ms / 20MB，11.1/11.2 的验收要在真实 daemon 完成后重新测，本
-   spike 只证明「打包机制本身」不是瓶颈（55ms 距离 6s 冷启动预算有充分余量，但不能外推到真实功能）。
+   和内存会显著高于本 spike §1 表格的数字（~70-80ms / ~18-24MB，`measure.sh` 可复现），11.1/11.2
+   的验收要在真实 daemon 完成后重新测，本 spike 只证明「打包机制本身」不是瓶颈（这个量级距离
+   6s 冷启动预算有充分余量，但不能外推到真实功能）。
 5. **launchd plist 是草案，没有接入真实安装流程**：真实的"写 plist → bootstrap → 崩溃拉起"逻辑
    要在 daemon 或 apps/desktop 的安装/启动代码里实现并测试 G11（Electron 关闭后 Cron 仍触发），
    本 spike 没有验证 launchd 拉起本身（写了 plist 但没有 `launchctl bootstrap` 实际跑一遍，因为
@@ -167,7 +252,17 @@ file dist/arm64/python/bin/python3.12 dist/x64/python/bin/python3.12   # 确认�
 # Electron 打包（用方案 B 的产物）
 cd packaging/electron-shell && pnpm install
 pnpm run build:arm64   # 或 build:x64
-open dist/mac-arm64/JonesPackagingSpike.app   # 会拉起 daemon，看 Console.app 或直接连 socket 验证
+open dist/mac-arm64/JonesPackagingSpike.app   # 会拉起 daemon，控制台会打印 "spawned daemon pid=<PID>"
+python3 -c 'import socket,json; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); \
+  s.connect("~/Library/Application Support/jones-packaging-spike/spike-runtime/daemon.sock"); \
+  s.sendall(b"{\"cmd\":\"ping\"}\n"); print(s.recv(4096))'
+# 把 pong 里的 pid 和控制台打印的 "spawned daemon pid=" 对比，确认连的是这一轮刚起的实例，
+# 不是上一轮遗留的孤儿 daemon（见 §2 的更正）。验证完用 Cmd+Q 或 window 关闭退出，
+# 确认 daemon 也退出了（ps 里找不到、~/Library/.../spike-runtime/daemon.sock 消失）。
+
+# 冷启动 / 空闲 RSS（可复现，替代已删除的 boot_s 字段）
+packaging/daemon-min/measure.sh packaging/standalone/dist/arm64/run.sh 5
+packaging/daemon-min/measure.sh packaging/pyinstaller/dist/jones-daemon-spike/jones-daemon-spike 5
 
 # 签名与校验
 cd packaging/sign

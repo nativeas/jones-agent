@@ -69,7 +69,9 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
 
     start = time.time()
-    log("started", pid=os.getpid(), sock=str(SOCK_PATH), boot_s=round(time.time() - start, 4))
+    # 冷启动耗时（exec 之前的时间）在进程内部量不到，量出来也只是这一行代码
+    # 前后的一次减法——真正的数字必须由外部计时（见 measure.sh），这里不再假装测量它。
+    log("started", pid=os.getpid(), sock=str(SOCK_PATH))
 
     try:
         while _running:

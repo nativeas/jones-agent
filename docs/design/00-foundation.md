@@ -26,7 +26,7 @@ jones-agent/
 │   ├── src/preload/         # 仅暴露 `window.jones` 的白名单 API
 │   ├── src/renderer/        # React 三栏 UI（无 Node 权限）
 │   └── tests/
-├── packaging/               # launchd plist、PyInstaller spec、electron-builder 配置、签名脚本
+├── packaging/               # launchd plist、python-build-standalone 打包脚本、electron-builder 配置、签名脚本
 ├── docs/                    # PRD、design、spikes
 ├── .github/workflows/ci.yml # pytest + ruff + pnpm test + tsc
 └── Makefile                 # make check = 全部 lint + test
@@ -42,7 +42,7 @@ jones-agent/
 | RPC | JSON-RPC 2.0，NDJSON，Unix domain socket | 流式、简单、无 TCP（PRD 11.3） |
 | 桌面 | Electron 33+，electron-vite，React 18，TypeScript strict，Zustand | 轻、快、够用 |
 | 测试 | pytest / vitest；ruff；tsc --noEmit | |
-| 打包 | PyInstaller（daemon 单目录）+ electron-builder（把 daemon 作为 extraResources） | spike #2 验证 |
+| 打包 | python-build-standalone（预编译解释器直接拷贝，daemon 单目录）+ electron-builder（把 daemon 作为 extraResources） | spike #2 验证：跟本仓库解释器管理工具 `uv` 一致（`uv python install <target-triple>` 零额外步骤拿到对应架构解释器），不需要装 uv 管理之外的 universal2 安装器；PyInstaller 并非做不到跨架构（给 universal2 基础解释器同样可行），只是需要多一条脱离 uv 的安装路径，见 `docs/spikes/02-packaging.md` §1 |
 
 ## 3. 进程模型
 

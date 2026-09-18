@@ -23,9 +23,30 @@ function spawnDaemon() {
     env: { ...process.env, JONES_SPIKE_HOME: path.join(app.getPath("userData"), "spike-runtime") },
     stdio: "inherit",
   });
-  daemonProc.on("exit", (code) => {
-    console.log(`[spike] daemon exited code=${code}`);
+  // 没有 'error' 监听时，spawn 目标不存在会在 Electron 主进程里变成未捕获异常
+  // （已实测：node 22 对不存在的可执行文件抛 Unhandled 'error' event，进程崩溃）。
+  // 这正是本 spike 要验证的失败模式之一（daemon 路径在打包后失效），必须捕获成
+  // 可见的错误而不是让 app 直接崩掉、把「daemon 路径错了」误报成「app 崩了」。
+  daemonProc.on("error", (err) => {
+    console.error(`[spike] failed to spawn daemon at ${exe}: ${err.message}`);
+    daemonProc = null;
   });
+  daemonProc.on("exit", (code, signal) => {
+    console.log(`[spike] daemon exited code=${code} signal=${signal}`);
+    daemonProc = null;
+  });
+  // run.sh 用 exec 拉起 python（见 packaging/standalone/build.sh），exec 不 fork，
+  // 所以这个 pid 就是 daemon 进程本身的 pid——验证时应该拿它去和 pong 响应里的
+  // pid 字段比对，确认连上的是这一次刚 spawn 的实例，而不是上一轮遗留的旧 daemon
+  // （见 docs/spikes/02-packaging.md §2 与「如何验证」一节）。
+  console.log(`[spike] spawned daemon pid=${daemonProc.pid} exe=${exe}`);
+}
+
+function stopDaemon() {
+  if (daemonProc) {
+    daemonProc.kill("SIGTERM");
+    daemonProc = null;
+  }
 }
 
 function createWindow() {
@@ -41,6 +62,13 @@ app.whenReady().then(() => {
 });
 
 app.on("window-all-closed", () => {
-  if (daemonProc) daemonProc.kill("SIGTERM");
+  stopDaemon();
   app.quit();
+});
+
+// Cmd+Q / app.quit() 走 will-quit，不会先发 window-all-closed（Electron 文档明确的行为）。
+// 只挂 window-all-closed 会让 Cmd+Q 退出时 daemon 变成孤儿进程——spawn 没有 detached，
+// 但 Node 不会在父进程退出时自动杀子进程。这里两条路径都挂，stopDaemon 本身是幂等的。
+app.on("will-quit", () => {
+  stopDaemon();
 });

@@ -50,9 +50,13 @@
         <string>__JONES_HOME__</string>
     </dict>
 
-    <!-- 不设 TCP，socket 路径由 daemon 自己在 JONES_HOME/runtime/daemon.sock 创建，不需要 Sockets 键。 -->
+    <!-- 不设 TCP，socket 路径由 daemon 自己在 JONES_HOME/runtime/daemon.sock 创建，不需要 Sockets 键。
+         ProcessType 用 Adaptive 而不是 Background：daemon 要同步响应 Electron 前端发起的 RPC
+         并写 SQLite，是「参与用户发起操作」的工作，不是纯后台批处理。launchd.plist(5) 里
+         Background 档会被系统施加 CPU / 磁盘 I/O 节流（含最低档磁盘 I/O 限流），会直接吃掉
+         PRD 11.1 的交互延迟预算；Adaptive 允许 daemon 按调用方需要在前台/后台优先级间切换。 -->
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Adaptive</string>
 
     <!-- 不需要在前台保留；用户注销时随 session 退出。 -->
     <key>ExitTimeOut</key>

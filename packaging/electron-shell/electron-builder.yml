@@ -24,8 +24,17 @@ mac:
   gatekeeperAssess: false
   entitlements: entitlements.mac.plist
   entitlementsInherit: entitlements.mac.plist
-  # 无开发者证书时留空，electron-builder 会退回 ad-hoc 签名（identity: null 显式声明）。
-  # 正式发布前替换为 "Developer ID Application: <公司名> (<TEAMID>)"
+  # identity: null 不是「退回 ad-hoc 签名」——已在 app-builder-lib@25.1.8 的
+  # out/macPackager.js:183-188 核实：qualifier === null 时整段 mac 签名直接 return false，
+  # 完全跳过，一次都不执行。也就是说上面的 hardenedRuntime / entitlements /
+  # entitlementsInherit 三项在本 spike 里从未真正生效过——本 spike 验证过的是
+  # packaging/sign/sign-adhoc.sh 手工签名那条路径（对 dist/mac-arm64/*.app 事后补签），
+  # 不是这份 yml 配置本身的签名路径。electron-builder 签名路径（含 entitlements 相对路径
+  # 解析、entitlementsInherit 对各 Helper 进程是否生效）本 spike 未验证，需要真实
+  # Developer ID 证书才能跑一遍，见 docs/spikes/02-packaging.md §3 与 §7。
+  # 正式发布前把这里换成 "Developer ID Application: <公司名> (<TEAMID>)"，
+  # 让 electron-builder 走它自己的 Frameworks/Helpers 签名逻辑（不要照搬 sign-adhoc.sh
+  # 的 --deep 手工签整个 .app，见该脚本末尾注释）。
   identity: null
 dmg:
   sign: false
