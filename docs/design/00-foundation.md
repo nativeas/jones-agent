@@ -267,6 +267,15 @@ BrowserMcpSession（daemon 内部状态，非 SQLite 表，进程重启即丢—
       ③ `browser_evaluate` 求值的表达式里含网络请求（`fetch`/
       `XMLHttpRequest` 等）或存储写入（`localStorage`/`sessionStorage`/
       `indexedDB`/写 cookie 等）。
+    - **兜底档（控制者裁定，第三轮复审补）**：上面三档没有点名的任何工具
+      ——包括但不限于 `browser_run_code_unsafe`、`browser_network_request`、
+      以及未来新版本 Playwright MCP 新增的工具——**一律用户闸**（fail-closed）。
+      规则闸的默认映射表在 daemon 启动时与 `tools/list` 实际返回比对，出现
+      未映射工具名即记 warning 日志并按用户闸处理，不允许「未知即放行」。
+    - **下载**：v1 不支持浏览器下载。导航或点击若触发下载，daemon 侧对该
+      次调用按用户闸处理（能否在 MCP 启动参数层面直接禁用下载，由 FR09
+      实现 Issue 核实锁定版本的参数后决定），而不是让 `browser_navigate`
+      的规则闸放行与「下载不低于审查闸」互相打架。
     - 分级由 Jones 规则闸按 MCP 工具名做默认映射（上面前两档是固定映射，
       第三档由审查闸在放行到它手上的调用里逐次判断触发，不是独立的工具名
       规则）；用户可以在 `permissions.json` 里针对具体工具名进一步收紧
