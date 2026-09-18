@@ -22,13 +22,15 @@ arm64 + x86_64 切片）的基础解释器，PyInstaller 能正确产出跑得�
 ```
 packaging/
 ├── daemon-min/ping_daemon.py     # 最小 Python 守护进程：Unix socket，收 {"cmd":"ping"} 回 pong
-├── pyinstaller/build.sh          # 方案 A：PyInstaller onedir（本机基础解释器是 thin arm64，只能产出宿主机架构；给 universal2 基础解释器能跨架构，见 §1 根因更正）
+├── legacy/pyinstaller/build.sh   # 方案 A：PyInstaller onedir（本机基础解释器是 thin arm64，只能产出宿主机架构；给 universal2 基础解释器能跨架构，见 §1 根因更正）。**控制者裁定打包方案定案为 python-build-standalone，本脚本移到 legacy/ ——不是生产路径，留着只为 §1 对比表格 / 根因更正结论可复现**
 ├── standalone/build.sh           # 方案 B：python-build-standalone + 直接拷贝（可跨架构）
 ├── electron-shell/               # 最小 Electron 壳 + electron-builder 配置
 │   ├── main.js
 │   ├── electron-builder.yml
 │   └── entitlements.mac.plist
-├── launchd/com.jones.daemon.plist  # LaunchAgent 草案
+├── launchd/
+│   ├── com.jones.daemon.plist     # LaunchAgent 草案
+│   └── install.sh                 # 生成真实 plist + 预创建日志目录（不执行 launchctl bootstrap，见 §4）
 └── sign/
     ├── sign-adhoc.sh             # 本机可跑：ad-hoc 签名 + 校验 + 正式流程步骤留档
     └── notarize.sh               # 正式公证命令（需要开发者账号，本机未执行）
@@ -36,19 +38,35 @@ packaging/
 
 ## 1. 两种打包方案对比（实测）
 
-冷启动 / 空闲 RSS 数字用 `packaging/daemon-min/measure.sh <daemon 可执行文件> [重复次数]`
-复现（外部计时：spawn 到 socket 可连接为止；daemon 进程自己测不出这段时间，见该脚本头部
-注释与 `ping_daemon.py` 里删掉的 `boot_s` 字段——那个字段之前恒为 0，因为两行代码之间的
-`time.time()` 减法什么都没测到）。
+冷启动 / 空闲 RSS 数字用 `packaging/daemon-min/measure.sh <daemon 可执行文件> [重复次数，默认 3]`
+复现。
+
+**计时方法（第二轮评审后修正）**：daemon 自己在 socket 进入可 accept 状态的那一刻，把
+`time.monotonic_ns()` 写进结构化日志（`ping_daemon.py` 的 `started` 事件，`ready_monotonic_ns`
+字段）；`measure.sh` 只用「spawn 前自己取的 monotonic_ns」减「daemon 报告的 ready
+monotonic_ns」，不再像早期版本那样反复 spawn 一个 Python 探测子进程去轮询"socket 能不能连上"
+——那种做法会把每次探测子进程自身的 fork+exec 开销（数十毫秒量级）计进"冷启动"数字里，两条
+打包路线之间几毫秒到十几毫秒的差值在这个噪音面前没有意义（评审记录第二轮意见 1）。修正后
+轮询循环只用来判断"该不该继续等"（读文件 + grep，不再 spawn 解释器），不参与计时。
+
+（`ping_daemon.py` 里没有 `boot_s` 字段——早期版本试过在进程内部用两行代码之间的
+`time.time()` 减法测冷启动，那个数字恒为 0，因为 exec 之前的时间进程自己根本看不到，
+已删掉，改成上面这种外部 spawn 时刻 + 内部 ready 时刻各自上报、事后相减的方式。）
 
 | | PyInstaller onedir | python-build-standalone（直接拷贝，已裁剪 tcl/tk） |
 |---|---|---|
 | 产物体积（daemon 目录，空壳脚本） | 20 MB | 39 MB（裁剪前 50MB，见下方修复记录：standalone 默认带 tcl/tk，headless daemon 用不到，PyInstaller 会自动裁剪、之前不是同口径对比） |
-| 冷启动到 socket 可用（`measure.sh` 复现，5 次，排除首次磁盘缓存冷启动后取稳态均值） | ~69 ms | ~78 ms |
-| 空闲 RSS | ~23.7 MB | ~18.3 MB |
+| 冷启动到 daemon 自报 ready（`measure.sh` 复现，3 次取中位数，spawn→ready，见上方「计时方法」） | ~28 ms | ~28 ms |
+| 空闲 RSS（同一批 3 次运行，取中位数） | ~23.2 MB | ~17.9 MB |
 | **能否在 arm64 主机上产出正确的 x86_64 产物** | **取决于基础解释器**（见下方「根因更正」）：给 `uv python install cpython-3.12-macos-x86_64-none` 这种 thin 解释器——不能，`--target-architecture x86_64` 只转换 bootloader 的 Mach-O 架构标记，内部 `libpython3.12.dylib` 仍是宿主机（arm64）编译的；给 python.org 官方 universal2 安装器装出来的解释器——**能**，已实测确认内部 `Python`/`.so` 全部是真正的 x86_64 切片 | **能**：只是下载对应架构的官方预编译解释器 tarball 再拷贝文件，不需要执行任何目标架构代码，天然跨架构，且直接用本仓库已有的 `uv python install`，不需要额外装什么 |
 | 拿到可用基础解释器的方式 | 需要 python.org 官方 **universal2** 安装器（`.pkg`，装到 `/Library/Frameworks`，需要管理员权限）——`uv python install` 不提供 universal2 build，只有 thin per-arch build | `uv python install cpython-3.12-macos-{aarch64,x86_64}-none`，本仓库其他地方（`daemon/`）已经在用 uv 管理解释器，零额外步骤，不需要管理员权限 |
 | 适用场景 | 有 universal2 基础解释器时单机可跨架构；否则退化为单架构 CI（各架构一台 runner，或至少各自 native 构建一次） | 单机零配置产出全部目标架构；代价是体积略大、需要自己管理 site-packages（真实 daemon 有 `hermes-agent` 等第三方依赖时要把 venv 的 site-packages 一起拷进去） |
+
+**修正后的冷启动数字说明**：两条路线的 spawn→ready 耗时在修正计时方法后都是 ~28ms，
+统计上没有可辨的差异——这符合预期，因为两条路线用的都是官方 CPython 解释器（一个是官方
+预编译 tarball，一个是 PyInstaller 打包同一份宿主机解释器），冷启动瓶颈是 CPython 解释器
+自身的初始化，不是打包机制。**选型不基于冷启动数字**（两者打平），理由仍然是上面写的
+工具链一致性（见下方「结论」）。
 
 **结论**：两条路线都能在 arm64 开发机上产出正确的 x86_64 产物，**但前提不同**。PyInstaller 需要
 一个 universal2 基础解释器，本仓库的解释器管理工具 `uv`（`daemon/` 已经在用）不提供这种 build，
@@ -185,9 +203,19 @@ Hardened Runtime 默认会拦。用到的三项：
 
 `packaging/launchd/com.jones.daemon.plist`：`RunAtLoad` + `KeepAlive.Crashed=true`（崩溃拉起，
 正常退出不拉起，避免用户主动 quit 后被强行复活）、`ThrottleInterval=10` 防止崩溃死循环耗电、
-日志分离到 `stdout`/`stderr` 两个文件。路径用占位符（`__DAEMON_EXECUTABLE__` / `__JONES_HOME__`），
-由 Electron 首次启动时写入真实绝对路径后再 `launchctl bootstrap gui/$(id -u) <plist>`——这部分是
-真实实现（daemon/ 或 apps/desktop/ 的安装逻辑）要做的，不在本 spike 范围内，只提供草案。
+日志分离到 `stdout`/`stderr` 两个文件、`ProcessType=Interactive`（第二轮评审更正，理由见 plist
+内注释与修复记录第 6 条：daemon 走普通 Unix socket 服务 Electron 的交互式 RPC，不经过 XPC，
+`Adaptive` 档依赖的 Mach 重要性传导用不上，`Interactive` 是不依赖调用方式的显式声明）。路径用
+占位符（`__DAEMON_EXECUTABLE__` / `__JONES_HOME__`）。
+
+`packaging/launchd/install.sh`（第二轮评审新增）：把 plist 里的占位符替换成真实路径、写到
+`~/Library/LaunchAgents/`、**在此之前先 `mkdir -p` 日志目录**（launchd 不会为
+`StandardOutPath`/`StandardErrorPath` 自动建父目录，目录不存在时 job 要么 bootstrap 直接报错，
+要么静默丢日志，行为随 macOS 版本而异，不可依赖）。跟 plist 本身一样是草案：本脚本写到
+"生成 plist + 建目录"为止，不实际执行最后一步 `launchctl bootstrap`——那会在本机常驻注册一个
+真实服务，超出 spike 范围；真实的"首次启动时安装"逻辑最终要写进 apps/desktop/ 的 Electron
+启动代码（daemon 可执行文件路径届时是已知的），这里只提供可读的参考实现，供本 spike 验证
+日志目录预创建这一步本身是否正确（已用一次性临时 `JONES_HOME` 跑通，见下方「修复后验证」）。
 
 ## 5. 各架构出包与实测数据
 
@@ -229,19 +257,21 @@ daemon 空壳本身的冷启动/内存数据（§1 表格）是在本机 arm64 �
    daemon 引入 `hermes-agent` 之后这些库会更多，需要在打包脚本里做「签目录下所有 .dylib/.so」
    的遍历（`sign-adhoc.sh` 已经是这个写法，可以直接复用）。
 4. **性能数字只测了空壳**：真实 daemon 加载 `hermes-agent`、SQLite migration 等之后，冷启动
-   和内存会显著高于本 spike §1 表格的数字（~70-80ms / ~18-24MB，`measure.sh` 可复现），11.1/11.2
+   和内存会显著高于本 spike §1 表格的数字（~28ms / ~18-24MB，`measure.sh` 可复现），11.1/11.2
    的验收要在真实 daemon 完成后重新测，本 spike 只证明「打包机制本身」不是瓶颈（这个量级距离
    6s 冷启动预算有充分余量，但不能外推到真实功能）。
-5. **launchd plist 是草案，没有接入真实安装流程**：真实的"写 plist → bootstrap → 崩溃拉起"逻辑
-   要在 daemon 或 apps/desktop 的安装/启动代码里实现并测试 G11（Electron 关闭后 Cron 仍触发），
-   本 spike 没有验证 launchd 拉起本身（写了 plist 但没有 `launchctl bootstrap` 实际跑一遍，因为
-   这会在本机常驻注册一个服务，超出 spike 该做的范围，且真实路径要等 daemon 可执行文件定型）。
+5. **launchd plist + `install.sh` 是草案，没有接入真实安装流程**：`install.sh`（第二轮评审新增）
+   把"生成真实 plist + 预创建日志目录"这一步做成可复现脚本，但真实的"写 plist → bootstrap →
+   崩溃拉起"完整逻辑要在 daemon 或 apps/desktop 的安装/启动代码里实现并测试 G11（Electron 关闭后
+   Cron 仍触发），本 spike 没有验证 launchd 拉起本身（`install.sh` 故意不执行最后一步
+   `launchctl bootstrap`，因为这会在本机常驻注册一个服务，超出 spike 该做的范围，且真实路径要等
+   daemon 可执行文件定型）。
 
 ## 8. 如何复现
 
 ```bash
 # 方案 A：PyInstaller（只能在当前架构跑）
-cd packaging/pyinstaller && ./build.sh
+cd packaging/legacy/pyinstaller && ./build.sh
 JONES_SPIKE_HOME=/tmp/x ./dist/jones-daemon-spike/jones-daemon-spike &
 python3 -c 'import socket,json; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect("/tmp/x/daemon.sock"); s.sendall(b"{\"cmd\":\"ping\"}\n"); print(s.recv(4096))'
 
@@ -253,16 +283,16 @@ file dist/arm64/python/bin/python3.12 dist/x64/python/bin/python3.12   # 确认�
 cd packaging/electron-shell && pnpm install
 pnpm run build:arm64   # 或 build:x64
 open dist/mac-arm64/JonesPackagingSpike.app   # 会拉起 daemon，控制台会打印 "spawned daemon pid=<PID>"
-python3 -c 'import socket,json; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); \
-  s.connect("~/Library/Application Support/jones-packaging-spike/spike-runtime/daemon.sock"); \
+python3 -c 'import socket,os; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); \
+  s.connect(os.path.expanduser("~/Library/Application Support/jones-packaging-spike/spike-runtime/daemon.sock")); \
   s.sendall(b"{\"cmd\":\"ping\"}\n"); print(s.recv(4096))'
 # 把 pong 里的 pid 和控制台打印的 "spawned daemon pid=" 对比，确认连的是这一轮刚起的实例，
 # 不是上一轮遗留的孤儿 daemon（见 §2 的更正）。验证完用 Cmd+Q 或 window 关闭退出，
 # 确认 daemon 也退出了（ps 里找不到、~/Library/.../spike-runtime/daemon.sock 消失）。
 
-# 冷启动 / 空闲 RSS（可复现，替代已删除的 boot_s 字段）
-packaging/daemon-min/measure.sh packaging/standalone/dist/arm64/run.sh 5
-packaging/daemon-min/measure.sh packaging/pyinstaller/dist/jones-daemon-spike/jones-daemon-spike 5
+# 冷启动 / 空闲 RSS（spawn→daemon 自报 ready，3 次取中位数，见 §1「计时方法」）
+packaging/daemon-min/measure.sh packaging/standalone/dist/arm64/run.sh
+packaging/daemon-min/measure.sh packaging/legacy/pyinstaller/dist/jones-daemon-spike/jones-daemon-spike
 
 # 签名与校验
 cd packaging/sign

@@ -51,12 +51,16 @@
     </dict>
 
     <!-- 不设 TCP，socket 路径由 daemon 自己在 JONES_HOME/runtime/daemon.sock 创建，不需要 Sockets 键。
-         ProcessType 用 Adaptive 而不是 Background：daemon 要同步响应 Electron 前端发起的 RPC
-         并写 SQLite，是「参与用户发起操作」的工作，不是纯后台批处理。launchd.plist(5) 里
-         Background 档会被系统施加 CPU / 磁盘 I/O 节流（含最低档磁盘 I/O 限流），会直接吃掉
-         PRD 11.1 的交互延迟预算；Adaptive 允许 daemon 按调用方需要在前台/后台优先级间切换。 -->
+         ProcessType 用 Interactive，不用 Adaptive（第二轮评审后更正，见修复记录）：Adaptive 的
+         优先级提升依赖调用方通过 Mach 消息（XPC）「捐赠」重要性给被调进程——daemon 收到的是
+         Electron 走普通 Unix domain socket 发来的 NDJSON RPC，不是 XPC，没有这条重要性传导
+         路径，launchd 拿不到信号去提升它，Adaptive 在这个场景下退化成跟 Standard 没有实质
+         区别，并不能保证不被节流。Interactive 是显式、无条件的分类，不依赖调用方式，直接
+         声明「这是为交互式用户操作服务的进程」，匹配 daemon 要同步响应 Electron RPC 并写
+         SQLite、参与 PRD 11.1 交互延迟预算这一事实；不用 Background 的原因不变（launchd.plist(5)
+         的 Background 档会被系统施加 CPU / 磁盘 I/O 节流，直接吃掉延迟预算）。 -->
     <key>ProcessType</key>
-    <string>Adaptive</string>
+    <string>Interactive</string>
 
     <!-- 不需要在前台保留；用户注销时随 session 退出。 -->
     <key>ExitTimeOut</key>

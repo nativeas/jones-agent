@@ -64,14 +64,22 @@ def main() -> int:
     server.bind(str(SOCK_PATH))
     server.listen(8)
     server.settimeout(0.5)
+    # listen() 一返回，socket 就已经可以 accept 了——这就是"ready"的那一刻，
+    # 在这里立刻取单调时钟时间戳，不要等到后面几行 signal 注册、log() 调用之后再取，
+    # 避免引入额外的、测量代码自己造成的延迟。用 monotonic_ns 而不是 time.time()，
+    # 是因为 measure.sh 要拿这个值跟自己 spawn 前记录的 monotonic_ns 相减算冷启动
+    # 耗时——CLOCK_MONOTONIC 在同一台机器上跨进程可比，wall clock 不适合算耗时差。
+    ready_ns = time.monotonic_ns()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
     start = time.time()
-    # 冷启动耗时（exec 之前的时间）在进程内部量不到，量出来也只是这一行代码
-    # 前后的一次减法——真正的数字必须由外部计时（见 measure.sh），这里不再假装测量它。
-    log("started", pid=os.getpid(), sock=str(SOCK_PATH))
+    # 冷启动耗时（exec 之前的时间）在进程内部量不到——但"从 exec 到这里 ready"这段，
+    # 现在由 ready_ns 精确标出。measure.sh 只算 spawn（外部）→ ready（这里）之间的差，
+    # 不再需要反复 spawn 探测子进程去猜测何时可连（那样会把探测进程自己的启动开销
+    # 计进冷启动数字，见评审记录第二轮意见 1）。
+    log("started", pid=os.getpid(), sock=str(SOCK_PATH), ready_monotonic_ns=ready_ns)
 
     try:
         while _running:

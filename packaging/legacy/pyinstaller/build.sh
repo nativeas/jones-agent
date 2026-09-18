@@ -6,6 +6,10 @@
 # （已实测验证，见 docs/spikes/02-packaging.md §1「根因更正」）。本仓库解释器工具链 uv
 # 不提供 universal2 build，只有 per-arch thin build，这也是最终选 python-build-standalone
 # 而不是这条路线的真实原因。
+#
+# 控制者裁定（评审第二轮）：打包方案定案为 python-build-standalone（见 packaging/standalone/），
+# 本脚本移到 packaging/legacy/ 下——不是生产路径，留着是因为 docs/spikes/02-packaging.md §1
+# 的对比表格与「根因更正」结论依赖它可复现，删掉这个脚本会让那部分结论失去可验证性。
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -23,7 +27,7 @@ pyinstaller \
   --clean \
   --distpath dist \
   --workpath build \
-  ../daemon-min/ping_daemon.py
+  ../../daemon-min/ping_daemon.py
 
 echo "built: $(pwd)/dist/jones-daemon-spike"
 du -sh dist/jones-daemon-spike
