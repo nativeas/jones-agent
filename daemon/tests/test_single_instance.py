@@ -1,4 +1,3 @@
-import asyncio
 import os
 import shutil
 import tempfile
@@ -7,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from jones_daemon import paths
-from jones_daemon.__main__ import _check_existing_instance
+from jones_daemon.__main__ import _acquire_single_instance_lock
 
 
 @pytest.fixture(autouse=True)
@@ -20,41 +19,56 @@ def jones_home(monkeypatch):
     shutil.rmtree(home, ignore_errors=True)
 
 
-def test_no_pid_file_is_a_noop():
-    _check_existing_instance()  # must not raise / exit
-    assert not paths.pid_file().exists()
+def test_first_instance_acquires_the_lock_and_writes_its_pid():
+    fh = _acquire_single_instance_lock()
+    try:
+        assert paths.pid_file().read_text().strip() == str(os.getpid())
+    finally:
+        fh.close()
 
 
-def test_stale_pid_file_dead_process_is_cleaned_up():
-    # PID 0 is never a real user process id we own; pick something guaranteed dead by
-    # spawning and immediately reaping a child.
-    import subprocess
-
-    proc = subprocess.Popen(["true"])
-    proc.wait()
-    dead_pid = proc.pid
-
-    paths.pid_file().write_text(str(dead_pid))
-
-    _check_existing_instance()  # must not exit
-
-    assert not paths.pid_file().exists()
-
-
-def test_pid_alive_but_socket_not_accepting_is_cleaned_up():
-    paths.pid_file().write_text(str(os.getpid()))
-    # No socket listening at paths.sock_file() -> treated as stale.
-    _check_existing_instance()
-    assert not paths.pid_file().exists()
-
-
-async def test_pid_alive_and_socket_accepting_exits(unused=None):
-    paths.pid_file().write_text(str(os.getpid()))
-    server = await asyncio.start_unix_server(lambda r, w: None, path=str(paths.sock_file()))
+def test_second_instance_is_rejected_while_the_first_holds_the_lock():
+    fh = _acquire_single_instance_lock()
     try:
         with pytest.raises(SystemExit) as exc_info:
-            _check_existing_instance()
+            _acquire_single_instance_lock()
         assert exc_info.value.code == 1
     finally:
-        server.close()
-        await server.wait_closed()
+        fh.close()
+
+
+def test_lock_is_released_when_the_holder_closes_its_handle():
+    fh = _acquire_single_instance_lock()
+    fh.close()  # simulates process exit: the OS releases the flock automatically
+
+    fh2 = _acquire_single_instance_lock()  # must not raise SystemExit
+    fh2.close()
+
+
+def test_missing_pid_file_does_not_bypass_the_lock_check():
+    # The old PID+socket probe treated "no PID file" as "no instance running" and
+    # returned early with no check at all — a cleared runtime/ dir or a restored
+    # backup could then let a second daemon start alongside a live one. There must
+    # be no such bypass: acquiring the lock still has to work correctly (and be
+    # exclusive) even though nothing has ever created the PID file yet.
+    assert not paths.pid_file().exists()
+    fh = _acquire_single_instance_lock()
+    try:
+        assert paths.pid_file().read_text().strip() == str(os.getpid())
+        with pytest.raises(SystemExit):
+            _acquire_single_instance_lock()
+    finally:
+        fh.close()
+
+
+def test_stale_pid_file_from_a_crashed_process_does_not_block_a_new_instance():
+    # A PID file can be left behind with a stale value and no lock held (the
+    # process was SIGKILLed before it could clean up). flock is per-open-file, not
+    # tied to the PID text written inside it, so a new instance must still be able
+    # to acquire it and overwrite the stale content.
+    paths.pid_file().write_text("999999")
+    fh = _acquire_single_instance_lock()
+    try:
+        assert paths.pid_file().read_text().strip() == str(os.getpid())
+    finally:
+        fh.close()

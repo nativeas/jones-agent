@@ -1,5 +1,7 @@
 import sqlite3
 
+import pytest
+
 from jones_daemon.store import migrator
 from jones_daemon.store.db import connect
 
@@ -84,5 +86,88 @@ def test_main_session_uniqueness_is_enforced(tmp_path):
         except sqlite3.IntegrityError as exc:
             with_error = exc
         assert with_error is not None
+    finally:
+        conn.close()
+
+
+def test_apply_pending_backs_up_the_db_file_before_migrating(tmp_path):
+    db_path = tmp_path / "jones.db"
+    conn = connect(db_path)
+    try:
+        migrator.apply_pending(conn)
+        backup = tmp_path / "jones.db.bak"
+        assert backup.exists()
+    finally:
+        conn.close()
+
+
+def test_apply_pending_skips_backup_when_nothing_is_pending(tmp_path):
+    db_path = tmp_path / "jones.db"
+    conn = connect(db_path)
+    try:
+        migrator.apply_pending(conn)  # v0 -> v1: db file exists by now, gets backed up
+        backup = tmp_path / "jones.db.bak"
+        backup.unlink()  # prove the *next* (no-op) call doesn't recreate it
+
+        migrator.apply_pending(conn)  # already at v1: nothing pending
+        assert not backup.exists()
+    finally:
+        conn.close()
+
+
+def test_backup_captures_committed_wal_data_via_checkpoint(tmp_path):
+    # store/db.py opens the connection in WAL mode: a committed row can live only
+    # in jones.db-wal until checkpointed back into jones.db. A backup that just
+    # copies jones.db without checkpointing first would silently miss it.
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    (migrations_dir / "001_init.sql").write_text(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);\n"
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);\n"
+    )
+    db_path = tmp_path / "jones.db"
+    conn = connect(db_path)
+    try:
+        migrator.apply_pending(conn, migrations_dir=migrations_dir)
+        conn.execute("INSERT INTO t (id, v) VALUES (1, 'hello')")
+        conn.commit()
+
+        # A second migration triggers a second backup, now with committed data
+        # sitting in the WAL that a naive file copy would miss.
+        (migrations_dir / "002_noop.sql").write_text("CREATE TABLE t2 (id INTEGER PRIMARY KEY);\n")
+        migrator.apply_pending(conn, migrations_dir=migrations_dir)
+
+        backup_conn = sqlite3.connect(str(tmp_path / "jones.db.bak"))
+        try:
+            row = backup_conn.execute("SELECT v FROM t WHERE id = 1").fetchone()
+            assert row == ("hello",)
+        finally:
+            backup_conn.close()
+    finally:
+        conn.close()
+
+
+def test_apply_pending_rolls_back_a_failed_migration_atomically(tmp_path):
+    # A migration with more than one DDL statement (the real-world trigger: an
+    # ALTER TABLE, which SQLite doesn't support with IF NOT EXISTS) can fail
+    # partway through. Without an explicit transaction, the statements before the
+    # failure point would already be committed — leaving a half-applied schema
+    # while schema_version still says v0, so a retry re-runs them against a
+    # database that no longer matches what the migration assumes.
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    (migrations_dir / "001_init.sql").write_text(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"
+        "INSERT INTO t (id) VALUES (1);\n"
+        "SELECT * FROM does_not_exist;\n"
+    )
+    conn = connect(tmp_path / "jones.db")
+    try:
+        with pytest.raises(sqlite3.Error):
+            migrator.apply_pending(conn, migrations_dir=migrations_dir)
+
+        assert migrator.current_version(conn) == 0
+        # the whole script was rolled back, not just left unversioned
+        assert "t" not in _table_names(conn)
     finally:
         conn.close()

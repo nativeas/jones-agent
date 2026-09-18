@@ -53,17 +53,23 @@ export class RpcClient {
   private reconnectAttempt = 0
   private reconnectTimer: NodeJS.Timeout | null = null
   private stopped = false
+  private connected = false
   private connectedWaiters: Array<{ resolve: () => void; reject: (err: Error) => void }> = []
 
   constructor(private readonly socketPath: string) {}
 
   connect(): void {
     this.stopped = false
+    // Idempotent: a second call while a socket is already open or mid-connect
+    // (e.g. macOS `activate` firing connect() again after window-all-closed
+    // already stopped and reopened one) must not leak a duplicate socket.
+    if (this.socket && !this.socket.destroyed) return
     this.openSocket()
   }
 
   stop(): void {
     this.stopped = true
+    this.connected = false
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
@@ -84,6 +90,7 @@ export class RpcClient {
     this.socket = socket
 
     socket.on('connect', () => {
+      this.connected = true
       this.reconnectAttempt = 0
       const waiters = this.connectedWaiters
       this.connectedWaiters = []
@@ -98,11 +105,21 @@ export class RpcClient {
   }
 
   private handleClose(): void {
+    this.connected = false
     this.leftover = Buffer.alloc(0)
     for (const [, call] of this.pending) {
       call.reject(new Error('daemon connection closed'))
     }
     this.pending.clear()
+    // Anyone waiting in whenConnected() (a call() made while this attempt was
+    // still connecting) must be rejected here too — otherwise a connection
+    // failure (daemon not running is the common case: first launch, or any dev
+    // session before the daemon has started) leaves those callers pending
+    // forever instead of the timeout ever getting a chance to fire, since the
+    // timeout is only armed once whenConnected() resolves.
+    const waiters = this.connectedWaiters
+    this.connectedWaiters = []
+    waiters.forEach(({ reject }) => reject(new Error('daemon connection closed')))
     if (this.stopped) return
     const delay =
       RECONNECT_DELAYS_MS[Math.min(this.reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)]
@@ -150,39 +167,55 @@ export class RpcClient {
   }
 
   private whenConnected(): Promise<void> {
-    if (this.socket && !this.socket.pending) return Promise.resolve()
+    // `socket.pending` is not "have we connected yet": it flips back to `true`
+    // after `destroy()`, so during a disconnect/reconnect window a live-looking
+    // socket reference would make this resolve immediately and hand back a
+    // socket that's about to reject every write. Track connectedness explicitly.
+    if (this.connected) return Promise.resolve()
     return new Promise((resolve, reject) => this.connectedWaiters.push({ resolve, reject }))
   }
 
   async call(method: string, params?: Record<string, unknown>, timeoutMs = 10_000): Promise<unknown> {
-    await this.whenConnected()
-    const id = this.nextId++
-    const payload = JSON.stringify({ jsonrpc: '2.0', id, method, params: params ?? {} }) + '\n'
-
+    // The timeout has to cover waiting-to-connect, not just waiting-for-response:
+    // previously it was only armed *after* whenConnected() resolved, so when the
+    // daemon isn't running (first launch, or any dev session before it's started)
+    // a call would await whenConnected() forever with nothing to ever time it out
+    // — the exact "stuck on 检测中…" bug. Wrapping the whole thing in one Promise
+    // lets a single timer own both phases.
     return new Promise((resolve, reject) => {
+      let settled = false
       const timer = setTimeout(() => {
-        this.pending.delete(id)
+        settled = true
         reject(new Error(`rpc call timed out: ${method}`))
       }, timeoutMs)
 
-      this.pending.set(id, {
-        resolve: (value) => {
-          clearTimeout(timer)
-          resolve(value)
-        },
-        reject: (err) => {
-          clearTimeout(timer)
-          reject(err)
-        }
-      })
+      const finish = (fn: () => void): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        fn()
+      }
 
-      this.socket!.write(payload, (err) => {
-        if (err) {
-          clearTimeout(timer)
-          this.pending.delete(id)
-          reject(err)
-        }
-      })
+      this.whenConnected()
+        .then(() => {
+          if (settled) return // already timed out while still waiting to connect
+          // design §4: RPC ids are strings.
+          const id = String(this.nextId++)
+          const payload = JSON.stringify({ jsonrpc: '2.0', id, method, params: params ?? {} }) + '\n'
+
+          this.pending.set(id, {
+            resolve: (value) => finish(() => resolve(value)),
+            reject: (err) => finish(() => reject(err))
+          })
+
+          this.socket!.write(payload, (err) => {
+            if (err) {
+              this.pending.delete(id)
+              finish(() => reject(err))
+            }
+          })
+        })
+        .catch((err: Error) => finish(() => reject(err)))
     })
   }
 

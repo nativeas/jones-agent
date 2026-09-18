@@ -1,6 +1,7 @@
 import asyncio
 import json
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import pytest
 
 from jones_daemon.rpc.errors import INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, RpcError
 from jones_daemon.rpc.methods import register_builtin_methods
-from jones_daemon.rpc.server import RpcServer
+from jones_daemon.rpc.server import MAX_LINE_BYTES, RpcServer
 
 
 @pytest.fixture
@@ -113,5 +114,88 @@ async def test_multiple_requests_on_one_connection_are_framed_independently(serv
         first = json.loads(await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2))
         second = json.loads(await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2))
         assert {first["id"], second["id"]} == {"a", "b"}
+    finally:
+        writer.close()
+
+
+async def test_socket_is_created_owner_only(server):
+    mode = stat.S_IMODE(server.socket_path.stat().st_mode)
+    assert mode == 0o600
+
+
+async def test_large_but_in_budget_request_round_trips(server):
+    # A payload comfortably inside the raised StreamReader limit (design §4.1
+    # payloads like session.send attachments or a batch of messages) must not be
+    # treated as oversized just because it's well past the old 64 KiB default.
+    big_text = "x" * (200 * 1024)
+    request = {"jsonrpc": "2.0", "id": "big", "method": "daemon.ping", "params": {"note": big_text}}
+    response = await _roundtrip(server.socket_path, request)
+    assert "error" not in response
+    assert response["id"] == "big"
+
+
+async def test_oversized_line_is_dropped_without_a_busy_loop(server):
+    # Regression test for the LimitOverrunError busy loop: readuntil() does not
+    # consume its buffer when it raises, so naively looping back to readuntil()
+    # re-raises on the same bytes forever. A single oversized line must produce a
+    # bounded, small number of error responses (one per limit-sized chunk drained
+    # while searching for the terminating newline) rather than spinning.
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        oversized = b'{"jsonrpc":"2.0","id":"1","method":"daemon.ping","params":{"note":"'
+        oversized += b"x" * (MAX_LINE_BYTES + 1024)
+        oversized += b'"}}\n'
+        writer.write(oversized)
+        await writer.drain()
+
+        responses = []
+        for _ in range(5):
+            try:
+                line = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2)
+            except (TimeoutError, asyncio.IncompleteReadError):
+                break
+            responses.append(json.loads(line))
+
+        assert len(responses) <= 2
+        assert all(r.get("error", {}).get("code") == PARSE_ERROR for r in responses)
+
+        # The connection must still be alive and usable afterwards (not wedged).
+        follow_up_request = {"jsonrpc": "2.0", "id": "2", "method": "daemon.ping"}
+        follow_up = await _roundtrip(server.socket_path, follow_up_request)
+        assert "error" not in follow_up
+    finally:
+        writer.close()
+
+
+async def test_concurrent_requests_on_one_connection_do_not_serialize(server):
+    # session.stop / permission.decide must be able to reach the daemon while a
+    # slow session.send is still running on the same connection (the frontend
+    # opens exactly one socket). Register a handler that blocks until released,
+    # and confirm a second request completes while the first is still pending.
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(params, conn):
+        started.set()
+        await release.wait()
+        return {"slow": True}
+
+    server.register("test.slow", slow)
+
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        writer.write(b'{"jsonrpc":"2.0","id":"slow","method":"test.slow"}\n')
+        await writer.drain()
+        await asyncio.wait_for(started.wait(), timeout=2)
+
+        writer.write(b'{"jsonrpc":"2.0","id":"fast","method":"daemon.ping"}\n')
+        await writer.drain()
+        fast_response = json.loads(await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2))
+        assert fast_response["id"] == "fast"
+        assert "error" not in fast_response
+
+        release.set()
+        slow_response = json.loads(await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2))
+        assert slow_response["id"] == "slow"
     finally:
         writer.close()

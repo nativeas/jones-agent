@@ -1,3 +1,4 @@
+import stat
 from pathlib import Path
 
 from jones_daemon import paths
@@ -53,3 +54,30 @@ def test_project_level_accessors_create_their_directories(tmp_path):
     assert paths.project_agents_dir(project) == project / ".jones" / "agents"
     assert paths.project_skills_dir(project).exists()
     assert paths.project_memory_dir(project).exists()
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_user_root_is_locked_down_to_owner_only(tmp_path, monkeypatch):
+    # ~/.jones holds daemon.sock and secrets/; macOS home directories default to
+    # world-readable (022 umask), so the root itself has to deny other local
+    # accounts traversal, not just its sensitive children.
+    monkeypatch.setenv("JONES_HOME", str(tmp_path / "home"))
+    paths.config_dir()  # any accessor call is enough to trigger root creation
+    assert _mode(paths.user_root()) == 0o700
+
+
+def test_secrets_and_runtime_dirs_are_locked_down_to_owner_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("JONES_HOME", str(tmp_path / "home"))
+    assert _mode(paths.secrets_dir()) == 0o700
+    assert _mode(paths.runtime_dir()) == 0o700
+
+
+def test_root_permission_is_tightened_even_if_it_pre_existed_looser(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir(mode=0o755)
+    monkeypatch.setenv("JONES_HOME", str(home))
+    paths.runtime_dir()
+    assert _mode(paths.user_root()) == 0o700

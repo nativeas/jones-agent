@@ -34,7 +34,7 @@ describe('RpcClient NDJSON framing', () => {
     const callPromise = client.call('daemon.ping')
     await new Promise((resolve) => setTimeout(resolve, 20))
     serverSocket!.write(
-      JSON.stringify({ jsonrpc: '2.0', id: 1, result: { version: '0.1.0' } }) + '\n'
+      JSON.stringify({ jsonrpc: '2.0', id: '1', result: { version: '0.1.0' } }) + '\n'
     )
     await expect(callPromise).resolves.toEqual({ version: '0.1.0' })
   })
@@ -42,7 +42,7 @@ describe('RpcClient NDJSON framing', () => {
   it('reassembles a response split across multiple chunks (no premature parse)', async () => {
     const callPromise = client.call('daemon.ping')
     await new Promise((resolve) => setTimeout(resolve, 20))
-    const line = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { pid: 42 } }) + '\n'
+    const line = JSON.stringify({ jsonrpc: '2.0', id: '1', result: { pid: 42 } }) + '\n'
     // Drip-feed a few bytes at a time across separate socket writes (including the
     // trailing newline, which a `.`-based regex split would otherwise swallow).
     for (let i = 0; i < line.length; i += 3) {
@@ -57,9 +57,9 @@ describe('RpcClient NDJSON framing', () => {
     const second = client.call('b')
     await new Promise((resolve) => setTimeout(resolve, 20))
     const combined =
-      JSON.stringify({ jsonrpc: '2.0', id: 1, result: 'first' }) +
+      JSON.stringify({ jsonrpc: '2.0', id: '1', result: 'first' }) +
       '\n' +
-      JSON.stringify({ jsonrpc: '2.0', id: 2, result: 'second' }) +
+      JSON.stringify({ jsonrpc: '2.0', id: '2', result: 'second' }) +
       '\n'
     serverSocket!.write(combined)
     await expect(first).resolves.toBe('first')
@@ -72,7 +72,7 @@ describe('RpcClient NDJSON framing', () => {
     serverSocket!.write(
       JSON.stringify({
         jsonrpc: '2.0',
-        id: 1,
+        id: '1',
         error: { code: 1001, message: 'session not found', data: { id: 'missing' } }
       }) + '\n'
     )
@@ -98,7 +98,40 @@ describe('RpcClient NDJSON framing', () => {
     serverSocket!.write('not json at all\n')
     const callPromise = client.call('daemon.ping')
     await new Promise((resolve) => setTimeout(resolve, 20))
-    serverSocket!.write(JSON.stringify({ jsonrpc: '2.0', id: 1, result: 'ok' }) + '\n')
+    serverSocket!.write(JSON.stringify({ jsonrpc: '2.0', id: '1', result: 'ok' }) + '\n')
     await expect(callPromise).resolves.toBe('ok')
+  })
+
+  it('sends request ids as strings, per design §4', async () => {
+    client.call('daemon.ping').catch(() => {
+      // never resolved by this test (no response is sent); rejected by afterEach's
+      // client.stop() during cleanup, which is expected and fine to ignore here.
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const received: Buffer[] = []
+    await new Promise<void>((resolve) => {
+      serverSocket!.once('data', (chunk) => {
+        received.push(chunk)
+        resolve()
+      })
+    })
+    const sent = JSON.parse(Buffer.concat(received).toString('utf8').trim())
+    expect(typeof sent.id).toBe('string')
+  })
+
+  it('times out a call made while the daemon is unreachable instead of hanging forever', async () => {
+    // Regression test: whenConnected() used to have no deadline of its own, and
+    // the per-call timer only started *after* it resolved — so a call made
+    // before the first successful connect (the common "daemon not running yet"
+    // case) would await forever. Point a fresh client at a socket nothing is
+    // listening on and confirm call() rejects within its timeout instead.
+    const deadSockPath = path.join(dir, 'nobody-listening.sock')
+    const deadClient = new RpcClient(deadSockPath)
+    deadClient.connect()
+    try {
+      await expect(deadClient.call('daemon.ping', undefined, 300)).rejects.toThrow()
+    } finally {
+      deadClient.stop()
+    }
   })
 })
