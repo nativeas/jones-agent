@@ -289,11 +289,11 @@ async def test_connection_inflight_cap_rejects_overflow_instead_of_queueing(serv
         assert overflow_response["error"]["code"] == TOO_MANY_REQUESTS
 
         release.set()
-        # Drain the 64 blocked responses so they don't race writer.close() below.
+        # Drain the blocked responses so they don't race writer.close() below.
         for _ in range(MAX_INFLIGHT_PER_CONNECTION):
             await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2)
 
-        # The cap is per-connection headroom, not a one-shot trip: once those 64
+        # The cap is per-connection headroom, not a one-shot trip: once those
         # requests finished and freed their slots, this same connection can
         # dispatch again normally.
         writer.write(

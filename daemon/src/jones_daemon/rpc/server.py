@@ -40,14 +40,21 @@ Handler = Callable[[dict[str, Any], "Connection"], Awaitable[Any]]
 # a single connection's per-line memory.
 MAX_LINE_BYTES = 16 * 1024 * 1024
 
-# Caps how many requests from a single connection may be awaiting a handler at
-# once. Without this, a connection that dispatches faster than handlers finish
-# (or one stuck behind a slow/misbehaving handler) queues an unbounded number of
-# tasks — each holding its parsed line and a Task object — with nothing ever
-# rejecting the overflow. 64 matches the global dispatch semaphore below: a
-# single connection hitting this cap is already using the daemon's entire
-# concurrent-handler budget.
-MAX_INFLIGHT_PER_CONNECTION = 64
+# Two separate caps, deliberately not equal (round 2 review flagged them being
+# the same number as a coincidence, not a design — this is the fix):
+#
+# - MAX_INFLIGHT_PER_CONNECTION bounds how many requests any *one* connection may
+#   have awaiting a handler at once. If this equaled the global cap, a single
+#   connection could alone saturate MAX_INFLIGHT_GLOBAL and starve every other
+#   connection's requests without ever hitting its own per-connection limit.
+#   16 is comfortably above any realistic single-client burst (the daemon's own
+#   RPC client issues requests one at a time per logical call) while leaving most
+#   of the global budget for other connections.
+# - MAX_INFLIGHT_GLOBAL bounds total concurrent in-flight handler calls across
+#   *all* connections (see `RpcServer._dispatch_semaphore`), sized well above any
+#   realistic simultaneous request count for a single-user daemon.
+MAX_INFLIGHT_PER_CONNECTION = 16
+MAX_INFLIGHT_GLOBAL = 64
 
 
 def _peek_request_id(line: bytes) -> Any:
@@ -93,9 +100,10 @@ class RpcServer:
         self._methods: dict[str, Handler] = {}
         self._server: asyncio.base_events.Server | None = None
         # Bounds concurrent in-flight handler calls across all connections so one
-        # slow session.send doesn't starve a growing number of tasks; sized well
-        # above any realistic simultaneous request count for a single-user daemon.
-        self._dispatch_semaphore = asyncio.Semaphore(64)
+        # slow session.send doesn't starve a growing number of tasks — see
+        # MAX_INFLIGHT_GLOBAL for why this is a distinct, larger number than the
+        # per-connection cap.
+        self._dispatch_semaphore = asyncio.Semaphore(MAX_INFLIGHT_GLOBAL)
 
     def register(self, method: str, handler: Handler) -> None:
         self._methods[method] = handler

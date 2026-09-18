@@ -11,7 +11,8 @@
     "preview": "electron-vite preview",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "smoke": "electron-vite build && electron scripts/smoke.mjs"
   },
   "dependencies": {
     "zustand": "^5.0.15"
