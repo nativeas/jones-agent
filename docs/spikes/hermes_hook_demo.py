@@ -16,9 +16,11 @@ or any model call happens (see ``agent/agent_runtime_helpers.py::invoke_tool``,
 quoted in docs/spikes/01-hermes-hook.md), and driving ``invoke_tool()`` itself needs
 nothing beyond the stdlib + ``pyyaml`` — no provider SDK, no full ``AIAgent``.
 
-Setup (once):
+Setup (once) -- CANONICAL commit this file is verified against (see docs/spikes/01-hermes-hook.md
+"验证对象" for why this superseded the original spike's 0138269, and second-round fix record item 3
+for why this file previously pointed at two different commits in two different places):
     git clone https://github.com/NousResearch/hermes-agent <somewhere>
-    cd <somewhere> && git checkout 0138269   # commit tested against, 2026-09-18
+    cd <somewhere> && git checkout ee4452991d17534aa561f31ee55596d082aa94e7
     uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e .
 
 Run:
@@ -164,8 +166,13 @@ class _StubAgent:
     _current_api_request_id = ""
 
 
-# The hook-callback timeout used for sections 1-5 (generous — those sections are
-# not testing the timeout itself). Sections 6-7 shrink it further on their own.
+# The hook-callback timeout used for sections 1-5. DELIBERATELY SHORT, not generous: sections
+# 4-5 exist specifically to prove that the human-approval wait (1.5x-3x this value, see below)
+# completes anyway because it happens AFTER request_tool_approval() falls through to Hermes's
+# own approve/deny wait, outside plugins.hook_callback_timeout's window (see module docstring
+# and docs/spikes/01-hermes-hook.md 结论 3). A "generous" timeout would prove nothing there —
+# the whole point is picking a value the simulated human is guaranteed to outlast. Sections 6-7
+# reuse this same value (not a further shrink) to trigger the anti-pattern's fail-closed cutoff.
 _HOOK_TIMEOUT_S = 0.5
 
 

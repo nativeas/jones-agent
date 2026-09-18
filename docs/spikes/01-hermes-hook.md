@@ -3,13 +3,20 @@
 对应 PRD 13.2 风险 1、6.2/6.3；00-foundation.md §7。
 
 验证对象：[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)。
-原始验证用的是 commit `0138269`（`main`，2026-09-18，treeless partial clone + 按需拉取，见下"实测证据·环境"）。
-**2026-09-18 评审修复一轮**（见文末"修复记录"）额外用本机已有的完整 checkout
-（`/Users/nativeas/.hermes/hermes-agent`，同一上游仓库，commit `ee4452991d`，浅克隆看不到与
-`0138269` 的祖先关系，未做网络核实）复核了下面标注"已实测"的结论，并重写、重跑了
-`docs/spikes/hermes_hook_demo.py`。两次验证的具体 commit 不同，但涉及的源码路径
-（`hermes_cli/plugins.py`、`plugins_dispatch.py`、`tools/approval.py`、`tools/approval_context.py`、
-`tools/terminal_tool.py`、`acp_adapter/*`）逻辑一致，是同一上游项目相隔不远的两个快照，不是两套设计。
+
+**统一后的 CANONICAL commit（第二轮评审修复，2026-09-19）：`ee4452991d17534aa561f31ee55596d082aa94e7`**
+（本机已有完整 checkout，`/Users/nativeas/.hermes/hermes-agent`）。本文件下方"实测证据""demo""ACP
+侧证据"三节、`docs/spikes/hermes_hook_demo.py` 头部、本文件末尾"验证方式"，现在**全部**指向这一个
+commit——不再有第二个数字。历史沿革（不影响上面这条统一结论，只解释为什么之前不一致，供后来者追溯）：
+原始 spike（2026-09-18）用的是 commit `0138269`（`main`，treeless partial clone + 按需拉取，受限于
+~25 KB/s 带宽，见下"实测证据·环境"）；**同一天**的第一轮评审修复改用本机已有的完整 checkout 复核结论，
+但只更新了正文的部分引用，"验证方式"一节的 clone 步骤仍留着 `0138269`，造成文档内部两个 commit 并存
+（第二轮评审第 3 条指出）。第二轮修复把全部引用收敛到 `ee4452991d17534aa561f31ee55596d082aa94e7`；
+浅克隆看不到它与 `0138269` 的祖先关系，未做网络核实，但涉及的源码路径（`hermes_cli/plugins.py`、
+`plugins_dispatch.py`、`tools/approval.py`、`tools/approval_context.py`、`tools/terminal_tool.py`、
+`acp_adapter/*`）逻辑一致，是同一上游项目相隔不远的两个快照，不是两套设计——"验证方式"一节仍保留
+`0138269` 作为"网络不受限环境下按标准流程 clone"的备选路径说明，但用清晰的文字标注它是历史路径，不是
+本文档当前验证用的 commit。
 
 ## 结论（先说结论）
 
@@ -55,6 +62,25 @@
 4. **不满足→运行时层代理方案（PRD 13.2 的 Plan B）不需要**：spike 结果是 A 可行，不需要在 daemon
    层再包一层"工具调用先过守护进程"的运行时代理——`pre_tool_call` 本身就是这层代理，而且是 Hermes 原生支持的，
    不用我们自己拦 stdio 流去猜哪一行是工具调用。
+
+5. **结论 3 的"approve 交给 Hermes 的 `request_tool_approval()` 走 ACP"有一个前提，本轮才发现且必须写清楚：
+   `request_tool_approval()` 不是无条件问人的——它自己前面有三道能让它零等待直接放行、`session/request_permission`
+   根本不会被发出的短路**（源码见下"Hermes 内置的批准绕过路径"一节）：进程级 `HERMES_YOLO_MODE` 环境变量、
+   `approvals.mode: off` 配置、以及命中会话级/**持久化落盘**的 `command_allowlist` 的调用。Jones 把用户闸"委托"
+   给 Hermes 的 `request_permission`，前提是这三条短路对 worker 进程全部不生效；worker 启动 Hermes 时必须显式
+   配置成"不生效"，这不是默认状态，是需要 Jones 主动做的事——写进了 FR05 的验收项建议（见下）。
+
+6. **`permission_decisions`/`steps` 表的写入点不在 `pre_tool_call` 回调里，且规则闸/审查闸两条决策路径的
+   写入时机不同**：`pre_tool_call` 回调本身对 approve 分支只是"路过"（立即返回，从不知道人工最终批准还是拒绝，
+   见结论 3）；真正知道每次工具调用最终结果（block/成功/超时）的，是同一个 worker 进程里**另一个**插件
+   hook——`post_tool_call`（`hermes_cli.plugins` 同样支持的 hook 类型，`model_tools._emit_post_tool_call_hook`
+   经 `agent/inline_tool_executors.py::emit_terminal_post_tool_call` 在 `invoke_tool()` 内、无论走 block
+   分支还是走完真实工具执行都会触发，晚于 `pre_tool_call`，携带 `status`/`error_type`/`error_message`/
+   `duration_ms`）；而真正**做**用户闸/审查闸决定的是 daemon 自己（它是 ACP client，`session/request_permission`
+   是 worker 向它发的 RPC，daemon 算出 allow/deny 的那一刻就是 daemon 自己知道决定内容的那一刻）。这两条路径
+   在哪个进程、什么时刻拥有"决定"这件事的完整信息不一样，因此不可能有一个单一的"写入点"，只能有一张按来源
+   分叉的时序图——完整时序见下"审计写入时序"一节，取代了原"下一步"里"写入点接到 pre_tool_call 回调里"这句
+   过时的表述。
 
 ## 实测证据
 
@@ -329,6 +355,186 @@ hook_callback_timeout"不是读代码猜的，是量出来的。第 6/7 步反�
 - **会话生命周期**：`new_session`/`load_session`/`resume_session`/`fork_session`/`list_sessions` 齐全，
   `fork_session` 直接对应 PRD 9.6 的子会话派生需求。
 
+## Hermes 内置的批准绕过路径（YOLO / allowlist）——本轮评审新增，源码核对于 `ee4452991d`
+
+结论 5 的展开。Jones 把"审查闸/用户闸"设计成插件返回 `approve`、交给 Hermes 自己的
+`tools/approval.py::request_tool_approval()` 去问人——但 `request_tool_approval()` 内部先过
+`_run_approval_gate()`，这个函数**前两步就是短路**（`tools/approval.py:888,891`）：
+
+```python
+def _run_approval_gate(...):
+    if _yolo_active():          # 短路 1：见下
+        return _approved()
+    session_key = get_current_session_key()
+    if is_approved(session_key, pattern_key):   # 短路 2：见下
+        return _approved()
+    ...  # 只有过了这两关，才会真的调 _human_decision() → ACP session/request_permission
+```
+
+`request_tool_approval()` 自己（`tools/approval.py:1001-1022`）把 Jones 插件的 `rule_key` 原样映射成
+`pattern_key=f"plugin_rule:{rule_key}"`——这条短路对 Jones 用插件转发过去的审批请求和 Hermes 自己的
+"危险 shell 命令"审批走的是**同一套**短路逻辑，不是分开的两套。三条具体短路路径：
+
+1. **进程级 YOLO（`HERMES_YOLO_MODE` 环境变量）**：`tools/approval.py:45`
+   ```python
+   # Frozen at import: reading os.environ per call would let any skill running in the process set
+   # this and bypass every approval check (prompt-injection escalation path).
+   _YOLO_MODE_FROZEN: bool = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
+   ```
+   **在模块被 import 的那一刻**读一次、冻结，之后这个进程里永远读的是这个冻结值。**要求**：daemon 拉起
+   `python -m acp_adapter.entry`（worker）子进程时，传给它的环境变量里**不能有** `HERMES_YOLO_MODE`
+   （不能从 daemon 自己的环境原样继承，必须显式构造子进程 env、排除这个键）。
+
+2. **`approvals.mode: off` 配置**：`tools/approval.py:1080`/`1158`
+   ```python
+   approval_mode = approval_context._get_approval_mode()
+   if _yolo_active() or approval_mode == "off":
+       return _approved()
+   ```
+   `_get_approval_mode()`（`tools/approval_context.py:228-236`）读的是活动 profile 的 `config.yaml` 里
+   `approvals.mode`（未设置时默认 `"manual"`，不是 off，本身安全，但**只要 worker 的 `config.yaml` 被写成
+   `off`（或任何代码/后续维护者手滑写成 off）这一路径就整体失效**）。**要求**：daemon 为 worker 生成的
+   `config.yaml` 不写 `approvals.mode: off`（不写这个键，走默认 `manual` 即可；不要因为"Jones 自己已经有
+   规则闸/审查闸了，Hermes 这层用不上"就顺手把它设成 off——一旦设 off，连 Jones 转发过去的 `approve` 请求
+   也会被短路，等于用户闸形同虚设）。
+
+3. **持久化的 `command_allowlist`（跨会话、写在磁盘上）**：`tools/approval.py:1205`（**模块级代码，import
+   `tools.approval` 时无条件执行一次，与是否是 CLI/ACP/gateway 无关**）
+   ```python
+   # Load permanent allowlist from config on module import
+   load_permanent_allowlist()
+   ```
+   `load_permanent_allowlist()` 从活动 profile 的 `config.yaml` 的 `command_allowlist` 列表读，塞进
+   `is_approved()`（`tools/approval.py:315-320`）检查的并集里；短路 2 命中的就是这个集合（加上同会话内
+   `/approve always` 产生的会话级近似）。**这不是要不要禁用的问题，是要不要"共享"的问题**：如果 worker
+   的 `HERMES_HOME` 就是用户自己交互式跑 `hermes` CLI 那个 `~/.hermes`，用户在自己 CLI 会话里对某个模式
+   点过一次"always"，这条豁免会原样出现在 Jones worker 的 `command_allowlist` 里，反之亦然——**两个身份
+   的审批状态互相渗透**。Hermes 自己已经支持"按 profile 隔离"（`tools/approval.py` 的
+   `_permanent_set()` 注释："Routed multiplex profiles: one permanent allowlist per profile home"，
+   经 `hermes_constants.get_hermes_home_override()`/`hermes_home_key()`）。**要求**：daemon 给每个
+   worker 子进程设置**独立的 `HERMES_HOME`**（不能是用户默认的 `~/.hermes`；例如 `~/.jones/hermes_home/`
+   下按 project 或 session 分的子目录——具体粒度留给 daemon 骨架 Issue 定，本 spike 只确认"必须隔离"这个
+   约束，不是"可以不隔离"），且 Jones 自己往这个隔离 home 的 `config.yaml` 写 `command_allowlist` 之前要
+   想清楚这就是在把某条规则"永久放行"，不是一次性的。`docs/spikes/hermes_hook_demo.py` 已经在用
+   `HERMES_HOME=$(mktemp -d)` 隔离，做法本身没错，只是原报告没把它当成一条**必须**的安全要求写下来。
+
+**会话级 `/yolo` 与"会话恢复自动重开 YOLO"——本轮核实：对纯 ACP worker 不构成第四条短路，但依赖的是
+一个当前源码里"未接线"的事实，不是协议层保证**：`enable_session_yolo(session_key)`
+（`tools/approval.py:213-222`）本身是通的，但驱动它的两条入口都在 `hermes_cli/` 里：
+- 交互 CLI/gateway 的 `/yolo` 斜杠命令（`hermes_cli/cli_session_mixin.py:850-910` 一类）；
+- 会话恢复时从 `hermes_state_sessions.py:730-735` 的 `model_config.yolo_mode` 自动 `_restore_session_yolo()`
+  （`hermes_cli/cli_session_mixin.py:168-184`，调用点在 `hermes_cli/cli_agent_setup_mixin.py:424`、
+  `hermes_cli/cli_commands_mixin.py:1322`）。
+
+`acp_adapter/commands.py::SlashCommandsMixin._COMMANDS`（ACP 自己的斜杠命令表，`help`/`model`/`tools`/
+`context`/`reset`/`compress`/`steer`/`queue`/`version`）**没有 `yolo`**，`_restore_session_yolo` 的三个
+调用点也都在 `hermes_cli/*_mixin.py`，本 spike 没有找到 `acp_adapter/session.py`/`server.py` 里对它的
+调用——即：**只要 daemon 拉起的 worker 进程只跑 `python -m acp_adapter.entry`（不初始化任何
+`hermes_cli` 的 CLI/gateway session mixin），这条会话级绕过在当前代码里没有可达路径**。写清楚这是
+"当前源码里没找到调用点"（一种"未使用"，不是"协议层禁止"或"配置项关闭"）——Hermes 后续版本给
+`acp_adapter` 加一个 `/yolo` 等价物完全可能，且不会被当成一次破坏性变更。**建议**：daemon 骨架/权限闸
+落地时加一条自动化检查（例如集成测试里断言"给 worker 发一条以 `dangerous_tool` 命中审查闸的调用后，
+往 ACP 连接发 `/yolo` 文本消息，下一次同名工具调用仍然收到 `session/request_permission`"），把"当前没有
+调用点"这个脆弱的事实变成一条持续验证的回归测试，而不是一份文档里的静态断言。
+
+**FR05 验收项建议**：把上面 1-3 三条（`HERMES_YOLO_MODE` 未设置、`approvals.mode` 非 `off`、worker
+`HERMES_HOME` 与用户默认 `~/.hermes` 隔离且其 `command_allowlist` 由 Jones 自己管理）列为 FR05
+（`docs/PRD.md` §12.2 G04 / §6.3）的验收项之一：**"worker 启动 Hermes 时，上述三条内置绕过路径全部不
+生效"**，建议的验证方式是本节这套源码引用 + 一条集成测试（往 worker 发一个会命中用户闸的工具调用，同时
+在 daemon 侧模拟"永不回应"，断言超时后仍是 deny 而不是被三条短路里任何一条提前放行）。这是本 spike 的
+建议，不是本 spike 替 W3 权限闸 Issue 写死的验收标准；已同步写入 `docs/PRD.md` FR05 一行与 §6.3（见"接口
+或契约变更"）。
+
+## 审计写入时序（permission_decisions / steps）——本轮评审新增，替换原"下一步"里过时的表述
+
+原报告"下一步"第 2 条写的是"把 `permission_decisions` 表的写入点接到 `pre_tool_call` 回调里"——这句话
+在"插件立即返回 approve、真正的等待发生在 `pre_tool_call` 已经返回之后"这个新设计下不成立：`pre_tool_call`
+回调返回的那一刻，approve 分支的真实结果（人到底批准没批准）根本还没发生，插件代码此时已经不在调用栈里，
+无从"写入"一个还不存在的决定。三条来源各自的信息在哪个进程、哪个时刻才齐全，答案不一样，所以画三条独立
+时序，而不是找一个共同的"写入点"：
+
+**① 直接放行（未触发任何闸）**——最简单，无 `permission_decisions` 行，`steps.permission_id` 为 NULL：
+
+```
+worker: tool.started 事件 ──(ACP session/update ToolCallStart)──> daemon：insert steps(status=running)
+worker: pre_tool_call 返回 None（不拦截）→ 工具真正执行
+worker: 工具执行完 ──(ACP session/update ToolCallComplete)──> daemon：update steps(status=ok, result_summary, duration_ms)
+```
+
+**② 规则闸本地拒绝（零等待，worker 从不联系 daemon 做这次判断）**——决定在 worker 单进程内做完，daemon
+只能事后从 ACP 事件流里**异步**得知，不可能同步拿到：
+
+```
+worker: tool.started 事件 ──(ACP ToolCallStart)──> daemon：insert steps(status=running)
+worker: pre_tool_call 命中规则闸，同步返回 {"action":"block","message":"JONES RULE GATE: ..."}
+        （零等待，不打一次 daemon IPC——这是刻意的性能设计，见结论 3/00-foundation.md §7）
+worker: invoke_tool() 把 {"error": message} 当工具结果返回给 agent（工具从未执行）
+worker: post_tool_call 钩子同步触发（同一进程内，晚于 pre_tool_call），拿到 status="blocked"、
+        error_type="plugin_block"、error_message=message、duration_ms
+worker: 工具"执行完"（其实是被拦下）──(ACP ToolCallComplete，result 就是上面那条 {"error": ...})──> daemon
+daemon：从 ToolCallComplete 的 result 文本里识别出这是 Jones 自己的规则闸拒绝（需要一个 Jones 定义、
+        daemon 能可靠解析的约定前缀/结构，例如现有 demo 里的 "JONES RULE GATE: " 前缀——具体解析约定
+        留给 W3 权限闸 Issue 定，本节只确认"daemon 只能从这条异步事件里拿到规则闸决定，没有别的同步
+        信号"这个约束本身），insert permission_decisions(gate="rule", decided_by="rule", decision="deny")，
+        update steps(permission_id=刚插入的行, status=blocked)
+```
+
+**③ 审查闸/用户闸（approve 分支，走 ACP `session/request_permission`）**——daemon 自己就是这次决定的
+拍板者，"决定发生的时刻"和"daemon 知道决定内容的时刻"是同一个时刻，天然没有异步落差：
+
+```
+worker: tool.started 事件 ──(ACP ToolCallStart)──> daemon：insert steps(status=running)
+worker: pre_tool_call 立即返回 {"action":"approve","message","rule_key"}（不等待，见结论 3）
+worker: hermes_cli/plugins.py::_resolve_block_from_details() 调 request_tool_approval()
+        → 过了 YOLO/allowlist 短路检查后 → _human_decision() → conn.request_permission(...)
+        （ACP JSON-RPC 请求，worker 是 server 端发起方，daemon 是 client 端接收方，这是一次真实的
+        跨进程往返，worker 这个线程原地阻塞等 daemon 回复——见"未验证"一节对并发工具调用下这条阻塞
+        的补充说明）
+daemon：收到 session/request_permission 请求，走 daemon 自己的审批 UI/规则，算出 allow/deny 的那一刻
+        insert permission_decisions(gate="review"/"user", decided_by="model"/"user", decision=...)
+        —— 写库必须排在"把 ACP 响应发回去"之前，不能反过来（见下"失败时如何保证不漏记"）
+daemon：发送 ACP 响应（allow_once/allow_session/allow_always/deny/...）
+worker: request_tool_approval() 收到结果，pre_tool_call 整条调用链返回，invoke_tool() 按结果放行或
+        block；post_tool_call 钩子同步触发（晚于 ACP 往返已经结束）
+worker: 工具执行完/被拦下 ──(ACP ToolCallComplete)──> daemon：update steps(permission_id=②③已写好
+        的那一行, status=ok/blocked, duration_ms)
+```
+
+**`steps`/`permission_decisions` 之间靠什么关联，这是本轮发现的一个未解决的口子，如实写出**：ACP 的
+`session/request_permission` 请求携带的 `tool_call` 字段是**合成的**（`acp_adapter/permissions.py::
+_build_permission_tool_call()` 生成一个新的 `perm-check-N` id，`N` 是进程内自增计数器），**不是**
+`tool.started` 事件里那个真实的 ACP `tool_call_id`（`acp_adapter/events.py::make_tool_call_id()`
+生成，走的是按工具名的 FIFO 队列 `tool_call_ids: Dict[str, Deque[str]]` 做"完成时"匹配，同名并发调用
+本身也只是"先进先出"近似，不是精确 id 匹配——这是 ACP 桥接层已有的设计权衡，不是本 spike 新引入的问题）。
+也就是说 daemon 收到 `session/request_permission` 时，手里只有 `session_id` + 命令/工具描述文本
+（`command`、`description`），**没有**一个能直接对上 `steps` 表某一行的 id。daemon 侧要把 ③ 里新写的
+`permission_decisions` 行和正确的 `steps` 行关联起来，目前只能靠"同一 session、按时间顺序匹配最近一个
+状态为 running 且尚未有 `permission_id` 的 `steps` 行"这种启发式（本质上和 ACP 自己在 `tool_call_ids`
+里做的 FIFO 近似是同一类做法），**在单线程顺序执行工具调用时是安全的，但 Hermes 支持并发工具调用
+（`_MAX_TOOL_WORKERS = 8`），并发场景下这条启发式可能对错行——本 spike 没有实测并发场景下这条关联是否
+真的会错位，只确认了"协议本身不提供精确关联手段"这个事实，是一个必须在 W3 权限闸 Issue 里解决的开放
+设计问题（可选方向：daemon 用 `description` 文本里编码的 `rule_key`/工具名做更强的近似匹配；或者更彻底
+地——升级 Jones 自己的插件，把 Hermes 内部的真实 `tool_call_id` 塞进 `request_tool_approval(rule_key=...)`
+的 `rule_key`/`reason` 文本里一起传过去，daemon 解析出来做精确关联，需要验证这样做不会破坏"结论 3"里
+`rule_key` 控制的 `[a]lways` allowlist 粒度语义）。
+
+**失败时如何保证不漏记（诚实失败，DEV.md 原则 4）**：
+- ③（daemon 自己拍板的路径）：写库必须发生在"daemon 决定 allow/deny"和"daemon 把 ACP 响应发出去"之间，
+  顺序固定为**先写库、写库成功后再回 ACP**——如果反过来（先回复、后写库），daemon 在两步之间崩溃会导致
+  "一次真实生效的用户闸决定，永久没有审计记录"，这正是 N09（错误被静默吞掉）在权限闸场景下最坏的样子。
+  如果写库失败（磁盘满、锁冲突等），daemon 不能悄悄当作"写成功"继续回复批准——按 DEV.md「诚实失败」，
+  应该把这次 ACP 响应也算失败处理（例如回 deny + 一条 `daemon.error` 通知，而不是静默批准且不留痕），
+  具体降级策略留给 W3 权限闸 Issue 定，本节只确认"顺序不能反、失败不能被吞"这两条约束。
+- ②（规则闸，daemon 事后从 ACP 事件流异步得知）：worker 侧的执行结果已经发生（工具真的被拦下了），
+  daemon 写库失败不会导致"未经审批的动作被执行"（方向上比③安全），但仍然不能 `except: pass`——daemon
+  处理 `session/update` 事件的代码本身要遵守 DEV.md「诚实失败」，写库异常要么重试要么显式记入
+  `daemon.error`/结构化日志，不能让一条 ACP 事件"进来了但没有任何痕迹地消失"。
+
+这一节替换了原"下一步"第 2 条里"写入点接到 pre_tool_call 回调里"的说法；`docs/design/00-foundation.md`
+§7 对应描述也已同步更正（见"接口或契约变更"）。**"steps/permission_decisions 关联方式"和"daemon 写库
+失败的具体降级策略"仍然是留给 W3 权限闸 Issue 拍板的开放设计问题**，本 spike 的职责是把时序和约束条件
+钉清楚，不是替 W3 写实现。
+
 ## 风险
 
 - **`hook_callback_timeout` 默认 30s，超时的影响范围比"这一次调用被拒"大一个量级——本轮已实测，不再只是
@@ -370,13 +576,18 @@ hook_callback_timeout"不是读代码猜的，是量出来的。第 6/7 步反�
 
 ## 下一步
 
-1. daemon 骨架 Issue：worker 启动流程里加载 Jones 自研 `pre_tool_call` 插件（含"静默放行"风险的
-   fail-closed 包装），worker↔daemon 走 ACP stdio；插件的 approve 分支只返回 `{"action":"approve",...}`，
-   不自己讲 ACP（本轮修复的核心结论）。
+1. daemon 骨架 Issue：worker 启动流程里加载 Jones 自研 `pre_tool_call`（+ `post_tool_call`，见"审计
+   写入时序"一节）插件（含"静默放行"风险的 fail-closed 包装，以及"Hermes 内置的批准绕过路径"一节要求的
+   三条禁用配置），worker↔daemon 走 ACP stdio；插件的 approve 分支只返回 `{"action":"approve",...}`，
+   不自己讲 ACP（本轮修复的核心结论）。详细的启动命令行/env/plugin.yaml 路径/daemon 需实现的 ACP client
+   方法清单，见 `docs/design/00-foundation.md` §8「给 W2/W3 实现者的接入清单」（本轮新增）。
 2. 权限闸 Issue（W3，FR05）：实现两段式设计——规则闸本地同步、审查闸/用户闸返回 `approve` 交给 Hermes
-   走 ACP `session/request_permission`；把 `permission_decisions` 表的写入点接到 `pre_tool_call` 回调里；
-   **决定** `acp_adapter/edit_approval.py` 那条 `write_file`/`patch` 编辑审批闸是关掉、复用还是被 Jones
-   的闸接管（本 spike 未定案）。
+   走 ACP `session/request_permission`；`permission_decisions`/`steps` 的写入时序见本文件"审计写入时序"
+   一节（daemon 侧写，不是 `pre_tool_call` 回调里写），其中"`steps`↔`permission_decisions` 精确关联"
+   和"daemon 写库失败的降级策略"两点本 spike 未定案，需要 W3 拍板；**决定** `acp_adapter/edit_approval.py`
+   那条 `write_file`/`patch` 编辑审批闸是关掉、复用还是被 Jones 的闸接管（本 spike 未定案）；**验证**
+   "Hermes 内置的批准绕过路径"一节列出的三条禁用配置在真实 daemon 骨架里确实生效（建议的集成测试见该节
+   "FR05 验收项建议"）。
 3. **并发场景集成测试**（本次评审明确要求，本 spike 未覆盖）：在 daemon 骨架落地、有真实 8 线程工具
    worker 池时，验证 `terminal_tool` 的按线程审批回调槽在并发工具调用下不会跨线程串号或丢失。
 4. 建议后续单独起一个小 spike（不阻塞 W1）验证 `hermes_state_*.py` 作为 worker 内会话存储、
@@ -385,17 +596,24 @@ hook_callback_timeout"不是读代码猜的，是量出来的。第 6/7 步反�
 
 ## 验证方式
 
+CANONICAL commit（与本文件、`hermes_hook_demo.py` 头部一致）：`ee4452991d17534aa561f31ee55596d082aa94e7`。
+
 ```bash
-git clone --filter=blob:none --depth 1 https://github.com/NousResearch/hermes-agent
-cd hermes-agent && git checkout 0138269   # 或任意较新的 main 提交，见文首"验证对象"说明
+git clone https://github.com/NousResearch/hermes-agent
+cd hermes-agent && git checkout ee4452991d17534aa561f31ee55596d082aa94e7
 uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python pyyaml   # 最小依赖；完整依赖见 pyproject.toml
+uv pip install --python .venv/bin/python -e .   # 完整依赖，见 pyproject.toml
 cd ..
 HERMES_HOME=$(mktemp -d) PYTHONPATH=hermes-agent hermes-agent/.venv/bin/python \
     docs/spikes/hermes_hook_demo.py
 # 期望：7 个 section 全部打印，"ALL ASSERTIONS PASSED"，退出码 0，整个脚本几秒内跑完
 # （section 4/6/7 各带 1-2 秒的 sleep，用来真实测量超时/抑制窗口行为，不是卡住）
 ```
+
+历史备选路径（网络对 `github.com` 带宽受限、拉不动上面这条 `-e .` 完整安装时）：treeless partial clone
++ `git checkout 0138269`（原始 spike 当时能拉到的最新 `main`，见文首"验证对象"）+ 只装 `pyyaml`，见
+`docs/spikes/hermes_hook_demo.py` 文件头注释。**这条路径验证的是一个更早的快照，不是本文档当前引用的
+commit**——网络不受限时应优先用上面的标准路径。
 
 ## 修复记录（2026-09-18，评审后）
 

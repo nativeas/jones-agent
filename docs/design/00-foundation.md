@@ -142,6 +142,90 @@ JSON-RPC 标准码 + 应用码：`1001 not_found`、`1002 invalid_state`（如�
   - **组合结论（已修正：Jones 的插件不自己讲 ACP）**：worker 跑 ACP server（daemon 是 ACP client，直接复用 `acp_adapter/` 的会话生命周期、流式事件、cancel，不重造 stdio 协议）；Jones 自研一个 `pre_tool_call` 插件做 Step 级拦截。规则闸能本地决出的直接在插件里返回 `{"action":"block",...}`（不打 IPC）；审查闸/用户闸需要人工裁决的，插件**立即**返回 `{"action":"approve", "message", "rule_key"}`——真正的人工等待由 Hermes 自己的 `tools.approval.request_tool_approval()` 完成：它经 `tools/approval_context.py::_resolve_cli_approval_callback(None)` 落到 `tools/terminal_tool.py` 的按线程审批回调槽，而 worker 以 ACP agent 身份运行时，这个槽已经被 `acp_adapter/server.py::_run_agent_turn()` 绑定为 `make_approval_callback(conn.request_permission, ...)`——approve 因此自动变成一次真实的 ACP `session/request_permission` 往返。**Jones 的插件不需要、也不应该自己再发起或等待一次 ACP 往返**；DEV.md 原则 1（能复用 Hermes 的就不要重写）在这里的落地就是"只返回 approve，剩下的交给 Hermes"。
   - **一个必须记住的坑**：`pre_tool_call` 回调本身受 `plugins.hook_callback_timeout` 限制（config 项，默认 30s，超时直接 fail-closed 拒绝）。这 30s 只卡"这次回调本身要跑多久"——插件立即返回 `approve` 时几乎不占用这个窗口；`request_tool_approval()` 随后在调用者线程上做的真人等待发生在 hook 派发**已经返回之后**，因此不计入这 30s（**已实测**：把 `hook_callback_timeout` 压到 0.5s、模拟人工审批耗时 1.5s，往返仍完整跑完，见 spike #1 demo 第 4 节）。**反过来，如果插件自己在回调里阻塞等待（自建 ACP 往返、`queue.get()` 等）**，这段阻塞就计入这 30s，超时后不仅这一次调用被 fail-closed，**同一个已注册回调**在后续 60s 抑制窗口内的**每一次** `pre_tool_call`（含完全无关的工具调用）都会被直接跳过判定为 block——不是单次失败，是整个会话的工具调用被连续拒绝到孤儿线程自己跑完 + 60s 抑制窗口过完为止（`hermes_cli/plugins_dispatch.py::_HOOK_TIMEOUT_SUPPRESSION_SECONDS`，已实测见 spike #1 demo 第 6/7 节）。这是权限闸可用性的硬约束，daemon 骨架/权限闸实现必须把"决定阶段快速返回"当成正确性要求，不是性能优化项。
   - **待定，留给 W3 权限闸 Issue**：ACP 还有第二个 `session/request_permission` 接入点，专管 `write_file`/`patch` 的编辑审批（`acp_adapter/edit_approval.py::maybe_require_edit_approval`），走独立策略（ask/workspace_session/session，另有 `.env`/`id_rsa` 等敏感文件自动放行名单）。daemon 作为 ACP client 时，这一路和 Jones 自己 `pre_tool_call` 闸的 `write_file`/`patch` 拦截会同时命中同一次文件写入——要么关掉 Hermes 这一路、要么复用它、要么让 Jones 的闸接管，本 spike 不定案，权限闸实现前必须先决定，否则要么用户被问两遍要么两套审批逻辑打架。
-  - **复用范围**：`hermes_state_*.py`（Session/Message/Turn 的 SQLite facade）建议直接作为 worker 内的会话存储，Jones 的 `sessions`/`messages` 表退化成引用 Hermes session_id 的外键，不重复造；`tools/`、`skills/`、MCP client 原样复用（PRD 6.2 本来的意思）；`cron/` 和 `gateway/`（Hermes 自己的 IM 网关，注意和 PRD 里 Jones 的 Channel Gateway 撞名，不是一个东西）功能对得上但没有在本 spike 验证，留给后续 spike。Jones 独有、Hermes 没有对应物的：`runs`/`steps`/`permission_decisions` 回放表——这条审计链只能由 Jones 自己的 `pre_tool_call` 插件 + ACP 工具调用事件拼出来。
+  - **复用范围**：`hermes_state_*.py`（Session/Message/Turn 的 SQLite facade）建议直接作为 worker 内的会话存储，Jones 的 `sessions`/`messages` 表退化成引用 Hermes session_id 的外键，不重复造；`tools/`、`skills/`、MCP client 原样复用（PRD 6.2 本来的意思）；`cron/` 和 `gateway/`（Hermes 自己的 IM 网关，注意和 PRD 里 Jones 的 Channel Gateway 撞名，不是一个东西）功能对得上但没有在本 spike 验证，留给后续 spike。Jones 独有、Hermes 没有对应物的：`runs`/`steps`/`permission_decisions` 回放表——**daemon 侧写**，不是 Jones 的 `pre_tool_call` 插件里写（插件对 approve 分支立即返回，从不知道最终结果）：规则闸的决定 daemon 只能从 ACP `session/update` 事件流异步得知，审查闸/用户闸的决定 daemon 自己就是拍板者、写库要排在回 ACP 响应之前；完整三条时序图、`steps`↔`permission_decisions` 关联方式的已知缺口、写库失败时的诚实失败要求，见 [docs/spikes/01-hermes-hook.md](../spikes/01-hermes-hook.md) §"审计写入时序"（2026-09-19 评审新增，取代了本节此前"由 pre_tool_call 插件 + ACP 工具调用事件拼出来"这句不够精确的旧表述）。
+  - **Hermes 内置的批准绕过路径必须在 worker 启动时禁用**（2026-09-19 评审新增，源码证据见 [docs/spikes/01-hermes-hook.md](../spikes/01-hermes-hook.md) §"Hermes 内置的批准绕过路径"）：Jones 把用户闸"委托"给 Hermes 自己的 `request_tool_approval()` 走 ACP，但这个函数前面有三道能让它零等待直接放行、`session/request_permission` 根本不会被发出的短路——进程级 `HERMES_YOLO_MODE` 环境变量（冻结于 `tools.approval` 模块 import 时）、`config.yaml` 里的 `approvals.mode: off`、以及命中持久化 `command_allowlist`（`tools/approval.py` 模块级代码在 import 时无条件从活动 profile 的 `config.yaml` 加载）。daemon 拉起 worker 子进程时必须：不传 `HERMES_YOLO_MODE`、worker 的 `config.yaml` 不写 `approvals.mode: off`、worker 的 `HERMES_HOME` 与用户默认的 `~/.hermes` 相互隔离（Hermes 自己按 `HERMES_HOME` 分 profile 隔离永久 allowlist，直接复用这个机制即可）。已建议列为 FR05 验收项（见 `docs/PRD.md` §12.3、§6.3）。
   - **未验证**：并发工具调用（`tool_executor.py` 的 8 线程池）下审批回调这个按线程槽会不会跨线程丢失——`agent/tool_executor.py` 有 `propagate_context_to_thread` 把 thread-local 的审批回调带进 worker 线程，源码看设计上没问题，但本 spike 没有并发场景的实测，留给 daemon 骨架落地时的集成测试覆盖（见下方"下一步"）。
 - 向量库（spike #3）、浏览器登录态（spike #4）、打包（spike #2）。
+
+## 8. 给 W2/W3 实现者的接入清单（2026-09-19 评审新增，spike #1 源码核对；对应 issue #1 评审第 4 条）
+
+本节只写"接口在哪、怎么接上"，不重复 §7 已经写过的设计结论（worker↔daemon 走 ACP、Jones 自研
+`pre_tool_call`/`post_tool_call` 插件做 Step 级拦截 + 审计）；两节冲突时以 §7 结论为准，本节是它的落地
+坐标。全部条目均为源码核对结果（`ee4452991d17534aa561f31ee55596d082aa94e7`），不是设计推测；标"待验证"
+的例外单独说明。
+
+### 8.1 worker 进程如何启动 Hermes ACP server
+
+- **命令行**：`python -m acp_adapter.entry`（`acp_adapter/entry.py`，模块 docstring 自带
+  `python -m acp_adapter.entry   # or: hermes acp / hermes-acp`）——stdio 上起标准 ACP JSON-RPC server，
+  `stdout` 只用于 ACP 协议，日志全部走 `stderr`（`entry.py::_setup_logging()`，混进 stdout 会污染
+  JSON-RPC 流，daemon 侧的 ACP client 实现不能假设 stderr 也是 JSON）。
+- **必须的环境变量**：
+  - `HERMES_HOME`：daemon 为每个 worker 显式设置的隔离路径（不是用户默认 `~/.hermes`），原因见 §7
+    "Hermes 内置的批准绕过路径必须在 worker 启动时禁用"一条；`hermes_constants.get_hermes_home()`
+    读取顺序是"context-local override → `HERMES_HOME` 环境变量 → 平台默认"，daemon 子进程 spawn 时
+    传这个环境变量即可，不需要更底层的 override API。
+  - **禁止**设置 `HERMES_YOLO_MODE`（不能从 daemon 自身环境继承，需显式构造子进程 env 并排除这个键，
+    见 §7）。
+- **该 `HERMES_HOME` 下的 `config.yaml` 必须包含**：`plugins.enabled` 列表里加上 Jones 自研插件的
+  `name`（`plugin.yaml` 的 `plugins.enabled` 是 opt-in 白名单，见"实测证据"一节末尾，未列入的插件即便
+  发现也不加载）；**不得**写 `approvals.mode: off`（默认 `manual` 即可，见 §7）；`command_allowlist`
+  初始为空或由 Jones 自己管理写入，不要复制用户默认 profile 的现存内容。
+- **worker↔daemon 的进程关系**：daemon 是这个子进程的父进程和 ACP **client**（stdio 两端），worker/
+  Hermes 是 ACP **agent**（server）——方向和"谁发 RPC 请求给谁"因此是：daemon 发 `initialize`/
+  `new_session`/`prompt`/`cancel` 等方法调用给 worker；worker 反过来向 daemon 发
+  `session/request_permission`、`session/update` 等（`acp/interfaces.py` 里 `Agent`/`Client` 两个
+  Protocol 分别对应这两个方向，见 8.3）。
+
+### 8.2 Jones 插件如何被加载
+
+- **文件位置**：`<worker 的 HERMES_HOME>/plugins/<plugin_name>/`，至少两个文件：`plugin.yaml`（声明
+  `name`/`version`/`hooks: [pre_tool_call, post_tool_call]`，与 §7 的 `plugins.enabled` 配合决定是否
+  真的加载）+ `__init__.py`（定义 `register(ctx)`，内部 `ctx.register_hook("pre_tool_call", fn)` /
+  `ctx.register_hook("post_tool_call", fn)`）。`docs/spikes/hermes_hook_demo.py::_materialize_plugin()`
+  是这个落盘形状的可运行参照（demo 用临时目录，daemon 骨架落地时换成 daemon 管理的固定路径）。
+- **注册方式**：Hermes 自己的 `hermes_cli.plugins.get_plugin_manager().discover_and_load()` 在进程
+  启动时扫描 `<HERMES_HOME>/plugins/*/plugin.yaml`，对 `plugins.enabled` 里列出的名字调用其
+  `register(ctx)`；daemon/worker 侧不需要（也不应该）自己重新实现一遍插件发现逻辑，`acp_adapter/entry.py`
+  拉起进程的过程本身会触发这一步（**待验证**：本 spike 没有跑通 `python -m acp_adapter.entry` 的完整
+  启动路径去确认 `discover_and_load()` 具体在哪一行被调用，只确认了它是 Hermes 自己在正常 CLI 启动路径
+  上会做的事——留给 daemon 骨架 Issue 第一次真正启动 `acp_adapter.entry` 时核实调用时机，若发现 ACP
+  入口没有自动触发插件发现，需要 daemon 侧在 `initialize` 之前手动调用一次）。
+
+### 8.3 daemon 需要实现的 ACP client 方法最小集合
+
+`acp/interfaces.py::Client`（`typing.Protocol`）声明的全部方法：`request_permission`、`session_update`、
+`write_text_file`、`read_text_file`、`create_terminal`、`terminal_output`、`release_terminal`、
+`wait_for_terminal_exit`、`kill_terminal`、`ext_method`、`ext_notification`、`on_connect`。
+
+- **必须真正实现**：`request_permission`（FR05 用户闸/审查闸的接线点，见 §7、spike doc"审计写入时序"）、
+  `session_update`（daemon 据此维护 `steps`/`messages`/流式文本增量，是 RPC v0 §4.2 通知层的上游数据源）。
+- **其余方法（`write_text_file`/`read_text_file`/`create_terminal`/`terminal_output`/`release_terminal`/
+  `wait_for_terminal_exit`/`kill_terminal`）是否要实现，取决于 daemon 在 `initialize()` 握手时怎么声明
+  `ClientCapabilities`**（`acp_adapter/server.py:502` 的 `initialize()` 接受 `client_capabilities` 参数）：
+  Jones 的文件读写、终端执行已经是 Hermes 自己 `tools/file_tools.py`/`tools/terminal_tool.py` 里的工具
+  （worker 进程内直接执行，不需要回调 daemon 来读写文件或起终端），推荐 daemon 在 `initialize()` 里如实
+  声明不支持这些编辑器式能力，让 Hermes 走自己的工具而不是回调 daemon。**待验证**：本 spike 只核对了
+  `Client` Protocol 的方法签名和 `initialize()` 接受 capabilities 参数这两点，没有逐条跟踪"声明不支持
+  某能力后 Hermes 是否真的永远不会调用对应方法"——留给 W2 daemon 骨架落地时用一次真实握手核实，若发现
+  某个方法即使声明不支持仍被调用，至少要给一个不崩溃的兜底实现（返回协议允许的"不支持"错误，不能让
+  daemon 直接抛未处理异常打断 ACP 连接）。
+- `Agent` Protocol（worker/Hermes 侧要实现、daemon 侧要调用的方法）已经由 `acp_adapter/server.py` 实现，
+  daemon 只需要作为 client 去调，最常用的是 `initialize`、`new_session`/`load_session`/`resume_session`/
+  `fork_session`、`prompt`、`cancel`——不需要 daemon 自己重新实现这一侧。
+
+### 8.4 Hermes 自身 session/state（`hermes_state_*`）与 Jones SQLite 的边界
+
+延续 §7"复用范围"一条，落到具体表级别：
+
+- **复用 Hermes 的**：`hermes_state_*.py`（`hermes_state_sessions.py` 等）管理的 Session/Message/Turn
+  facade 作为 worker 内的会话存储真源；Jones 的 `sessions`/`messages` 表（00-foundation.md §5）**引用**
+  Hermes 的 session_id，不重复存一份消息内容。
+- **Jones 自己记的**（Hermes 没有对应概念）：`runs`、`steps`、`permission_decisions`、`goals`、
+  `queue_items`、`crons`、`providers` ——这些是 Jones 的回放/权限/多 Provider 模型特有的，daemon 侧
+  `store/` 层写，见 §5 schema 与本节 §7 的审计写入时序。
+- **明确不能复用、需要自己隔离的一条**：`hermes_state_sessions.py:730` 的 `model_config.yolo_mode`
+  是 Hermes 自己的会话级 YOLO 状态字段——即使确认了 ACP 路径当前不会自动 `_restore_session_yolo()`
+  （见 §7"批准绕过路径"一节最后一段），Jones 也不应该把这个字段当成自己的状态来源或去写它；Jones 的
+  "会话是否处于宽松审批模式"应该是 Jones 自己 `sessions` 表的 `mode`/`settings_json`，不要跟 Hermes
+  这个字段混用，避免未来 Hermes 给 ACP 补上 `/yolo` 等价物时，两套状态互相踩踏。
