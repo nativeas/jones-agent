@@ -193,13 +193,24 @@ BrowserMcpSession（daemon 内部状态，非 SQLite 表，进程重启即丢—
   - profile_dir: <user_root()>/browser/profile   # Jones 专属，非用户 Default profile，路径不变
   - proc: daemon 用 stdio 子进程方式直接拉起的 MCP server 进程：
       npx -y @playwright/mcp@<锁定版本> --browser chrome
-          --user-data-dir <profile_dir> --headless=false
+          --user-data-dir <profile_dir>
+    **第三轮修复**：`--headless` 在 Playwright MCP 里是一个不接值的布尔开关
+    （出现即代表启用 headless，不出现就是有头——旧版本这里写的
+    `--headless=false` 是把值传给一个不吃值的 flag，Commander 直接报
+    `error: unknown option '--headless=false'` 并以退出码 1 秒退，daemon 会
+    拿到一个刚起来就挂掉的子进程）。有头是 Playwright MCP 的默认行为，daemon
+    生产配置要有头，因此**正确做法是完全不传 `--headless`**，不是传某个
+    「等于 false」的值。实际跑通的完整命令行（`@playwright/mcp@0.0.81`，本机
+    macOS + 系统 Chrome，2026-09-19 实测：进程正常常驻、`initialize`/
+    `browser_navigate`/`browser_close` 全部成功返回，退出码 0）：
+      npx -y @playwright/mcp@0.0.81 --browser chrome --user-data-dir <profile_dir>
     浏览器可执行文件由 Playwright 按 --browser chrome 这个 channel 名自动发现
     系统已安装的 Chrome，不需要 daemon 自己维护一份「自动发现 Chrome/Edge
     路径」的逻辑（旧版本自己发现二进制路径的代码不再需要）。
-  - headless=false（有头）：用户需要在这个 Jones 专属窗口里手动登录，必须可见；
-    本节的实测为了自动化跑得快用了 --headless，daemon 的生产配置必须是有头，
-    这是结论没变但配置不同，不要照抄探针脚本的 --headless。
+  - 有头：用户需要在这个 Jones 专属窗口里手动登录，必须可见；本节的探针脚本
+    （`daemon/spikes/mcp_reuse_probe/test_persist.py`）为了自动化跑得快显式加了
+    `--headless`，daemon 的生产配置必须**不加**这个 flag（保持默认有头），不要
+    照抄探针脚本。
   - 生命周期：daemon 直接持有并管理这个 MCP server 子进程（stdio pipe，和 FR13
     里任何一个 stdio MCP Server 的接入方式完全一致），第一次浏览器工具调用时
     懒加载启动；daemon 决定关闭它（空闲超时或 daemon 自己退出）前，必须先调用
@@ -226,17 +237,42 @@ BrowserMcpSession（daemon 内部状态，非 SQLite 表，进程重启即丢—
     MCP server 直接暴露给 worker），闸的代码就长在 daemon 组装/发出这次
     tools/call 请求之前——这是「进程边界」意义上天然存在的介入点，不需要
     额外代理层，第一版认为「没有天然介入点」是错的。
-  - 权限分级：Playwright MCP 没有一个语义化的「表单提交」工具（旧契约里
-    `browser.submit` 是 Jones 自己发明的抽象，现在不存在了）——在缺乏
-    「这次点击/按键是不是在提交表单」这个语义信息的前提下，分类简化为
-    只读工具（`browser_navigate`、`browser_snapshot`、`browser_evaluate`
-    但仅当求值表达式本身不含有副作用调用时）默认走规则闸放行；其余所有
-    有副作用的工具（`browser_click`/`browser_fill_form`/`browser_type`/
-    `browser_press_key`/`browser_drag`/`browser_file_upload` 等）统一走
-    用户闸。这比旧口径「只有 submit 走用户闸」更保守，但因为拿不到工具名
-    以外的语义信号，这是能诚实做到的最保守分类，避免「点了个看起来像
-    提交按钮的元素」被规则闸误放行。PRD 12.3 FR09 验收口径同 PR 更新为
-    这个新分级。
+  - 权限分级（**第三轮重写**，按控制者裁定）：上一版把 `browser_evaluate`
+    （任意 JS 求值）塞进「规则闸默认放行」档，前提是「仅当求值表达式本身
+    不含有副作用调用时」——这自相矛盾：规则闸是按 PRD FR05 定义的机械
+    工具名/规则匹配层，没有能力判断一段任意 JS 字符串有没有副作用，把这个
+    语义判断压给规则闸等于让它做它做不到的事。按 PRD FR05 的三道闸
+    （规则闸 → 审查闸 → 用户闸）重新分级，用「能不能靠工具名机械判定」
+    区分规则闸与审查闸，用「需要审查闸对参数/页面上下文做语义判断」区分
+    审查闸与用户闸：
+    - **规则闸放行**（只读、按工具名机械匹配即可判定，不经过审查闸）：
+      `browser_navigate`（导航）、`browser_snapshot`（读页 a11y 树）、
+      `browser_take_screenshot`（截图）、`browser_wait_for`（只是等待某个
+      条件出现，不产生任何页面/文件副作用）。
+    - **审查闸**（有副作用或工具名本身不足以判断风险，需要模型看这次调用
+      的参数与页面上下文；这正是审查闸存在的目的——语义判断，不是硬塞进
+      规则闸）：`browser_click`、`browser_fill_form`、`browser_type`、
+      `browser_press_key`、`browser_drag`、`browser_select_option`、
+      `browser_hover`、`browser_file_upload`、`browser_evaluate`、
+      `browser_tabs`（新建/切换/关闭标签页）。下载没有独立工具，是某次
+      `browser_navigate`/`browser_click` 的副作用，按触发它的那次调用定级，
+      不低于审查闸。`browser_close` 由 daemon 生命周期管理自己在关闭子进程
+      前调用（见上），不经过这里的分级；若被 agent 当普通工具主动调用，按
+      审查闸处理。
+    - **用户闸**（审查闸判断满足以下任一条件即标红升级；这个信号只能来自
+      模型对参数/页面上下文的语义判断，不是单独的工具名规则，因为
+      Playwright MCP 没有语义化的「表单提交」工具）：① 表单提交（这次
+      点击/按键实质是提交表单，即将触发导航或向服务器发起写请求）；
+      ② 任何触发外发的动作（把本地内容/文件发送到外部，如上传、发布）；
+      ③ `browser_evaluate` 求值的表达式里含网络请求（`fetch`/
+      `XMLHttpRequest` 等）或存储写入（`localStorage`/`sessionStorage`/
+      `indexedDB`/写 cookie 等）。
+    - 分级由 Jones 规则闸按 MCP 工具名做默认映射（上面前两档是固定映射，
+      第三档由审查闸在放行到它手上的调用里逐次判断触发，不是独立的工具名
+      规则）；用户可以在 `permissions.json` 里针对具体工具名进一步收紧
+      （例如强制把某个工具整体钉死在用户闸，不管审查闸怎么判断），但不能
+      放宽——与 PRD 规则闸「只能收紧」的既有原则一致（对齐 G14）。
+    - PRD 12.3 FR09 验收口径同 PR 更新为这三档。
   - Step 记录 args_json 时对 `browser_fill_form`/`browser_type` 的输入内容做
     脱敏（若字段名/上下文疑似密码则不落明文），对齐 N02，这条约束不变。
   - 不做「自动发现并接管用户当前浏览器窗口」的路径（spike #4 实测：单实例锁会把
