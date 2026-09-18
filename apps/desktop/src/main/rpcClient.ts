@@ -53,7 +53,7 @@ export class RpcClient {
   private reconnectAttempt = 0
   private reconnectTimer: NodeJS.Timeout | null = null
   private stopped = false
-  private connectedResolvers: Array<() => void> = []
+  private connectedWaiters: Array<{ resolve: () => void; reject: (err: Error) => void }> = []
 
   constructor(private readonly socketPath: string) {}
 
@@ -74,6 +74,9 @@ export class RpcClient {
       call.reject(new Error('rpc client stopped'))
     }
     this.pending.clear()
+    const waiters = this.connectedWaiters
+    this.connectedWaiters = []
+    waiters.forEach(({ reject }) => reject(new Error('rpc client stopped')))
   }
 
   private openSocket(): void {
@@ -82,9 +85,9 @@ export class RpcClient {
 
     socket.on('connect', () => {
       this.reconnectAttempt = 0
-      const resolvers = this.connectedResolvers
-      this.connectedResolvers = []
-      resolvers.forEach((resolve) => resolve())
+      const waiters = this.connectedWaiters
+      this.connectedWaiters = []
+      waiters.forEach(({ resolve }) => resolve())
     })
     socket.on('data', (chunk) => this.handleData(chunk))
     socket.on('error', () => {
@@ -148,7 +151,7 @@ export class RpcClient {
 
   private whenConnected(): Promise<void> {
     if (this.socket && !this.socket.pending) return Promise.resolve()
-    return new Promise((resolve) => this.connectedResolvers.push(resolve))
+    return new Promise((resolve, reject) => this.connectedWaiters.push({ resolve, reject }))
   }
 
   async call(method: string, params?: Record<string, unknown>, timeoutMs = 10_000): Promise<unknown> {
