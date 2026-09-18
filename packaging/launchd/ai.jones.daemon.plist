@@ -1,10 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  草案：Jones 守护进程的用户级 LaunchAgent。
-  安装位置：~/Library/LaunchAgents/com.jones.daemon.plist
-  安装方式：Electron 首次启动时写入该文件（用真实安装路径替换下面的占位符），
-  然后 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jones.daemon.plist`。
+  草案 / 参考：Jones 守护进程的用户级 LaunchAgent。
+  真正生成这份 plist 并 install/uninstall/status 的实现是
+  `daemon/src/jones_daemon/service.py`（Issue #6）——它用 `plistlib` 直接构造等价内容，
+  不解析这个文件；这里留作人可读的字段对照参考，字段改动请两边一起改。
+  安装位置：~/Library/LaunchAgents/ai.jones.daemon.plist
+  安装方式：`python -m jones_daemon service install`（daemon 侧，Electron 不再自己拼 plist）。
   对应 PRD 11.3「守护进程注册为系统用户级服务，崩溃后由系统拉起」与 FR15。
 
   占位符：
@@ -15,7 +17,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.jones.daemon</string>
+    <string>ai.jones.daemon</string>
 
     <key>ProgramArguments</key>
     <array>

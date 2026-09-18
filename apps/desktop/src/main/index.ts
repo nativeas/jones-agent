@@ -4,6 +4,7 @@ import os from 'node:os'
 import { spawn } from 'node:child_process'
 import { app, BrowserWindow, ipcMain } from 'electron'
 import { RpcClient } from './rpcClient'
+import { ensureDaemonRunning as runDaemonLifecycle, startHeartbeat } from './daemonLifecycle'
 
 // Same override the daemon's paths.py honors, so `JONES_HOME=... electron-vite dev`
 // points both processes at the same sandbox during development/tests.
@@ -24,13 +25,11 @@ const rpcClient = new RpcClient(daemonSocketPath())
 // later issues add methods from design §4.1.
 const ALLOWED_RPC_METHODS: ReadonlySet<string> = new Set(['daemon.ping', 'daemon.status'])
 
-// Matches the label packaging/*.plist will install as a launchd service (spike
-// #2, not built yet) — kickstart is a harmless no-op until then; spawnDevDaemon()
+// Matches `service.DEFAULT_LABEL` in daemon/src/jones_daemon/service.py — the label
+// `python -m jones_daemon service install` registers with launchd (design §6).
+// Before that install has ever run, kickstart is a harmless no-op; spawnDevDaemon()
 // below is what actually recovers the common local-dev case (daemon not started).
-const DAEMON_LAUNCHD_LABEL = 'com.jones.daemon'
-const MAX_DAEMON_START_ATTEMPTS = 3
-const DAEMON_PING_TIMEOUT_MS = 2000
-const DAEMON_RETRY_WAIT_MS = 1000
+const DAEMON_LAUNCHD_LABEL = 'ai.jones.daemon'
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -127,11 +126,23 @@ function reportDaemonUnreachable(): void {
   const payload = {
     code: -32000,
     message: 'daemon unreachable after retries',
-    detail: { attempts: MAX_DAEMON_START_ATTEMPTS }
+    detail: { attempts: 3 }
   }
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('rpc:notify', 'daemon.error', payload)
   }
+}
+
+// Real dependencies for daemonLifecycle.ts's injectable sequencing (design §3, §6):
+// connect/ping this rpcClient, kickstart/spawn the real subprocess, push a real
+// `daemon.error` notification. See daemonLifecycle.test.ts for the fake-dependency
+// version of this same sequencing.
+const daemonLifecycleDeps = {
+  connect: () => rpcClient.connect(),
+  ping: (timeoutMs: number) => pingOnce(timeoutMs),
+  kickstart: attemptLaunchdKickstart,
+  spawnDev: spawnDevDaemon,
+  onUnreachable: reportDaemonUnreachable
 }
 
 /**
@@ -142,19 +153,8 @@ function reportDaemonUnreachable(): void {
  * keeps a single ping from hanging forever, but this is what actually gets the
  * daemon running in the common dev case and reports it when it can't.
  */
-async function ensureDaemonRunning(): Promise<void> {
-  rpcClient.connect()
-  if (await pingOnce(DAEMON_PING_TIMEOUT_MS)) return
-
-  for (let attempt = 1; attempt <= MAX_DAEMON_START_ATTEMPTS; attempt++) {
-    await attemptLaunchdKickstart()
-    spawnDevDaemon()
-    rpcClient.connect()
-    await new Promise((resolve) => setTimeout(resolve, DAEMON_RETRY_WAIT_MS))
-    if (await pingOnce(DAEMON_PING_TIMEOUT_MS)) return
-  }
-
-  reportDaemonUnreachable()
+function ensureDaemonRunning(): Promise<boolean> {
+  return runDaemonLifecycle(daemonLifecycleDeps)
 }
 
 rpcClient.onAnyNotification((method, params) => {
@@ -174,9 +174,15 @@ ipcMain.handle('rpc:call', async (_event, method: string, params?: Record<string
   }
 })
 
+let stopHeartbeat: (() => void) | null = null
+
 app.whenReady().then(() => {
   createWindow()
   void ensureDaemonRunning()
+  // design §6: "健康检测：daemon.ping 心跳 5s，断线走 RpcClient 状态机重连" — started
+  // once at app startup (not per-window), independent of ensureDaemonRunning's own
+  // outcome, since a daemon that answers now can still wedge later.
+  stopHeartbeat = startHeartbeat(daemonLifecycleDeps)
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -193,4 +199,8 @@ app.on('window-all-closed', () => {
   // client's own socket, never signal the daemon to exit here.
   rpcClient.stop()
   if (process.platform !== 'darwin') app.quit()
+})
+
+app.on('will-quit', () => {
+  stopHeartbeat?.()
 })

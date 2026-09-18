@@ -23,6 +23,7 @@ from jones_daemon.logging import configure_logging, get_logger
 from jones_daemon.providers import methods as providers_methods
 from jones_daemon.rpc.methods import register_builtin_methods
 from jones_daemon.rpc.server import RpcServer
+from jones_daemon.service import maybe_handle_cli
 from jones_daemon.store import apply_pending, connect, run_in_db_thread
 
 logger = get_logger("main")
@@ -132,6 +133,11 @@ async def _run() -> None:
 
 
 def main() -> None:
+    # `python -m jones_daemon service install|uninstall|status` (Issue #6, design §6)
+    # short-circuits here instead of starting the daemon event loop below.
+    exit_code = maybe_handle_cli(sys.argv[1:])
+    if exit_code is not None:
+        sys.exit(exit_code)
     asyncio.run(_run())
 
 
