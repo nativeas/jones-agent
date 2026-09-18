@@ -92,7 +92,12 @@ Jones Agent 是一台装在用户自己电脑上、自主运行的通用 AI 工�
 | 运行时 ↔ IM 平台 | 各平台官方 SDK / Bot API（长连接或 Webhook） |
 | 内核 ↔ 能力域 | Hermes 原生 tool 协议 + MCP client；Skill 以文件形式加载 |
 
-**Step 级权限拦截（FR05 的落地点，spike #1 结论）**：ACP 的 `session/request_permission` 只挂在 Hermes 自带的“危险 shell 命令”侦测上，覆盖不到任意工具调用。真正的全覆盖拦截点是 Hermes 的 `pre_tool_call` 插件 hook（`hermes_cli.plugins`，在 `agent/agent_runtime_helpers.py::invoke_tool()` 里、任何工具真正执行前同步触发，对 registry 工具和内联工具一视同仁）：worker 启动时加载一个 Jones 自研插件，其 `pre_tool_call` 回调对每次工具调用做出 `block`（工具从不执行，`{"error": message}` 原样进入 agent 的工具结果，agent 收到明确拒绝）/`modify`（改写参数）/放行三选一。规则闸能本地同步决出的（硬性禁止、项目级 `permissions.json` 命中）直接在 worker 内返回，不打一次 IPC；审查闸/用户闸需要人工裁决的，通过 worker 已经开着的 ACP 连接把 daemon 当作 ACP client，发一次标准 `session/request_permission` 等回复——这段等待**不**计入 Hermes 的 `plugins.hook_callback_timeout`（默认 30s，配置项，这 30s 只卡 hook 回调本身，不够人工审批用；实测见 spike #1）。
+**Step 级权限拦截（FR05 的落地点，spike #1 结论，2026-09-18 评审修正）**：全覆盖拦截点是 Hermes 的 `pre_tool_call` 插件 hook（`hermes_cli.plugins`，在 `agent/agent_runtime_helpers.py::invoke_tool()` 里、任何工具真正执行前同步触发，对 registry 工具和内联工具一视同仁）：worker 启动时加载一个 Jones 自研插件，其 `pre_tool_call` 回调对每次工具调用做出 `block`（工具从不执行，`{"error": message}` 原样进入 agent 的工具结果，agent 收到明确拒绝）/`approve`（升级为人工裁决）/`modify`（改写参数）/放行四选一。
+
+- **规则闸**：能本地同步决出的（硬性禁止、项目级 `permissions.json` 命中）直接在插件里返回 `{"action":"block",...}`，零等待，不打一次 IPC。
+- **审查闸/用户闸**：插件**立即**返回 `{"action":"approve", "message", "rule_key"}`——插件自己不发起、也不等待任何 ACP 往返。真正的人工等待由 Hermes 自己的 `tools.approval.request_tool_approval()` 完成，且发生在调用者线程上、在 `pre_tool_call` 的 hook 派发已经返回**之后**——这段等待因此不计入 `plugins.hook_callback_timeout`（默认 30s，配置项）。这不是 Jones 自己搭的传输：worker 以 ACP agent 身份运行时，`acp_adapter/server.py::_run_agent_turn()` 已经把 `terminal_tool` 的按线程审批回调槽绑定到 `make_approval_callback(conn.request_permission, ...)`；`request_tool_approval()` 经 `_resolve_cli_approval_callback(None)` 落到同一个槽上，approve 因此自动变成一次真实的 ACP `session/request_permission` 往返，Jones 的插件不需要、也不应该自己再讲一遍 ACP。**（实测见 spike #1：`docs/spikes/01-hermes-hook.md` §"实测证据"——把 `plugins.hook_callback_timeout` 压到 0.5s、模拟人工审批耗时 1.5s，往返仍然完整跑完、拒绝理由原样传回 agent，证明这段等待确实在计时窗口之外。）**
+- **反例（禁止）**：如果插件自己在 `pre_tool_call` 回调里阻塞等待（例如自己发起 ACP 往返或 `queue.get()`），这段阻塞**计入** `hook_callback_timeout`；超时后 Hermes 对这次调用 fail-closed，且**同一个回调注册对象**在后续 60s 抑制窗口内的**所有** `pre_tool_call` 调用（含无关工具）都会被跳过并 fail-closed，不是单次失败（`hermes_cli/plugins_dispatch.py` `_HOOK_TIMEOUT_SUPPRESSION_SECONDS`；实测见 spike #1 demo 第 6/7 节）。
+- **待定**：ACP 还有第二个 `session/request_permission` 接入点，专管 `write_file`/`patch` 的编辑审批（`acp_adapter/edit_approval.py`），走独立策略（ask/workspace_session/session）。daemon 作为 ACP client 时，这一路和 Jones 自己的 `pre_tool_call` 闸会同时命中同一次文件写入。是关掉 Hermes 这一路、复用它、还是让 Jones 的闸接管，留给 W3 权限闸 Issue 决定，不在本 spike 范围内定案。
 
 ### 6.4 存储
 

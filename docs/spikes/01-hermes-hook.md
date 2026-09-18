@@ -2,8 +2,14 @@
 
 对应 PRD 13.2 风险 1、6.2/6.3；00-foundation.md §7。
 
-验证对象：[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)
-commit `0138269` (`main`, 2026-09-18)。
+验证对象：[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)。
+原始验证用的是 commit `0138269`（`main`，2026-09-18，treeless partial clone + 按需拉取，见下"实测证据·环境"）。
+**2026-09-18 评审修复一轮**（见文末"修复记录"）额外用本机已有的完整 checkout
+（`/Users/nativeas/.hermes/hermes-agent`，同一上游仓库，commit `ee4452991d`，浅克隆看不到与
+`0138269` 的祖先关系，未做网络核实）复核了下面标注"已实测"的结论，并重写、重跑了
+`docs/spikes/hermes_hook_demo.py`。两次验证的具体 commit 不同，但涉及的源码路径
+（`hermes_cli/plugins.py`、`plugins_dispatch.py`、`tools/approval.py`、`tools/approval_context.py`、
+`tools/terminal_tool.py`、`acp_adapter/*`）逻辑一致，是同一上游项目相隔不远的两个快照，不是两套设计。
 
 ## 结论（先说结论）
 
@@ -11,27 +17,40 @@ commit `0138269` (`main`, 2026-09-18)。
    Hermes 有一个真实存在、同步阻塞、在任何工具执行前触发的插件 hook：`pre_tool_call`
    （`hermes_cli.plugins`，挂在 `agent/agent_runtime_helpers.py::invoke_tool()` 里）。
    回调可以真的阻塞调用线程等外部信号，返回 `block` 时工具从不执行、拒绝理由原样成为该次工具调用的结果传回给
-   agent——**已用真实 hermes-agent 代码实测，不是读源码猜的**（见下文"实测证据"）。
+   agent——**已驱动真实 `invoke_tool()`（不是手写等价 JSON）实测，只用一个 ~5 行的 stub agent对象，
+   不需要完整 `AIAgent` 或任何 provider SDK**（见下文"实测证据"）。
 
-2. **B（`acp_adapter/`，Agent Client Protocol，stdio）也可行，而且比自己发明一个 worker 协议成熟得多。**
+2. **B（`acp_adapter/`，Agent Client Protocol，stdio）也可行，而且比自己发明一个 worker 协议成熟得多，
+   且已经把 A 的人工审批分支接通了。**
    `hermes acp` 起一个标准 ACP JSON-RPC stdio server：真的有会话生命周期
    （`new_session`/`load_session`/`resume_session`/`fork_session`）、真的流式文本/思考增量、真的工具调用
    start/update/complete 事件、真的 `cancel()`（设置一个 agent loop 会检查的 `cancel_event`）、真的
-   `session/request_permission`。**但它的 `request_permission` 只接在 Hermes 自己"危险 shell 命令"的启发式侦测上**，
-   不会自动帮 Jones 拦下任意工具调用——它是 A 的一种传输层，不是 A 的替代品。
+   `session/request_permission`。**这条 `request_permission` 不止接在 Hermes 自己"危险 shell 命令"的
+   启发式侦测上——`acp_adapter/server.py::_run_agent_turn()` 把 `tools/terminal_tool.py` 的按线程审批回调槽
+   绑定到它，而 `pre_tool_call` 的 `approve` 分支（`tools/approval.py::request_tool_approval()`）正是从
+   同一个槽里取审批回调的。** 也就是说：worker 跑在 ACP 之上时，Jones 插件返回一次 `approve`，这次审批
+   就自动变成一次真实的 ACP `session/request_permission` 往返——不需要 Jones 自己再讲一遍 ACP（详见
+   "ACP 侧证据"）。它还有第二个独立的 `request_permission` 接入点管 `write_file`/`patch` 的编辑审批
+   （`acp_adapter/edit_approval.py`），见"风险"一节。
 
-3. **推荐：A + B 组合，不是二选一。**
+3. **推荐：A + B 组合，不是二选一，且 A 的"人工审批"分支本身就是 B。**
    - worker 进程跑 ACP server（daemon 是 ACP client），直接复用 `acp_adapter/` 的会话生命周期、流式事件、cancel，
      不重造 stdio 协议——00-foundation.md §3 的"worker stdio JSON-RPC"直接就是 ACP，不用另起一套。
    - worker 启动时额外加载一个 **Jones 自研的 `pre_tool_call` 插件**，做 FR05 要求的 Step 级权限拦截：
-     规则闸能本地同步决出的（硬性禁止、`permissions.json` 命中）在 worker 内直接返回，不打一次 daemon IPC；
-     审查闸/用户闸需要人工裁决的，复用 worker 已经开着的 ACP 连接，向 daemon（ACP client）发一次标准
-     `session/request_permission` 等回复。
-   - **关键坑，写进了 00-foundation.md**：`pre_tool_call` 回调本身受 `plugins.hook_callback_timeout`
-     限制（config 项，默认 30s，超时直接 fail-closed 拒绝）。这 30s 只够"决定阶段"，不够真人在 Electron
-     里点审批用的。Hermes 自己处理这个问题的方式是：`pre_tool_call` 返回 `{"action":"approve"}` 把决定权交给
-     `tools.approval.request_tool_approval()`，那次人工等待发生在 `hook_callback_timeout` 计时**之外**。
-     Jones 的插件必须照抄这个两段式设计，不能把 `queue.get()` 直接杵在 hook 回调里等审批。
+     规则闸能本地同步决出的（硬性禁止、`permissions.json` 命中）在插件里直接返回 `{"action":"block",...}`，
+     零等待，不打一次 daemon IPC；审查闸/用户闸需要人工裁决的，插件**立即**返回
+     `{"action":"approve","message","rule_key"}`——不在回调里等待，不自己发起 ACP 往返。真正的人工等待由
+     Hermes 自己的 `request_tool_approval()` 完成，经既有的 `terminal_tool` 审批回调槽自动落到 ACP 的
+     `session/request_permission` 上（结论 2）。
+   - **关键坑，写进了 00-foundation.md，本轮已实测**：`pre_tool_call` 回调本身受 `plugins.hook_callback_timeout`
+     限制（config 项，默认 30s，超时直接 fail-closed 拒绝）。这 30s 只卡"这次回调本身要跑多久"；插件立即
+     返回 `approve` 时几乎不占用这个窗口，随后 `request_tool_approval()` 在调用者线程上做的真人等待发生在
+     hook 派发**已经返回之后**，因此不计入这 30s——**已实测**：把 `hook_callback_timeout` 压到 0.5s、模拟
+     人工审批耗时 1.5s（3 倍于超时），往返仍完整跑完、拒绝理由原样传回 agent（demo 第 4 节）。
+     **反过来，如果插件自己在回调里阻塞等待**（自建 ACP 往返、`queue.get()` 等——这正是本 spike 早期草稿
+     的写法，已改掉），这段阻塞就计入这 30s；超时后不仅这一次调用被 fail-closed，**同一个已注册回调**
+     在后续 60s 抑制窗口内的**每一次** `pre_tool_call`（含完全无关的工具调用）都会被跳过判定为 block——
+     不是单次失败（demo 第 6/7 节已实测这个连锁效应，见"风险"一节）。
 
 4. **不满足→运行时层代理方案（PRD 13.2 的 Plan B）不需要**：spike 结果是 A 可行，不需要在 daemon
    层再包一层"工具调用先过守护进程"的运行时代理——`pre_tool_call` 本身就是这层代理，而且是 Hermes 原生支持的，
@@ -47,16 +66,20 @@ commit `0138269` (`main`, 2026-09-18)。
   按 `hermes_cli.plugins` → `hermes_cli.lifecycle` → `agent.agent_runtime_helpers`（仅到
   `invoke_tool`/`_pre_tool_block_message` 需要的部分）这条真实 import 链，迭代拉取到约 90 个源文件，
   未拉取整仓库（`agent/`、`hermes_cli/`、`tools/` 各有 300–500 个文件，多数是 provider/auth/terminal 相关，
-  与本次验证的问题无关）。跑通 `agent.agent_runtime_helpers` 的完整 import（走到需要 openai/anthropic SDK
-  的那一层）预计还要再深入约 60+ 个文件外加若干第三方 SDK，本 spike 判断这部分对回答"hook 点是否存在、能否
-  阻塞、能否拒绝"这个问题没有增量信息，故未做——`invoke_tool()` 调用 `_pre_tool_block_message()` 这一段
-  的源码原文见下方"关键源码"，与本 spike 实测跑的 `_dispatch_pre_tool_call_hooks()` 是同一个函数，只是
-  上面还包一层 try/except（失败即放行，不影响结论）。
+  与本次验证的问题无关）。
+- **原始 spike 的判断有误，本轮已纠正**：原始报告认为"跑通 `agent.agent_runtime_helpers` 的完整 import
+  还要再深入约 60+ 个文件外加 openai/anthropic 等第三方 SDK"，因此没有驱动真实 `invoke_tool()`，只是手写了
+  一段等价的 JSON 打印来代表"agent 会收到什么"。这个理由不成立——在有完整 checkout 的机器上实测，
+  `import agent.agent_runtime_helpers`（系统 `python3`，不装任何依赖）一次通过，不需要任何 provider SDK；
+  `invoke_tool()` 本身只在真正派发到 registry/inline 工具之前需要 provider 相关的东西，而这正是
+  block 路径永远不会走到的分支。本轮用一个 ~5 行的 stub agent（只带 `session_id`/`_current_turn_id`/
+  `_current_api_request_id` 三个属性）驱动了真实的 `agent.agent_runtime_helpers.invoke_tool()`，见
+  demo 第 3/4/6 节。
 - `uv venv --python 3.12`，只装了 `pyyaml`（`hermes_cli.plugins` 这条 import 链除了标准库只需要它）。
   **没有配置任何模型 provider API key，也没有发起任何模型调用**——`pre_tool_call` 在工具真正执行前、
   在任何 API 请求发生前同步触发，验证它不需要一个完整 Turn。
 
-### 关键源码（hermes-agent 原文，未改写）
+### 关键源码摘录（hermes-agent，含中文注解，非逐字——上一版本声明"未改写"但实际做了改写，已更正标题并恢复省略号标注）
 
 `agent/agent_runtime_helpers.py`（工具真正派发前的调用点）：
 
@@ -92,13 +115,24 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     # 只有走到这里才真正派发到 model_tools.handle_function_call / inline_executor
 ```
 
-`hermes_cli/plugins.py`（`_dispatch_pre_tool_call_hooks` 本体，本 spike 直接调用的函数）：
+`hermes_cli/plugins.py`（`_dispatch_pre_tool_call_hooks` 本体，本 spike 直接调用的函数；**逐字英文
+docstring，本轮对照 `ee4452991d` 恢复，并补回了上一版本删掉的 `_thread_tool_whitelist` 分支**）：
 
 ```python
-def _get_pre_tool_call_directive_details(tool_name, args, task_id="", session_id="", tool_call_id="",
-                                         turn_id="", api_request_id="", middleware_trace=None):
-    """block（否决；message 变成 tool result）或 approve（把任意工具升级到人工审批闸，
-    走 tools.approval 里跟"危险命令"共用的同一套人工裁决机制）。"""
+def _get_pre_tool_call_directive_details(
+    tool_name: str, args: Optional[Dict[str, Any]], task_id: str = "", session_id: str = "",
+    tool_call_id: str = "", turn_id: str = "", api_request_id: str = "",
+    middleware_trace: Optional[List[Dict[str, Any]]] = None,
+) -> _PreToolCallDirective:
+    """Check ``pre_tool_call`` hooks for ``{"action": "block", "message"}`` (veto; message becomes
+    the tool result) or ``{"action": "approve", "message", "rule_key"?}`` (escalate ANY tool to the
+    human-approval gate; ``rule_key`` picks the ``[a]lways`` allowlist grain). First valid directive
+    wins; irrelevant returns are ignored."""
+    allowed = getattr(_thread_tool_whitelist, "allowed", None)
+    if allowed is not None and tool_name not in allowed:
+        fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
+        return _PreToolCallDirective(action="block", message=fmt.format(tool_name=tool_name))
+    from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
     hook_results = invoke_lifecycle_hook("pre_tool_call", tool_name=tool_name, args=args or {}, ...)
     for result in hook_results:
         ...
@@ -107,8 +141,8 @@ def _get_pre_tool_call_directive_details(tool_name, args, task_id="", session_id
 
 
 def _resolve_block_from_details(details, tool_name, *, turn_id="", tool_call_id="", session_id=""):
-    """唯一的 fail-closed 收口：block 直接拒；approve 交给 tools.approval.request_tool_approval()
-    （这一步的人工等待不计入 pre_tool_call 自身的 hook_callback_timeout）；网关/裁决出错也拒，不静默放行。"""
+    """The ONE place for the fail-closed approval logic: ``block`` blocks with its message; an
+    ``approve`` whose gate errors, denies, or times out is blocked; anything else proceeds."""
     if details.action == "block":
         return details.message
     if details.action != "approve":
@@ -126,18 +160,64 @@ def _dispatch_pre_tool_call_hooks(tool_name, args, **hook_kwargs):
     return (block_msg, details.modified_args)
 ```
 
+（上一版本这里多了一句括号"（这一步的人工等待不计入 pre_tool_call 自身的 hook_callback_timeout）"混进了
+声称逐字引用的代码块——`ee4452991d` 的真实 docstring 没有这句话。这个结论本身是对的（见结论 3），但
+出处是 `hermes_cli/plugins_dispatch.py::invoke_hook`/`_run_hook_callback_bounded` 的调度逻辑，不是
+这段 docstring 的原文，已挪到下面"ACP 侧证据"和"风险"里，并给出了对应的源码行号。）
+
+`hermes_cli/plugins_dispatch.py`（hook 超时/抑制机制本体，`_dispatch_pre_tool_call_hooks` 走的
+`invoke_lifecycle_hook` 最终落到这里；本轮新增引用，上一版本没有摘录过这个文件）：
+
+```python
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
+_HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0  # After a timeout, suppress the same callback this long.
+
+def invoke_hook(self, hook_name, **kwargs):
+    ...
+    for cb in self._hooks.get(hook_name, []):
+        if use_timeout:
+            ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
+            if ret is _HOOK_SKIPPED:
+                if fail_closed:  # pre_tool_call: fail closed with a block directive
+                    results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+                continue
+        ...
+
+def _run_hook_callback_bounded(self, hook_name, cb, kwargs, timeout):
+    callback_key = (hook_name, id(cb))  # keyed on the CALLBACK, not the individual call
+    with self._hook_timeout_lock:
+        suppressed_until = self._hook_timeout_suppressed_until.get(callback_key)
+        running = callback_key in self._hook_running_callbacks
+        if (suppressed_until is not None and suppressed_until > time.monotonic()) or running:
+            return _HOOK_SKIPPED  # every later call for this SAME callback, any tool, is skipped
+        ...
+        self._hook_running_callbacks[callback_key] = token
+    ...
+    thread = threading.Thread(target=_runner, ...)  # daemon=True; never joined if it times out
+    thread.start()
+    if not done.wait(timeout=timeout):
+        self._hook_timeout_suppressed_until[callback_key] = time.monotonic() + self._hook_timeout_suppression_seconds
+        return _HOOK_SKIPPED
+    ...
+```
+
 `plugins.yaml` 的 hook 是 opt-in 白名单（`config.yaml` 的 `plugins.enabled`），未列入的插件即便被发现也不会加载
 ——这本身就是 Hermes 自带的"第三方能力需显式启用"闸门，跟 PRD N15 的精神一致。
 
-### demo：真实跑 hermes-agent 代码，阻塞 + 拒绝 + agent 收到拒绝结果
+### demo：真实跑 hermes-agent 代码——block 路径经真实 `invoke_tool()`；approve 路径经真实 `request_tool_approval()`
 
 `docs/spikes/hermes_hook_demo.py`（本仓库，可独立重跑，见文件头的复现步骤）驱动的是**真实的**
 `hermes_cli.plugins` 插件发现/加载/分发机制（真实 `plugin.yaml` + `__init__.py` 落盘、真实
-`PluginManager.discover_and_load()`），唯一被模拟的是"daemon 那一端"——`jones_demo` 插件里用一个
-后台线程 + `queue.Queue` 扮演"daemon 想了一会儿才给裁决"，真实系统里这段换成 worker 到 daemon 的
-ACP `session/request_permission` 往返，阻塞的*形状*完全一样。
+`PluginManager.discover_and_load()`），本轮重写后额外驱动真实的
+`agent.agent_runtime_helpers.invoke_tool()`、`tools.approval.request_tool_approval()`、
+`tools.terminal_tool.set_approval_callback()`/`_get_approval_callback()`、
+`tools.approval_context.set_hermes_interactive_context()`。唯一被模拟的是 ACP 传输本身——一个
+`fake_request_permission()` 函数站在 `acp_adapter/permissions.py::make_approval_callback()` 包起来的
+`conn.request_permission` 的位置上，真正起一个 ACP stdio 连接超出本 spike 范围（见"未做的事"）；它前后
+的一切（`terminal_tool` 的按线程回调槽、`request_tool_approval()` 的等待/拒绝/放行逻辑、`invoke_tool()`
+把拒绝理由包回工具结果）都是未改写的 hermes-agent 代码。
 
-运行输出（原文，2026-09-18，退出码 0）：
+运行输出（原文，2026-09-18，对 `ee4452991d`，退出码 0）：
 
 ```
 ======================================================================
@@ -148,28 +228,43 @@ has_hook('pre_tool_call'): True
 ======================================================================
 2. Read-only tool -> approved instantly, no daemon round trip
 ======================================================================
-block_message=None modified_args=None elapsed=0.002s
+block_message=None modified_args=None elapsed=0.005s
 
 ======================================================================
-3. Local rule-gate deny (write under /etc) -> blocked with ZERO daemon wait
+3. Local rule-gate deny (write under /etc) -> real invoke_tool(), agent gets the rejection
 ======================================================================
-block_message='JONES RULE GATE: writes under /etc/ are never allowed.' elapsed=0.000s
+elapsed=0.183s
+tool result the agent ACTUALLY received (from real invoke_tool(), not hand-built): {"error": "JONES RULE GATE: writes under /etc/ are never allowed."}
 
 ======================================================================
-4. Dangerous tool call, daemon ASKED and DENIES after a delay -> agent gets the rejection
+4. Plugin returns approve; Hermes's OWN request_tool_approval() waits, then DENIES
 ======================================================================
-block_message='JONES USER GATE: denied (user gate: operator clicked Deny); waited 1.28s for daemon.' elapsed=1.285s
-tool result the agent would receive: {"error": "JONES USER GATE: denied (user gate: operator clicked Deny); waited 1.28s for daemon."}
+hook_callback_timeout is 0.5 s; the simulated human below takes 3x that to answer.
+  [fake ACP session/request_permission] 'operator must confirm this'
+elapsed=1.652s
+tool result the agent ACTUALLY received: {"error": "BLOCKED: User denied this potentially dangerous action (matched 'operator must confirm this'). Do NOT retry — the user has explicitly rejected it."}
+PASS: a human wait (1.50s) longer than hook_callback_timeout (0.5s) completed anyway -- confirmed NOT counted against it, because the plugin returned `approve` instead of waiting in-callback.
 
 ======================================================================
-5. Same dangerous tool, daemon ASKED and APPROVES after a delay -> proceeds (None)
+5. Same shape, daemon APPROVES after a delay -> proceeds (block_message None)
 ======================================================================
-block_message=None elapsed=0.630s
+block_message=None elapsed=0.893s
 
 ======================================================================
-6. Timeout path: daemon never answers -> fail CLOSED, not open
+6. ANTI-PATTERN: blocking pre_tool_call itself (not returning approve) -> fails closed AT THE TIMEOUT, not at the full delay
 ======================================================================
-(see the plugin's `except queue.Empty` branch above: block, fail-closed by construction; not exercised here at full 10s to keep the demo fast)
+hangy_tool sleeps 2.00s INSIDE the callback; hook_callback_timeout is 0.5s.
+elapsed=0.644s tool result the agent received: {"error": "pre_tool_call plugin callback timed out or is still running"}
+PASS: the anti-pattern loses the tool call's own deliberation AND fails closed after only 0.5s, not the 2.00s the (simulated) daemon actually needed.
+
+======================================================================
+7. BLAST RADIUS: that ONE timeout now fails EVERY later pre_tool_call for this callback, including unrelated tools, until the suppression window elapses
+======================================================================
+(suppression window shrunk to 1.00s for this demo; production default is 60s)
+immediately-after safe_read_file result (should ALSO be blocked, even though it is harmless and has nothing to do with hangy_tool): {"error": "pre_tool_call plugin callback timed out or is still running"}
+waiting 1.56s for both the abandoned worker thread and the (shrunk) suppression window to clear...
+after the window elapses: block_message=None
+PASS: one timed-out tool call silently degraded EVERY later pre_tool_call for the same plugin callback for the whole suppression window -- not a single-call failure.
 
 ======================================================================
 ALL ASSERTIONS PASSED
@@ -179,18 +274,21 @@ RC=0
 
 （跑的时候 stderr 还会打几条 `Built-in observability hook failed / No module named
 'hermes_cli.observability'` —— 这是本 spike 为控制拉取范围，没有拉取 Hermes 内部一个无关的遥测 hook
-模块，Hermes 自己 `try/except` 吞掉了，不影响任何一条断言，不是本 spike 引入的问题。）
+模块，Hermes 自己 `try/except` 吞掉了，不影响任何一条断言，不是本 spike 引入的问题。用完整 checkout
+跑时改成一条不同的、同样无关的插件加载警告，见 demo 输出前的 stderr 行。）
 
-第 4 步是关键断言：`_dispatch_pre_tool_call_hooks()` 调用处，主线程实测被真实阻塞了 1.285 秒（对应
-demo 里模拟的 daemon 决策延迟 1.2s），证明这不是一个 fire-and-forget 通知，而是真同步等待；返回后
-`block_message` 非空，且 `json.dumps({"error": block_message})`——与 `invoke_tool()` 真实源码构造
-tool result 的方式完全一致——就是 agent 会看到的工具结果。第 5 步换成"daemon 批准"，同样真实阻塞
-0.63s 后放行（`block_message is None`），证明同一条路径两个分支都真实可达，不是只测了一边。
+第 3 步是"验收项 2"的直接证据：调的是**真实** `invoke_tool()`，不是手写一遍等价 JSON——返回值就是
+agent 会拿到的字面工具结果。第 4 步是本轮修复的核心：把 `hook_callback_timeout` 压到 0.5s、模拟人工
+审批耗时 1.5s（3 倍于超时），往返仍然完整跑完、真实阻塞了 1.652s，证明"approve 之后的人工等待不计入
+hook_callback_timeout"不是读代码猜的，是量出来的。第 6/7 步反向验证："自己在回调里等"这个反面写法
+会在超时点被切断（0.644s 而不是 2.00s），而且会把同一个回调注册对象在抑制窗口内的所有后续调用（含完全
+无关的 `safe_read_file`）一起拖下水，直到孤儿线程跑完 + 抑制窗口过期才恢复——这正是 PRD/foundation
+现在写进"关键坑"里的那句话的实测依据。
 
-### ACP 侧证据（`acp_adapter/`，未做端到端 stdio 往返 demo，源码读 + 关键片段核对）
+### ACP 侧证据（`acp_adapter/`，源码读 + 关键片段核对；`approve` 分支的接线链条本轮已用完整 checkout 逐跳核实）
 
-以下基于对 `acp_adapter/server.py`、`session.py`、`events.py`、`permissions.py`、`tools.py` 的源码核对
-（同一 commit），未跑端到端 ACP stdio 会话（见"未做的事"）：
+基于对 `acp_adapter/server.py`、`session.py`、`events.py`、`permissions.py`、`edit_approval.py`、
+`tools.py`、`tools/approval.py`、`tools/approval_context.py`、`tools/terminal_tool.py` 的源码核对：
 
 - **工具调用事件**：`acp_adapter/events.py::make_step_cb()` 在每个工具调用结束时发 `session/update`
   的 `ToolCallComplete`（`build_tool_complete`，携带工具名、参数、结果）；`tools.py::build_tool_start()`
@@ -199,50 +297,89 @@ tool result 的方式完全一致——就是 agent 会看到的工具结果。�
 - **流式文本**：`make_thinking_cb()` / `make_message_cb()` 包一层 `_make_text_cb()`，把 AIAgent 的
   `thinking_callback`/`stream_delta_callback` 转成 ACP 的 `update_agent_thought_text`/
   `update_agent_message_text` 增量通知，`None` 是"这条消息结束"的哨兵（下一条 delta 开新 messageId）。
-- **`session/request_permission`**：`acp_adapter/permissions.py::make_approval_callback()` 把 ACP 的
-  `request_permission` 协程包成 Hermes 的 `approval_callback(command, description, ...) -> str` 签名，
-  `server.py::_wire_turn_callbacks()` 里 `cbs.approval_cb = make_approval_callback(conn.request_permission, ...)`
-  接到 AIAgent 的危险命令检测上——**只接在这一处**，没有接到 `pre_tool_call` 的 `approve` 分支（那条分支走的是
-  `tools.approval.request_tool_approval`，同一份人工裁决核心逻辑，但触发来源不同）。这是"B 不能替代 A"这条
-  结论的直接依据。
+- **`session/request_permission` 接线到 `pre_tool_call` 的 `approve` 分支——上一版本这里的结论是反的，
+  本轮改正**：调用链是通的，逐跳如下——
+  1. `hermes_cli/plugins.py::_resolve_block_from_details()` 对 `approve` 调
+     `tools.approval.request_tool_approval(tool_name, message, rule_key=...)`，**不传**
+     `approval_callback`。
+  2. `tools/approval.py::request_tool_approval()` → `_run_approval_gate()` → `_presence(None)`。
+  3. `tools/approval.py::_presence()` → `tools/approval_context.py::_resolve_cli_approval_callback(None)`
+     → 兜底走 `tools.terminal_tool._get_approval_callback()`（一个按**线程**存放的槽，
+     `tools/terminal_tool.py::set_approval_callback`/`_get_approval_callback`）。
+  4. `acp_adapter/server.py::_run_agent_turn()`（第 746-747 行附近，注释原文点明"Approval routing is
+     thread-local, so it MUST be bound here"）在跑 turn 的那个线程上执行
+     `terminal_tool.set_approval_callback(approval_cb)`，并 `set_hermes_interactive_context(True)`
+     （否则 `_presence()` 判定为"无交互上下文"，直接 fail-closed，本轮实测踩过这个坑，见"修复记录"）。
+  5. `approval_cb` 就是 `server.py::_wire_turn_callbacks()` 里的
+     `make_approval_callback(conn.request_permission, loop, session_id)`（`acp_adapter/permissions.py`）。
+  6. 并发工具调用不破坏这条链：`agent/tool_executor.py` 用 `propagate_context_to_thread` 把 thread-local
+     的审批回调带进 8 线程池的 worker（docstring 明写）——**但这条"传进 worker 线程后槽会不会丢"的路径
+     本 spike 没有实测**，只核对了源码，见"风险"一节。
+  - 即：插件返回 `{"action":"approve", ...}` 时，只要 worker 是以 ACP agent 身份在跑，Hermes **已经**会把
+    这次人工裁决发成 ACP `session/request_permission`，Jones 的插件不需要自己再拿到一个 ACP 连接句柄。
+- **第二个 `request_permission` 接入点——编辑审批，上一版本完全没提到**：`acp_adapter/edit_approval.py`
+  的 `maybe_require_edit_approval()` / `make_acp_edit_approval_requester()`，由 `server.py`（约
+  863-866 行）绑定、`acp_adapter/events.py`（约 97/107 行）对 `write_file`/`patch`/`skill_manage`
+  触发，走的是**同一个** `conn.request_permission`，但策略独立（ask/workspace_session/session），
+  另有 `SENSITIVE_AUTO_APPROVE_NAMES`（`.env`、`.env.local`、`id_rsa`、`id_ed25519` 等）自动放行名单。
+  对 Jones 的影响：daemon 作为 ACP client 时，每次 `write_file`/`patch` 会**同时**撞上这一路和 Jones
+  自己 `pre_tool_call` 闸的 `write_file`/`patch` 拦截——要么用户被问两遍，要么两套审批策略打架。本 spike
+  不定案，留给 W3 权限闸 Issue（见"下一步"）。
 - **取消**：`HermesACPAgent.cancel(session_id)` 真的 `state.cancel_event.set()`，不是空实现。
 - **会话生命周期**：`new_session`/`load_session`/`resume_session`/`fork_session`/`list_sessions` 齐全，
   `fork_session` 直接对应 PRD 9.6 的子会话派生需求。
 
 ## 风险
 
-- **`hook_callback_timeout` 默认 30s，是 Hermes 自己的 config 项，不是 Jones 能绕开的硬编码**：
-  Jones 的 `pre_tool_call` 插件如果图省事把整段人工等待都塞进 hook 回调本身，一旦真人 30 秒内没点审批，
-  Hermes 侧会自动 fail-closed 拒绝——这个拒绝对用户不可见、不会显式提示"超时"，只会让 agent 收到一个
-  BLOCKED 的工具结果。必须用"决定阶段快速返回 + 人工等待走 ACP `request_permission`"的两段式，已写进
-  00-foundation.md §7；daemon 侧还应该把这个 30s 读出来做健康检查（值被人改小会静默削弱权限闸的可用性,
-  不是安全性——闸依然会拒，只是拒绝理由从"用户否决"变成"回调超时"，日志埋点要能区分这两种，否则误导用户
-  以为自己被拒绝了但其实是配置项出问题）。
-- **未验证并发工具调用下的隔离**：Hermes 支持并发工具调用（`_MAX_TOOL_WORKERS = 8`，见
-  `run_agent.py`），`pre_tool_call` 会在多个线程上同时触发；demo 里用 `tool_call_id` 分流决策队列，
-  真实插件要保证多路并发裁决不串号——设计上没问题（`tool_call_id` 是 Hermes 传入的），但没有并发场景的
-  实测，留给 daemon 骨架落地时的集成测试覆盖。
+- **`hook_callback_timeout` 默认 30s，超时的影响范围比"这一次调用被拒"大一个量级——本轮已实测，不再只是
+  读代码推断**：一旦 Jones 的插件在 `pre_tool_call` 回调里自己阻塞等待（而不是立即返回 `approve`），超时
+  后 `hermes_cli/plugins_dispatch.py::_run_hook_callback_bounded()` 会把 `(hook_name, id(cb))` 这个
+  **回调级**的 key 写进 `_hook_timeout_suppressed_until`，且被抛弃的 worker 线程在真正跑完之前，同一个
+  key 也留在 `_hook_running_callbacks` 里——两者任一条件成立，`invoke_hook()` 对该回调的**每一次**后续
+  `pre_tool_call`（不管是不是同一个工具、同一次调用）都直接返回 `_HOOK_SKIPPED`，对 fail-closed 的
+  `pre_tool_call` 即等价于 block。demo 第 6/7 节把 `hook_callback_timeout` 和抑制窗口都调小后实测到：
+  一次 `hangy_tool` 超时后，紧接着一次完全无关、原本会秒过的 `safe_read_file` 也被 block，直到（a）被
+  抛弃的 worker 线程自己跑完**和**（b）60s 抑制窗口都过期，才恢复正常。对 Jones 的含义：如果真人一次没在
+  30s 内点审批，且插件写成了"自己等"的错误形状，整个会话的所有工具调用会被连续拒绝到抑制窗口结束——这是
+  权限闸可用性的硬约束，必须写进 daemon 骨架/权限闸 Issue 的验收标准（"决定阶段快速返回"是正确性要求，
+  不是性能优化）。**照本文档"结论 3"的正确设计（插件只返回 `approve`）不会触发这条路径**，因为回调本身
+  几乎不占用 `hook_callback_timeout` 的窗口——但一旦任何插件代码路径里混进一次同步阻塞（哪怕是无意的，
+  比如一次同步网络调用），后果就是这里描述的连锁失效，值得在 daemon 骨架里加一层"pre_tool_call 回调必须
+  在 N ms 内返回"的自测（不是本 spike 的产出，留给后续 Issue）。
+- **未验证并发工具调用下的审批回调隔离**：Hermes 支持并发工具调用（`_MAX_TOOL_WORKERS = 8`，见
+  `run_agent.py`），`pre_tool_call` 会在多个线程上同时触发，`approve` 分支最终落到的
+  `terminal_tool` 按线程审批回调槽也要在并发下正确传播。`agent/tool_executor.py` 用
+  `propagate_context_to_thread` 把 thread-local 的审批回调带进 worker 线程，源码/docstring 看设计上
+  没问题，但**没有并发场景的实测**——这是本次评审明确点出的、本 spike 仍然没有覆盖的点，留给 daemon 骨架
+  落地时的集成测试覆盖（见"下一步"）。
 - **`pre_tool_call` 插件本身是单点**：如果 Jones 的插件抛异常，看 `_pre_tool_block_message()` 源码是
   `except Exception: return None, function_args`——**静默放行**，不是 fail-closed。这跟 DEV.md「诚实失败」
   原则冲突，也跟 PRD N09「错误被静默吞掉」是负面清单项直接冲突。**这是本 spike 发现的、需要 daemon 骨架
   实现时特别处理的点**：Jones 的插件代码本身要有自己的 try/except，把内部错误转成一次显式的
   `{"action":"block","message":"权限闸内部错误：<detail>"}`，绝不能让异常穿透到 Hermes 的兜底静默放行。
-  建议写进 daemon 骨架 Issue 的验收标准。
+  建议写进权限闸 Issue 的验收标准。
+- **第二个编辑审批闸未决**：见"ACP 侧证据"——`acp_adapter/edit_approval.py` 对 `write_file`/`patch` 有
+  独立于 `pre_tool_call` 的 ACP 审批闸，PRD 6.3 定稿前应说清楚这一处是关掉、复用、还是让 Jones 的闸接管，
+  否则要么用户被问两遍要么两套审批逻辑打架。
 - **`gateway/` 命名冲突**：Hermes 自己的 `gateway/` 是 IM 机器人网关（Telegram/Discord/Slack…），PRD
   6.1 里"Channel Gateway"说的是同一类东西但不是同一份代码；后续如果决定接 Hermes 的 IM 网关实现 FR21，
   文档/代码里要避免用同一个词指两个不同的东西。
-- **网络环境限制**：本次验证在带宽受限（~25 KB/s 对 github.com）的环境下完成，用了 treeless partial
-  clone + 按需拉取，只覆盖了回答问题所需的 ~90 个源文件，不是整仓库；`agent.agent_runtime_helpers`
-  完整 import（含 openai/anthropic SDK 等第三方依赖）未验证，`invoke_tool()` 里 `_pre_tool_block_message`
-  之后的路径（真实工具派发、并发执行）依赖源码阅读，不是本 spike 的实测范围。
+- **网络环境限制**：原始验证在带宽受限（~25 KB/s 对 github.com）的环境下完成，用了 treeless partial
+  clone + 按需拉取，只覆盖了回答问题所需的 ~90 个源文件，不是整仓库；本轮修复用本机已有的完整 checkout
+  复核了受评审影响的结论，但两次用的是不同 commit（见文首说明），不是同一次连续验证。
 
 ## 下一步
 
-1. daemon 骨架 Issue：worker 启动流程里加载 Jones 自研 `pre_tool_call` 插件（含上面"静默放行"风险的
-   fail-closed 包装），worker↔daemon 走 ACP stdio。
-2. 权限闸 Issue（W3，FR05）：实现两段式设计——规则闸本地同步、审查闸/用户闸走 ACP
-   `session/request_permission`；把 `permission_decisions` 表的写入点接到 `pre_tool_call` 回调里。
-3. 建议后续单独起一个小 spike（不阻塞 W1）验证 `hermes_state_*.py` 作为 worker 内会话存储、
+1. daemon 骨架 Issue：worker 启动流程里加载 Jones 自研 `pre_tool_call` 插件（含"静默放行"风险的
+   fail-closed 包装），worker↔daemon 走 ACP stdio；插件的 approve 分支只返回 `{"action":"approve",...}`，
+   不自己讲 ACP（本轮修复的核心结论）。
+2. 权限闸 Issue（W3，FR05）：实现两段式设计——规则闸本地同步、审查闸/用户闸返回 `approve` 交给 Hermes
+   走 ACP `session/request_permission`；把 `permission_decisions` 表的写入点接到 `pre_tool_call` 回调里；
+   **决定** `acp_adapter/edit_approval.py` 那条 `write_file`/`patch` 编辑审批闸是关掉、复用还是被 Jones
+   的闸接管（本 spike 未定案）。
+3. **并发场景集成测试**（本次评审明确要求，本 spike 未覆盖）：在 daemon 骨架落地、有真实 8 线程工具
+   worker 池时，验证 `terminal_tool` 的按线程审批回调槽在并发工具调用下不会跨线程串号或丢失。
+4. 建议后续单独起一个小 spike（不阻塞 W1）验证 `hermes_state_*.py` 作为 worker 内会话存储、
    `cron/` 复用到什么程度，`tui_gateway/`（Hermes 自带的 TUI/Desktop JSON-RPC 后端，本 spike 顺带
    发现的第三条候选协议，未评估）值不值得看一眼。
 
@@ -250,11 +387,57 @@ tool result 的方式完全一致——就是 agent 会看到的工具结果。�
 
 ```bash
 git clone --filter=blob:none --depth 1 https://github.com/NousResearch/hermes-agent
-cd hermes-agent && git checkout 0138269
+cd hermes-agent && git checkout 0138269   # 或任意较新的 main 提交，见文首"验证对象"说明
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python pyyaml   # 最小依赖；完整依赖见 pyproject.toml
 cd ..
 HERMES_HOME=$(mktemp -d) PYTHONPATH=hermes-agent hermes-agent/.venv/bin/python \
     docs/spikes/hermes_hook_demo.py
-# 期望：6 个 section 全部打印，退出码 0
+# 期望：7 个 section 全部打印，"ALL ASSERTIONS PASSED"，退出码 0，整个脚本几秒内跑完
+# （section 4/6/7 各带 1-2 秒的 sleep，用来真实测量超时/抑制窗口行为，不是卡住）
 ```
+
+## 修复记录（2026-09-18，评审后）
+
+逐条处理本轮代码评审的 9 条意见（见 PR/commit 消息里的评审原文），均确认成立，无不同意项：
+
+1. **[critical] PRD 6.3 自相矛盾且谎称"实测"** → 改写 PRD §6.3 对应段落（`docs/PRD.md`）：拆成规则闸/
+   审查闸/反例/待定四段，删掉"通过 worker 已经开着的 ACP 连接……发一次标准 session/request_permission"这个
+   由插件发起 ACP 往返的错误框架，改成"插件只返回 approve，Hermes 自己的 request_tool_approval 经既有的
+   terminal_tool 槽自动落到 ACP 上"；"实测见 spike #1" 改成了真实可复核的实测（demo 第 4 节，压缩
+   hook_callback_timeout 到 0.5s、人工等待 1.5s 仍完整跑完）。
+2. **[important] ACP request_permission 覆盖不到 approve 分支——与源码不符** → 本文件"结论 2"、
+   "ACP 侧证据"整段重写，补上完整调用链（`_resolve_block_from_details` → `request_tool_approval` →
+   `_presence` → `_resolve_cli_approval_callback` → `terminal_tool._get_approval_callback` →
+   `server.py::_run_agent_turn` 绑定 `make_approval_callback`），标注仍未实测的部分（8 线程池下的
+   thread-local 传播，见风险清单与"下一步"第 3 条）。
+3. **[important] 验收项 2 没有真实运行证据，"不可行"理由是错的** → 重写 `hermes_hook_demo.py`：block
+   路径全部改成驱动真实 `agent.agent_runtime_helpers.invoke_tool()`（~5 行 stub agent，无需 SDK），
+   demo 第 3 节现在打印的是 `invoke_tool()` 的真实返回值，不是手写 JSON。
+4. **[important] 漏掉编辑审批（write_file/patch）第二个 request_permission 接入点** → 加进"结论 2"、
+   "ACP 侧证据"、"风险"、PRD §6.3、00-foundation.md §7，标记为 W3 权限闸 Issue 定案前必须决定的开放
+   设计问题（关掉/复用/Jones 接管三选一），本 spike 不越权替后续 Issue 拍板。
+5. **[critical] 同意见 1**，一并处理。
+6. **[important] 同意见 2**，一并处理；另外确认了 `agent/tool_executor.py::propagate_context_to_thread`
+   在并发路径上的作用，写进"未验证"清单。
+7. **[important] 超时影响范围被低估——60s 抑制窗口是按回调而非按调用生效** → "风险"一节重写，用
+   demo 第 6/7 节的实测数据（压缩窗口后，一次超时确实拖累了后续完全无关的调用）取代此前"只影响这一次
+   调用"的错误描述；PRD/foundation 同步更新。
+8. **[important] demo 把反面写法标成"真实集成的形状"** → 重写 `hermes_hook_demo.py`：`_on_pre_tool_call`
+   现在对"需要人工"的场景返回 `approve`（正确形状），`hangy_tool` 单独作为一个明确标注"反面示例，仅用于
+   演示其失败模式"的分支保留，供第 6/7 节测失败模式用，不再是"真实集成应该长这样"的示例。
+9. **[important] "未改写"标注失实——docstring 被中文化、删了 `_thread_tool_whitelist` 分支、混入了一句
+   本文档自己的推论** → 本文件"关键源码"一节标题改为"含中文注解，非逐字"，恢复英文 docstring 原文、
+   补回 `_thread_tool_whitelist` 分支，把那句推论移出代码块、标注它的真实出处
+   （`plugins_dispatch.py::invoke_hook`/`_run_hook_callback_bounded`）并新增该文件的摘录。
+
+修复过程中一个意料之外的坑（记录以防后来者重复踩）：光调用
+`tools.terminal_tool.set_approval_callback()` 绑定审批回调不够，`tools/approval_context.py::_presence()`
+还要求 `_is_interactive_cli()` 为真，否则 `_run_approval_gate()` 直接 fail-closed（"no interactive
+user/gateway is present"）——`acp_adapter/server.py::_run_agent_turn()` 是连着
+`set_hermes_interactive_context(True)` 一起绑的，demo 第 4/5 节照抄了这一步才测通，这也印证了"结论 2"
+里"approve 分支要求 worker 确实是以 ACP agent 身份在跑"这个前提本身是真实存在的，不是可有可无的细节。
+
+测试结果：`docs/spikes/hermes_hook_demo.py` 在 `ee4452991d` 上重跑，7 个 section 全过，`ALL ASSERTIONS
+PASSED`，退出码 0（见上方"demo"一节的原文输出）。仓库没有其它自动化测试覆盖本 Issue 的范围（纯 spike，
+无代码接口变更），`make check` 在本分支没有可跑的目标（daemon/、apps/desktop/ 都还没有代码）。
