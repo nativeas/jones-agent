@@ -30,3 +30,12 @@ Thumbs.db
 .idea/
 .vscode/
 *.log
+
+# packaging spike (Issue #2)：下载/构建产物不入库
+packaging/standalone/pyroot/
+packaging/pyinstaller/.venv/
+packaging/pyinstaller/build/
+packaging/pyinstaller/dist/
+packaging/standalone/dist/
+packaging/electron-shell/dist/
+packaging/pyinstaller/*.spec

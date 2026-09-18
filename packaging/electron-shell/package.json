@@ -1,0 +1,15 @@
+{
+  "name": "jones-packaging-spike",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Electron + Python 守护进程打包 spike（不是真实 apps/desktop）",
+  "main": "main.js",
+  "scripts": {
+    "build:arm64": "electron-builder --mac dmg --arm64 --config electron-builder.yml",
+    "build:x64": "electron-builder --mac dmg --x64 --config electron-builder.yml"
+  },
+  "devDependencies": {
+    "electron": "43.4.0",
+    "electron-builder": "25.1.8"
+  }
+}

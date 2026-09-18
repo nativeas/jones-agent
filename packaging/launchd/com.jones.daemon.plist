@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  草案：Jones 守护进程的用户级 LaunchAgent。
+  安装位置：~/Library/LaunchAgents/com.jones.daemon.plist
+  安装方式：Electron 首次启动时写入该文件（用真实安装路径替换下面的占位符），
+  然后 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jones.daemon.plist`。
+  对应 PRD 11.3「守护进程注册为系统用户级服务，崩溃后由系统拉起」与 FR15。
+
+  占位符：
+    __DAEMON_EXECUTABLE__  -> <App>.app/Contents/Resources/daemon/jones-daemon（PyInstaller onedir 的可执行文件，
+                               或 python-build-standalone 方案的启动脚本）
+    __JONES_HOME__         -> 用户 $HOME/.jones（launchd 环境变量里没有 $HOME 展开，需要在写文件时替换成绝对路径）
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jones.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__DAEMON_EXECUTABLE__</string>
+    </array>
+
+    <!-- 崩溃后由 launchd 拉起；不监控文件系统变化，不是 watch 型，符合 daemon 空闲不轮询的原则。 -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- 用户登录即启动一次；G11 要求 Electron 未运行也常驻。 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- launchd 默认节流：连续崩溃时至少间隔 10s 再拉起，避免死循环耗电。 -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__JONES_HOME__/runtime/logs/daemon.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JONES_HOME__/runtime/logs/daemon.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>JONES_HOME</key>
+        <string>__JONES_HOME__</string>
+    </dict>
+
+    <!-- 不设 TCP，socket 路径由 daemon 自己在 JONES_HOME/runtime/daemon.sock 创建，不需要 Sockets 键。 -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- 不需要在前台保留；用户注销时随 session 退出。 -->
+    <key>ExitTimeOut</key>
+    <integer>5</integer>
+</dict>
+</plist>

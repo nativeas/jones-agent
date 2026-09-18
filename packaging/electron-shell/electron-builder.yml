@@ -1,0 +1,31 @@
+# electron-builder 配置 spike。真实 apps/desktop 会有自己的完整配置；这里只验证
+# extraResources 把 PyInstaller onedir 目录整体塞进 .app 且路径可被 main.js 找到。
+appId: dev.jones.packagingspike
+productName: JonesPackagingSpike
+directories:
+  output: dist
+files:
+  - main.js
+  - package.json
+extraResources:
+  # 用 python-build-standalone 方案的产物（见 packaging/standalone/build.sh），因为它能在
+  # Apple Silicon 主机上同时正确产出 arm64 与 x86_64 两份资源（PyInstaller 做不到，见 spike 报告）。
+  # ${arch} 是 electron-builder 内置宏，按当前 --arm64/--x64 构建目标展开成 arm64/x64。
+  - from: ../standalone/dist/${arch}
+    to: daemon
+mac:
+  category: public.app-category.developer-tools
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: entitlements.mac.plist
+  entitlementsInherit: entitlements.mac.plist
+  # 无开发者证书时留空，electron-builder 会退回 ad-hoc 签名（identity: null 显式声明）。
+  # 正式发布前替换为 "Developer ID Application: <公司名> (<TEAMID>)"
+  identity: null
+dmg:
+  sign: false
