@@ -137,4 +137,66 @@ JSON-RPC 标准码 + 应用码：`1001 not_found`、`1002 invalid_state`（如�
 ## 7. 待 spike 决定的开放点
 
 - **Hermes 接入形态**（spike #1）：A) 库形式 `from run_agent import AIAgent` + 工具调用前 hook；B) Hermes 自带 `acp_adapter`（Agent Client Protocol，stdio，内建 `session/request_permission`）作为 worker 协议。**倾向 B**——权限请求、流式事件、会话是 ACP 原生概念，与 PRD 的 stdio worker 决定完全吻合；若 B 可用，`workers/` 的 stdio 协议直接采用 ACP 而非自定义 JSON-RPC。
-- 向量库（spike #3）、浏览器登录态（spike #4）、打包（spike #2）。
+- 向量库（spike #3）、打包（spike #2）。
+- ~~浏览器登录态（spike #4）~~ 已决定，见第 8 节。
+
+## 8. FR09 浏览器能力：daemon 内部契约（spike #4 结论落地）
+
+评审要求（jones-agent#4 修复记录）：这份接口草案原来写在 `docs/spikes/04-browser-login-state.md`
+里——按第 1 节的目录所有权表，`docs/spikes/` 只承载「技术验证报告」，不是契约的家；
+现移到这里，spike 报告改为只引用本节。修 PR 见该 spike 报告末尾的「修复记录」。
+
+浏览器能力作为 worker 侧的一组工具（类比 FR07 文件五件套），不在第 4 节 RPC v0 的
+前端方法表里新增顶层方法，走既有的 `session.send` → Step 机制；这里定义的是
+daemon 内部 `kernel/` 与「浏览器子系统」之间的契约，供 daemon 骨架 Issue 与浏览器
+能力落地 Issue 实现时遵循：
+
+```
+BrowserSession（daemon 内部状态，非 SQLite 表，进程重启即丢——与 Step/Run 的持久化记录不冲突，
+                回放读的是 Step 里记录的动作参数/结果摘要，不依赖这个活对象）：
+  - profile_dir: <user_root()>/browser/profile   # Jones 专属，非用户 Default profile
+  - browser_path: 自动发现（macOS: /Applications/Google Chrome.app/... 或 Edge 对应路径）
+  - proc: 冷启动的 Chrome/Edge 子进程句柄，--remote-debugging-port=0（随机端口，
+    spike #4 实测过 port=0 + 轮询 <profile_dir>/DevToolsActivePort 这条路径，
+    不是只在文档里推荐、从没跑过的配置——见 daemon/spikes/browser_probe.py
+    的 _read_devtools_active_port）
+  - cdp_endpoint: 从 DevToolsActivePort 文件读到的实际 ws endpoint；attach 前
+    必须校验监听该端口的进程 pid 就是本进程拉起的那个（lsof 核对），不能假设
+    端口没被别的进程占用
+  - 首个 CDP 客户端连上一个全新 profile 时，若前台还残留浏览器自带的初始 tab
+    （例如 Edge 冷启动自带的 edge://sync-confirmation-dialog），应复用/接管
+    已有 tab 而不是开新 tab——spike #4 实测：新开的后台 tab 在这种情况下
+    会被节流，表单提交静默失效，复现 100%（daemon/spikes/browser_probe.py
+    step_cdp_attach 的注释）
+  - 生命周期：daemon 启动后懒加载（第一次浏览器工具调用才拉起）；daemon 退出/崩溃后此进程
+    独立存活或一并退出待定（倾向：daemon 退出时优雅关闭，避免孤儿进程——需要 daemon 骨架
+    Issue 里统一子进程收拢策略，此处只声明约束，不重复实现）
+
+工具（暴露给 kernel/worker，经权限闸）：
+  browser.navigate   {url}                          -> {title, url}
+  browser.read       {selector?}                    -> {text | html}       # 只读，规则闸可默认放行
+  browser.click       {selector}                     -> {ok}
+  browser.fill        {selector, value}               -> {ok}
+  browser.submit      {selector}                      -> {ok}               # 表单提交，必须过用户闸（PRD 12.3 FR09 口径）
+
+约束：
+  - navigate/read 为只读动作，可被规则闸放行；click/fill 视目标风险可能触发审查闸；
+    submit 一律用户闸（表单提交视为有副作用的外发动作，对齐 12.3 FR09「表单提交走用户闸」）。
+  - Step 记录 args_json 时对 fill 的 value 做脱敏（若字段名/上下文疑似密码则不落明文），
+    对齐 N02。
+  - 不做「自动发现并接管用户当前浏览器窗口」的路径（spike #4 实测：单实例锁会把
+    补开调试端口的第二次启动直接转发并秒退，flag 被忽略，100% 复现，不存在不重启
+    偷偷挂调试口这条路）；浏览器能力首次使用时，若 Jones 专属 profile 里未登录
+    目标网站，工具应返回明确错误/提示（而不是静默失败），提示用户到 Jones 浏览器
+    窗口里手动登录一次——对齐诚实失败原则。
+  - 为什么不直接接一个现成的浏览器 MCP Server 顶替这一整套自研工具（工程原则 1
+    「能复用就复用」）：调研过（见 spike 报告「c) 是否该用 MCP 顶替自研」一节），
+    结论是不成立——权限闸要求在 Step 落库、拦截点在「工具调用前」而不是「进程边界」，
+    经 stdio/HTTP 的 MCP Server 是黑盒子进程，闸没有一个天然的介入点能卡在它的
+    工具调用和真正执行之间（除非在 daemon 和 MCP Server 之间再插一层代理，那样
+    等于又实现了一遍这里的工具面，复用等于没复用）；且 CDP 进程生命周期
+    （随 daemon 懒加载、随 daemon 优雅关闭）需要跟 daemon 自己的子进程收拢
+    机制统一管理，交给外部 MCP Server 进程管理会分裂成两套生命周期。这不代表
+    以后不能把 `browser.*` 这五个工具本身包成一个 Jones 自带的 MCP Server（对
+    FR13 MCP 接入是同一形态），只是「谁持有 CDP 进程、闸在哪里介入」这两点决定了
+    它不能是一个外部现成的、不受 daemon 控制的 MCP Server。

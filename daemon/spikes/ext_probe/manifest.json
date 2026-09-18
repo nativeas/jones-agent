@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "Jones Spike4 Debugger Probe",
+  "version": "0.0.1",
+  "description": "Spike-only: tests whether chrome.debugger can read an authenticated tab without a CDP debug port.",
+  "permissions": ["debugger", "tabs", "scripting"],
+  "host_permissions": ["https://the-internet.herokuapp.com/*", "http://127.0.0.1/*"],
+  "background": { "service_worker": "background.js" }
+}
