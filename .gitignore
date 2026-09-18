@@ -1,0 +1,32 @@
+# Jones 项目级运行数据（见 PRD 10.2）：记忆与运行态不提交，配置类可提交
+.jones/memory/
+.jones/runtime/
+.jones/cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Node / Electron
+node_modules/
+out/
+release/
+.vite/
+
+# 环境与凭据
+.env
+.env.*
+*.pem
+*.key
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
