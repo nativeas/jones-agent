@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import type { RpcTransport } from '../rpc/transport'
-import type { Message, PermissionRequest, QueueItem, Step, TerminationCard } from '../domain/types'
+import type { Message, PermissionRequest, QueueItem, Session, Step, TerminationCard } from '../domain/types'
 import { createDeltaBatcher, type DeltaBatcher } from './deltaBatcher'
 
 export type TimelineEntry =
@@ -29,10 +29,19 @@ interface ChatState {
   runToSession: Map<string, string>
   batcher: DeltaBatcher
   unsubscribers: Array<() => void>
+  /** Bumped on every bindSession() call and captured locally by that call —
+   * lets a bind that's superseded (user switched sessions again before the
+   * first `session.subscribe` round-trip returned) detect it's stale and
+   * back out instead of overwriting a newer bind's state/listeners. */
+  bindGeneration: number
 
   bindSession(transport: RpcTransport, sessionId: string): Promise<void>
   unbindSession(): void
   send(text: string): Promise<{ queued: boolean } | null>
+  /** PRD 9.3 错误终止卡片的"重试"：重发最近一条用户消息。 */
+  retryLastMessage(): Promise<{ queued: boolean } | null>
+  /** PRD 9.3 错误终止卡片的"放弃"：只是关闭这张卡片，run 早已终止，没有服务端动作可做。 */
+  dismissTermination(runId: string): void
   stop(): Promise<void>
   removeQueueItem(itemId: string): Promise<void>
   reorderQueue(orderedIds: string[]): Promise<void>
@@ -62,6 +71,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
   error: null,
   runToSession: new Map(),
   unsubscribers: [],
+  bindGeneration: 0,
   batcher: createDeltaBatcher((updates) => {
     set((state) => {
       let timeline = state.timeline
@@ -91,6 +101,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
 
   async bindSession(transport, sessionId) {
     get().unbindSession()
+    const generation = get().bindGeneration + 1
     set({
       transport,
       activeSessionId: sessionId,
@@ -99,12 +110,31 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       pendingPermissions: [],
       running: false,
       error: null,
-      runToSession: new Map()
+      runToSession: new Map(),
+      bindGeneration: generation
     })
 
-    await transport.call('session.subscribe', { id: sessionId })
+    const isActive = (): boolean => get().activeSessionId === sessionId && get().bindGeneration === generation
 
-    const isActive = (): boolean => get().activeSessionId === sessionId
+    const subscribeRes = await transport.call('session.subscribe', { id: sessionId })
+    if (get().bindGeneration !== generation) {
+      // A newer bindSession() call already started while this subscribe was
+      // in flight (e.g. two quick clicks in the left pane) — back out rather
+      // than register listeners or write state that belongs to that newer
+      // call now; otherwise every superseded call here leaks a full set of
+      // notification subscriptions forever (01-w2-interfaces.md §5 review).
+      transport.call('session.unsubscribe', { id: sessionId }).catch((err) => {
+        console.warn('session.unsubscribe (stale bind) failed', err)
+      })
+      return
+    }
+    if (!subscribeRes.ok) {
+      // §5 review: a failed subscribe must not leave the pane looking bound
+      // — no delta/step/termination notification will ever arrive for it.
+      set({ error: subscribeRes.message ?? '订阅会话通知失败' })
+      return
+    }
+
     const sessionOf = (runId: string): string | undefined => get().runToSession.get(runId)
 
     const unsubscribers = [
@@ -176,6 +206,34 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     ]
     set({ unsubscribers })
 
+    // Restore in-flight run state. 00-foundation.md §4.1 has `session.get`
+    // return the Session + its most recent Turn (which carries run_id), and
+    // `run.get`/`run.steps` are explicitly the replay data source — this is
+    // what lets rebinding a session whose run kept going while this pane was
+    // pointed elsewhere come back looking "running" instead of idle, and lets
+    // the run's remaining step/termination notifications (which do arrive —
+    // we just resubscribed above) resolve via runToSession instead of being
+    // silently dropped as belonging to no known session.
+    const sessionRes = await transport.call<Session & { turn?: { run_id: string | null } | null }>('session.get', {
+      id: sessionId
+    })
+    if (isActive() && sessionRes.ok && sessionRes.result) {
+      const runId = sessionRes.result.turn?.run_id ?? null
+      if (runId) {
+        const running = sessionRes.result.status === 'running'
+        set((state) => ({ running, runToSession: new Map(state.runToSession).set(runId, sessionId) }))
+        const stepsRes = await transport.call<Step[]>('run.steps', { run_id: runId })
+        if (isActive() && stepsRes.ok) {
+          set((state) => ({
+            timeline: (stepsRes.result ?? []).reduce<TimelineEntry[]>(
+              (acc, step) => upsertTimeline(acc, { kind: 'step', step }),
+              state.timeline
+            )
+          }))
+        }
+      }
+    }
+
     const [messagesRes, queueRes, pendingRes] = await Promise.all([
       transport.call<Message[]>('turn.messages', { session_id: sessionId, limit: 200 }),
       transport.call<QueueItem[]>('session.queue', { id: sessionId }),
@@ -201,7 +259,13 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     unsubscribers.forEach((fn) => fn())
     batcher.cancel()
     if (transport && activeSessionId) {
-      void transport.call('session.unsubscribe', { id: activeSessionId })
+      // Fire-and-forget cleanup — the pane is already torn down, so there's
+      // no state left to render an error into — but a rejected call (real
+      // windowTransport on a dead/reject-ing IPC round-trip) must still be
+      // caught or it becomes an unhandled promise rejection (§7 review).
+      transport.call('session.unsubscribe', { id: activeSessionId }).catch((err) => {
+        console.warn('session.unsubscribe failed', err)
+      })
     }
     set({ unsubscribers: [] })
   },
@@ -235,6 +299,23 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       set((state) => ({ timeline: upsertTimeline(state.timeline, { kind: 'message', message }) }))
     }
     return res.result
+  },
+
+  async retryLastMessage() {
+    const { timeline } = get()
+    for (let i = timeline.length - 1; i >= 0; i -= 1) {
+      const entry = timeline[i]
+      if (entry?.kind === 'message' && entry.message.role === 'user') {
+        return get().send(entry.message.content)
+      }
+    }
+    return null
+  },
+
+  dismissTermination(runId) {
+    set((state) => ({
+      timeline: state.timeline.filter((e) => !(e.kind === 'termination' && e.card.run_id === runId))
+    }))
   },
 
   async stop() {

@@ -198,8 +198,13 @@ export class MockTransport implements RpcTransport {
         return session
       }
       case 'session.get': {
+        // 00-foundation.md §4.1: `session.get` returns Session + 最近 Turn —
+        // the "turn" here is trimmed to the one field chatStore's replay-on-
+        // rebind path needs (run_id), since this mock has no separate turns
+        // table to model the rest of it.
         const session = this.requireSession(params.id)
-        return { ...session, messages: this.messages.get(session.id) ?? [] }
+        const runId = this.activeRuns.get(session.id) ?? null
+        return { ...session, messages: this.messages.get(session.id) ?? [], turn: runId ? { run_id: runId } : null }
       }
       case 'session.set_mode': {
         const session = this.requireSession(params.id)

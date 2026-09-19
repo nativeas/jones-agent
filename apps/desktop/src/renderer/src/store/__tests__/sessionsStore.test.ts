@@ -63,6 +63,23 @@ describe('sessionsStore', () => {
     await useSessionsStore.getState().init(failing)
     expect(useSessionsStore.getState().error).toBe('boom')
   })
+
+  it('surfaces a rejected transport.call (not just ok:false) as an explicit error, and clears `loading`', async () => {
+    // windowTransport's real IPC round-trip rejects rather than resolving
+    // ok:false when the call itself fails (handler unregistered, main
+    // restarted mid-call) — refresh() must not leave `loading` stuck true
+    // with an unhandled rejection as the only signal (§7 review).
+    const rejecting = {
+      call: async () => {
+        throw new Error('ipc channel closed')
+      },
+      on: () => () => {}
+    }
+    await useSessionsStore.getState().init(rejecting)
+    const state = useSessionsStore.getState()
+    expect(state.loading).toBe(false)
+    expect(state.error).toBe('ipc channel closed')
+  })
 })
 
 describe('buildProjectGroups (pure tree building)', () => {

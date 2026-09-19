@@ -35,24 +35,31 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
     const { transport } = get()
     if (!transport) return
     set({ loading: true, error: null })
-    const [providersRes, modelsRes, agentsRes] = await Promise.all([
-      transport.call<Provider[]>('provider.list'),
-      transport.call<Model[]>('model.list'),
-      transport.call<Agent[]>('agent.list')
-    ])
-    if (!providersRes.ok || !modelsRes.ok || !agentsRes.ok) {
+    try {
+      const [providersRes, modelsRes, agentsRes] = await Promise.all([
+        transport.call<Provider[]>('provider.list'),
+        transport.call<Model[]>('model.list'),
+        transport.call<Agent[]>('agent.list')
+      ])
+      if (!providersRes.ok || !modelsRes.ok || !agentsRes.ok) {
+        set({
+          loading: false,
+          error: providersRes.message ?? modelsRes.message ?? agentsRes.message ?? '加载设置失败'
+        })
+        return
+      }
       set({
-        loading: false,
-        error: providersRes.message ?? modelsRes.message ?? agentsRes.message ?? '加载设置失败'
+        providers: providersRes.result ?? [],
+        models: modelsRes.result ?? [],
+        agents: agentsRes.result ?? [],
+        loading: false
       })
-      return
+    } catch (err) {
+      // Same rejection-vs-ok:false gap as sessionsStore.refresh (§7 review):
+      // a rejected transport.call must not leave `loading` stuck true with no
+      // visible error.
+      set({ loading: false, error: err instanceof Error ? err.message : String(err) })
     }
-    set({
-      providers: providersRes.result ?? [],
-      models: modelsRes.result ?? [],
-      agents: agentsRes.result ?? [],
-      loading: false
-    })
   },
 
   async setProviderKey(provider, key) {

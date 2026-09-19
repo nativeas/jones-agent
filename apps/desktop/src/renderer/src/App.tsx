@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import { getTransport } from './rpc'
 import { useLayoutStore } from './store/layoutStore'
 import { useSessionsStore } from './store/sessionsStore'
+import { useNavigationStore } from './store/navigationStore'
 import { DaemonStatusCard } from './components/DaemonStatusCard'
 import { LeftPane } from './components/left/LeftPane'
 import { CenterPane } from './components/CenterPane'
@@ -12,8 +13,6 @@ import { SettingsPage } from './components/settings/SettingsPage'
 // scope (not per-render) since it owns notification subscriptions.
 const transport = getTransport()
 
-type View = 'sessions' | 'settings'
-
 export function App(): JSX.Element {
   const leftPaneOpen = useLayoutStore((s) => s.leftPaneOpen)
   const rightPaneOpen = useLayoutStore((s) => s.rightPaneOpen)
@@ -21,7 +20,8 @@ export function App(): JSX.Element {
   const toggleRightPane = useLayoutStore((s) => s.toggleRightPane)
 
   const initSessions = useSessionsStore((s) => s.init)
-  const [view, setView] = useState<View>('sessions')
+  const view = useNavigationStore((s) => s.view)
+  const setView = useNavigationStore((s) => s.setView)
 
   useEffect(() => {
     void initSessions(transport)

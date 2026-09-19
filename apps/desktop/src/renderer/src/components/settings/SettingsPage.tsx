@@ -1,20 +1,23 @@
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import type { RpcTransport } from '../../rpc/transport'
 import { useSettingsStore } from '../../store/settingsStore'
+import { useNavigationStore, type SettingsTab } from '../../store/navigationStore'
 import { ProviderSettings } from './ProviderSettings'
 import { AgentSettings } from './AgentSettings'
 import { ProjectSettings } from './ProjectSettings'
 
-type Tab = 'provider' | 'agent' | 'project'
-const TABS: Array<{ id: Tab; label: string }> = [
+const TABS: Array<{ id: SettingsTab; label: string }> = [
   { id: 'provider', label: 'Provider' },
   { id: 'agent', label: 'Agent' },
   { id: 'project', label: 'Project' }
 ]
 
-/** 设置页：Provider / Agent / Project 三个子页（01-w2-interfaces.md §5）。 */
+/** 设置页：Provider / Agent / Project 三个子页（01-w2-interfaces.md §5）。
+ * 当前 tab 存在 navigationStore 里（而不是本地 state），这样错误终止卡片的
+ * "换模型" 按钮才能从中栏直接跳到 Agent 子页（见 CenterPane / TerminationCard）。 */
 export function SettingsPage({ transport }: { transport: RpcTransport }): JSX.Element {
-  const [tab, setTab] = useState<Tab>('provider')
+  const tab = useNavigationStore((s) => s.settingsTab)
+  const setTab = useNavigationStore((s) => s.setSettingsTab)
   const init = useSettingsStore((s) => s.init)
   const error = useSettingsStore((s) => s.error)
 

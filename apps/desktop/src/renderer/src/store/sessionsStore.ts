@@ -51,18 +51,26 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
     const { transport } = get()
     if (!transport) return
     set({ loading: true, error: null })
-    const [projectsRes, sessionsRes] = await Promise.all([
-      transport.call<Project[]>('project.list'),
-      transport.call<Session[]>('session.list')
-    ])
-    if (!projectsRes.ok || !sessionsRes.ok) {
-      set({
-        loading: false,
-        error: projectsRes.message ?? sessionsRes.message ?? '加载会话列表失败'
-      })
-      return
+    try {
+      const [projectsRes, sessionsRes] = await Promise.all([
+        transport.call<Project[]>('project.list'),
+        transport.call<Session[]>('session.list')
+      ])
+      if (!projectsRes.ok || !sessionsRes.ok) {
+        set({
+          loading: false,
+          error: projectsRes.message ?? sessionsRes.message ?? '加载会话列表失败'
+        })
+        return
+      }
+      set({ projects: projectsRes.result ?? [], sessions: sessionsRes.result ?? [], loading: false })
+    } catch (err) {
+      // A real windowTransport call rejects (rather than resolving ok:false)
+      // when the IPC round-trip itself fails — e.g. main hasn't registered
+      // its handler yet, or restarted mid-call. Without this the promise
+      // rejection went unhandled and `loading` stayed true forever (§7 review).
+      set({ loading: false, error: err instanceof Error ? err.message : String(err) })
     }
-    set({ projects: projectsRes.result ?? [], sessions: sessionsRes.result ?? [], loading: false })
   },
 
   selectSession(id) {

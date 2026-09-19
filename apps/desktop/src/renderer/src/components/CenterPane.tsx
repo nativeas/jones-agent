@@ -3,6 +3,7 @@ import type { RpcTransport } from '../rpc/transport'
 import type { SessionMode } from '../domain/types'
 import { useChatStore } from '../store/chatStore'
 import { useSessionsStore } from '../store/sessionsStore'
+import { useNavigationStore } from '../store/navigationStore'
 import { MessageList } from './chat/MessageList'
 import { InputBar } from './chat/InputBar'
 import { QueuePanel } from './chat/QueuePanel'
@@ -28,9 +29,12 @@ export function CenterPane({ transport }: CenterPaneProps): JSX.Element {
   const queue = useChatStore((s) => s.queue)
   const send = useChatStore((s) => s.send)
   const stop = useChatStore((s) => s.stop)
+  const retryLastMessage = useChatStore((s) => s.retryLastMessage)
+  const dismissTermination = useChatStore((s) => s.dismissTermination)
   const removeQueueItem = useChatStore((s) => s.removeQueueItem)
   const reorderQueue = useChatStore((s) => s.reorderQueue)
   const error = useChatStore((s) => s.error)
+  const goToAgentModelSettings = useNavigationStore((s) => s.goToAgentModelSettings)
 
   useEffect(() => {
     if (!selectedSessionId) return
@@ -65,7 +69,12 @@ export function CenterPane({ transport }: CenterPaneProps): JSX.Element {
       </div>
       {error && <div className="center-pane__error">{error}</div>}
       <div className="center-pane__body">
-        <MessageList timeline={timeline} />
+        <MessageList
+          timeline={timeline}
+          onRetry={() => void retryLastMessage()}
+          onSwitchModel={goToAgentModelSettings}
+          onAbandon={dismissTermination}
+        />
       </div>
       <QueuePanel items={queue} onRemove={removeQueueItem} onReorder={reorderQueue} />
       <InputBar running={running} onSend={send} onStop={stop} />

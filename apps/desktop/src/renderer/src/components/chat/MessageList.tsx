@@ -14,7 +14,9 @@ interface MessageListProps {
   timeline: TimelineEntry[]
   onRetry?: () => void
   onSwitchModel?: () => void
-  onAbandon?: () => void
+  /** Dismiss one termination card — takes the card's run_id since the
+   * timeline can hold more than one past termination. */
+  onAbandon?: (runId: string) => void
 }
 
 function renderEntry(entry: TimelineEntry, props: MessageListProps): JSX.Element {
@@ -33,12 +35,13 @@ function renderEntry(entry: TimelineEntry, props: MessageListProps): JSX.Element
   if (entry.kind === 'step') {
     return <StepCard step={entry.step} />
   }
+  const runId = entry.card.run_id
   return (
     <TerminationCard
       card={entry.card}
       onRetry={props.onRetry}
       onSwitchModel={props.onSwitchModel}
-      onAbandon={props.onAbandon}
+      onAbandon={props.onAbandon ? () => props.onAbandon!(runId) : undefined}
     />
   )
 }

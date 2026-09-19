@@ -42,6 +42,17 @@ export function DaemonStatusCard({ transport }: { transport: RpcTransport }): JS
     runPing()
   }, [runPing])
 
+  // main pushes `daemon.error` after it gives up retrying (00-foundation.md
+  // §4.2, PRD 11.3: "永不静默") — this card only otherwise pings on mount/
+  // refresh, so without this subscription that push has no listener and the
+  // card can sit on a stale "ok" or mid-retry state forever (§8 review).
+  useEffect(() => {
+    return transport.on('daemon.error', (raw) => {
+      const payload = raw as { code?: string; message?: string }
+      setStatus({ kind: 'error', message: payload.message ?? payload.code ?? 'daemon 报告了一个错误' })
+    })
+  }, [transport])
+
   return (
     <div className="daemon-status-card">
       <div className="daemon-status-card__header">

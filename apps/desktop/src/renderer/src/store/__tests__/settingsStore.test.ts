@@ -97,4 +97,17 @@ describe('settingsStore', () => {
     await useSettingsStore.getState().init(failing)
     expect(useSettingsStore.getState().error).toBe('boom')
   })
+
+  it('surfaces a rejected transport.call (not just ok:false) as an explicit error, and clears `loading`', async () => {
+    const rejecting = {
+      call: async () => {
+        throw new Error('ipc channel closed')
+      },
+      on: () => () => {}
+    }
+    await useSettingsStore.getState().init(rejecting)
+    const state = useSettingsStore.getState()
+    expect(state.loading).toBe(false)
+    expect(state.error).toBe('ipc channel closed')
+  })
 })
