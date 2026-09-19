@@ -1101,7 +1101,14 @@ async def test_daemon_status_reports_real_active_sessions_and_worker_counts(tmp_
 
         session_id = await _new_session(service, title="status")
         await service.send(session_id, "SLEEP_MS:300 hello there")
-        await _wait_until(lambda: service.active_turn_session_ids() != [])
+        # A Session is "active" from the moment its Turn starts, but its worker
+        # process is spawned *inside* that Turn (`_run_turn` → `ensure_started`)
+        # — so "active session, zero workers" is a real transient state, not a
+        # bug. Wait for both before asserting the busy snapshot.
+        await _wait_until(
+            lambda: service.active_turn_session_ids() != []
+            and service.worker_manager.worker_count() >= 1
+        )
 
         busy = await handler({}, None)
         assert busy["sessions_active"] == 1
