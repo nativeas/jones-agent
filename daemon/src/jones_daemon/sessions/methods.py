@@ -97,11 +97,39 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
             limit=params.get("limit", 50),
         )
 
+    async def run_list(params: dict[str, Any], conn: Connection) -> Any:
+        return await service.run_list(
+            _require_str(params, "session_id"), limit=params.get("limit", 50)
+        )
+
     async def run_get(params: dict[str, Any], conn: Connection) -> Any:
         return await service.run_get(_require_str(params, "run_id"))
 
     async def run_steps(params: dict[str, Any], conn: Connection) -> Any:
-        return await service.run_steps(_require_str(params, "run_id"))
+        # FR06 回放分页 (02-w3-interfaces.md §2) — both optional, `run.steps` with
+        # neither behaves exactly as before this issue (every Step, in order).
+        after_seq = params.get("after_seq")
+        limit = params.get("limit")
+        if after_seq is not None and not isinstance(after_seq, int):
+            raise RpcError(INVALID_PARAMS, "'after_seq' must be an integer", {"params": params})
+        if limit is not None and not isinstance(limit, int):
+            raise RpcError(INVALID_PARAMS, "'limit' must be an integer", {"params": params})
+        return await service.run_steps(
+            _require_str(params, "run_id"), after_seq=after_seq, limit=limit
+        )
+
+    async def run_payload(params: dict[str, Any], conn: Connection) -> Any:
+        offset = params.get("offset", 0)
+        limit = params.get("limit")
+        if not isinstance(offset, int) or offset < 0:
+            raise RpcError(
+                INVALID_PARAMS, "'offset' must be a non-negative integer", {"params": params}
+            )
+        if limit is not None and (not isinstance(limit, int) or limit <= 0):
+            raise RpcError(
+                INVALID_PARAMS, "'limit' must be a positive integer", {"params": params}
+            )
+        return await service.run_payload(_require_str(params, "ref"), offset=offset, limit=limit)
 
     async def permission_pending(params: dict[str, Any], conn: Connection) -> Any:
         return await service.permission_pending(params.get("session_id"))
@@ -126,8 +154,10 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
     server.register("session.subscribe", session_subscribe)
     server.register("session.unsubscribe", session_unsubscribe)
     server.register("turn.messages", turn_messages)
+    server.register("run.list", run_list)
     server.register("run.get", run_get)
     server.register("run.steps", run_steps)
+    server.register("run.payload", run_payload)
     server.register("permission.pending", permission_pending)
     server.register("permission.decide", permission_decide)
     return service

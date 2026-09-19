@@ -15,7 +15,7 @@ describe('createWindowTransport', () => {
 
   it('forwards call() to window.jones.rpc.call with the same method/params', async () => {
     const call = vi.fn().mockResolvedValue({ ok: true, result: { pid: 1 } })
-    win.jones = { rpc: { call, on: vi.fn() } }
+    win.jones = { rpc: { call, on: vi.fn() }, dialog: { pickDirectory: vi.fn() } }
 
     const transport = createWindowTransport()
     const result = await transport.call('daemon.ping', { a: 1 })
@@ -27,7 +27,7 @@ describe('createWindowTransport', () => {
   it('forwards on() subscriptions and their unsubscribe function', () => {
     const unsubscribe = vi.fn()
     const on = vi.fn().mockReturnValue(unsubscribe)
-    win.jones = { rpc: { call: vi.fn(), on } }
+    win.jones = { rpc: { call: vi.fn(), on }, dialog: { pickDirectory: vi.fn() } }
 
     const transport = createWindowTransport()
     const cb = vi.fn()

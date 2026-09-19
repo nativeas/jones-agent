@@ -27,7 +27,7 @@ from jones_daemon.projects.bootstrap import bootstrap_projects_and_agents
 from jones_daemon.projects.methods import register as register_projects
 from jones_daemon.providers import methods as providers_methods
 from jones_daemon.providers.resolver import DaemonProviderResolver
-from jones_daemon.rpc.methods import register_builtin_methods
+from jones_daemon.rpc.methods import register_builtin_methods, register_daemon_status
 from jones_daemon.rpc.server import RpcServer
 from jones_daemon.secrets.vault import build_default_vault
 from jones_daemon.service import maybe_handle_cli
@@ -127,6 +127,7 @@ async def _run() -> None:
         register_projects(server, ctx)
         register_agents(server, ctx)
         session_service = sessions_methods.register(server, ctx)
+        register_daemon_status(server, session_service)  # 02-w3-interfaces.md §2 集成收口 #2
         await session_service.startup()
         await server.start()
         logger.info(

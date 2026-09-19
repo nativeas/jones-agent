@@ -62,7 +62,7 @@ export function App(): JSX.Element {
           <CenterPane transport={transport} />
           {rightPaneOpen && (
             <aside className="shell__pane shell__pane--right">
-              <RightPane />
+              <RightPane transport={transport} />
             </aside>
           )}
         </div>

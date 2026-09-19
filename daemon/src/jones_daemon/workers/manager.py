@@ -219,6 +219,15 @@ class WorkerManager:
     def get(self, session_id: str) -> Worker | None:
         return self._workers.get(session_id)
 
+    def worker_count(self) -> int:
+        """`daemon.status`'s `workers` count (02-w3-interfaces.md §2 集成收口 #2,
+        `rpc/methods.py::register_daemon_status`) — a plain read-only accessor,
+        added by G/#12 (this file's `_worker_env`/`_prepare_hermes_home` remain
+        F/#11's exclusive touch points per 02-w3-interfaces.md §0; see the PR
+        report's "契约变更" section for why this one extra accessor was necessary
+        despite that)."""
+        return len(self._workers)
+
     def mark_busy(self, session_id: str, busy: bool) -> None:
         worker = self._workers.get(session_id)
         if worker is not None:

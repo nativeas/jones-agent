@@ -10,6 +10,11 @@ export interface RpcCallResult {
   message?: string
 }
 
+export interface PickDirectoryResult {
+  canceled: boolean
+  path?: string
+}
+
 const jonesApi = {
   rpc: {
     call: (method: string, params?: Record<string, unknown>): Promise<RpcCallResult> =>
@@ -21,6 +26,13 @@ const jonesApi = {
       ipcRenderer.on('rpc:notify', listener)
       return () => ipcRenderer.removeListener('rpc:notify', listener)
     }
+  },
+  // 02-w3-interfaces.md §2 集成收口 #5: a native folder picker for the Project
+  // 设置页 (FR02) — its own narrow channel, not routed through `rpc.call`
+  // (that bridge is specifically the daemon RPC transport; this is a Node/
+  // Electron-only capability the daemon has no part in).
+  dialog: {
+    pickDirectory: (): Promise<PickDirectoryResult> => ipcRenderer.invoke('dialog:pickDirectory')
   }
 }
 

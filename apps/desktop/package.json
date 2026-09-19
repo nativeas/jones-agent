@@ -13,7 +13,8 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "test": "vitest run",
-    "smoke": "electron-vite build && electron scripts/smoke.mjs"
+    "smoke": "electron-vite build && electron scripts/smoke.mjs",
+    "e2e": "electron-vite build && electron scripts/e2e.mjs"
   },
   "dependencies": {
     "zustand": "^5.0.15"

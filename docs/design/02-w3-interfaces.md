@@ -52,6 +52,17 @@ daemon ── _on_request_permission ──┐
   4. `pnpm e2e`：真实起 daemon（`JONES_HOME` 临时目录）+ 真实 Electron，走 `project.list → session.create → session.send`，没有模型 Key 时断言 UI 出现 provider_error 错误卡片而非白屏（G08 的一条）。CI 里跑（macos runner）。
   5. 目录选择对话框：main 加 `dialog:pickDirectory` IPC（白名单），renderer 的 Project 设置页接上。
 
+### 2.1 落地时的契约变更（2026-09-19，实现阶段发现，非设计推测）
+
+- **新增 `run.list {session_id, limit?} -> Run[]`**：00-foundation.md §4.1 的原表从未给出"如何发现一个历史 Run 的 id"——`run.get`/`run.steps` 都要求调用方已经有 `run_id`，唯一的发现渠道是活会话期间收到的 `turn.started` 通知（转瞬即逝，不适合"选一个 Run 回放"这种事后场景）。回放视图的"选一个 Run"下拉框需要这个方法；`sessions/queries.py::list_runs_for_session`（按 `created_at DESC` 排序）+ `SessionService.run_list` + `sessions/methods.py` 注册，纯新增，不改 `run.get`/`run.steps` 既有行为。
+- **`run.payload` 的响应形状**：`{ref, offset, size, data_base64, eof}`——payload 可能是二进制（截图），NDJSON 传输要求文本安全，故 base64；`size` 是文件总大小（不是本次返回的字节数），`eof` 让调用方知道要不要继续用 `offset` 翻页，不用自己拿 `size - offset - len(data)` 算。
+- **`runs` 表新增列 `terminated_step_seq INTEGER`**（迁移 `005_replay_terminated_step.sql`）：00-foundation.md §5 原 schema 没有承载"终止时正在跑第几个 Step"的列；`terminated_kind`/`terminated_reason` 只说明"为什么"，不说明"在哪"。可空——迁移前终止的 Run、或从未开始过 Step 就终止的 Run，诚实地留 NULL，不补造一个 0。
+- **`workers/manager.py::WorkerManager.worker_count()`**（新增，一行只读方法）：§0 表格把 `workers/manager.py` 的 F 共享改动限定在 `_worker_env`/`_prepare_hermes_home`，没有把这个文件列进 G 的共享改动清单；但 `daemon.status` 真实计数（明确分给 G）离不开一个"当前有多少个 worker"的读法，`WorkerManager._workers` 是私有字典，`SessionService`（G 持有 `self.worker_manager`）没有别的干净途径拿到这个数。加一个只读 accessor 是能做到"不碰 F 的两个函数、只加一行新方法"里最小的选择；未在 §0 表格里预先声明，这里补上。
+- **`sessions/service.py` touch 超出 §0 表格字面列出的函数清单**：`_run_turn` 本身没被列进 G 的允许清单（清单只列了 `_handle_tool_call_start/_update`、`_finalize_*`、`_terminate_run`、`run_get/run_steps`、`_cwd_for_project`），但两处新增行为只能长在这里，没有别的合理位置：① `_run_turn` 开头写 prompt snapshot（Run 一开始就要落盘，晚了就不诚实）；② provider 预检查（必须在 `WorkerManager.ensure_started()` 之前，即 §2 集成收口第 4 条 `pnpm e2e` 断言的前提——没有这一步，缺 Key 时只会得到一张和"worker 起不来"完全同形状的报错卡，无法验证是 provider_error）。`__init__`/`startup`/`shutdown` 也加了字段/几行（后台任务集合、保留期清理循环的启停）。均为新增行，未改动 F 拥有的 `_on_request_permission`/`permission_decide`/`send` 内部任何一行。
+- **provider 预检查不等于把 `ProviderBinding` 接进 worker**：`_run_turn` 现在会在拉起 worker 前调用 `ctx.providers.resolve(model_pref)`，resolve 失败（`RpcError`/`ProviderNotConfiguredError`，两种实现抛的异常类型不同，均已捕获）→ `run.terminated{kind:"error", reason:"provider_error: ..."}`，**不**尝试把 resolve 成功后的 `ProviderBinding`（env/`hermes_config`）写进 worker 的启动环境或 `HERMES_HOME/config.yaml`——那部分仍是 01-w2-interfaces.md §2.1 记录的既有缺口（`_worker_env`/`_prepare_hermes_home` 是 F 的专属触点），本分支只做了"先问一声该不该起"，没有做"起的时候把答案接上"。
+- **`sessions/queries.py`/`sessions/methods.py` 不在 §0 表格任何一边的共享改动清单里**（表格只写了 `sessions/service.py` 的函数级划分），但两条分支都必须触碰它们才能实现各自的 RPC 方法；F 与 G 本轮加的函数完全不重叠（G：`update_step` 加 `payload_ref` 形参、`list_run_steps` 加分页、`mark_run_terminated` 加 `terminated_step_seq`、以及 `set_prompt_snapshot_ref`/`list_runs_with_payload_before`/`clear_run_payload_refs`/`get_agent_model_pref`/`list_runs_for_session` 全部新增；`run.list`/`run.payload` 注册 + `run.steps` 分页参数透传），未见冲突，按 DEV.md「先改文档后落地」的精神补记于此。
+- **`settings.payload_retention_days` 未写进 `config/resolver.py::DEFAULT_SETTINGS`**：那份默认值表是 C（#8/#9）的专属文件，本分支未触碰；`replay/retention.py::_retention_days` 直接对 `ctx.config.settings(None).get("payload_retention_days", 90)` 取值——`ConfigResolver.settings()` 本就是对磁盘 JSON 文件的无 schema 合并，用户在 `settings.json` 里手写这个 key 一样生效，只是不会出现在"即使两级都没有 settings.json 也保证存在"的默认值里。建议 C 在后续 PR 里把这个 key 补进 `DEFAULT_SETTINGS`，本分支不越界代为改动。
+
 ## 3. 全体
 
 - 性能：规则闸零 IPC；审查闸纯计算 < 1ms；用户闸等待不占 worker CPU；回放 payload 写入异步、不阻塞 ACP 读循环。报告里给数字。

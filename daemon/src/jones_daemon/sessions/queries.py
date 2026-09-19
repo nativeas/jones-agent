@@ -294,6 +294,22 @@ def get_run(conn: sqlite3.Connection, run_id: str) -> dict[str, Any] | None:
     return _d(conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
 
 
+def list_runs_for_session(
+    conn: sqlite3.Connection, session_id: str, *, limit: int = 50
+) -> list[dict[str, Any]]:
+    """Newest-first Run list for a Session — the replay view's "选一个 Run" list
+    (02-w3-interfaces.md §2). Not in 00-foundation.md §4.1's original table (that
+    table only ever had per-Run `run.get`/`run.steps`, never a way to discover a
+    Run id in the first place besides the live `turn.started` notification) —
+    added by this issue as `run.list`, see the PR report's "契约变更"."""
+    return _rows(
+        conn.execute(
+            "SELECT * FROM runs WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+            (session_id, limit),
+        )
+    )
+
+
 def mark_run_completed(conn: sqlite3.Connection, run_id: str, turn_id: str) -> None:
     now = iso_now()
     try:
@@ -311,14 +327,20 @@ def mark_run_completed(conn: sqlite3.Connection, run_id: str, turn_id: str) -> N
 
 
 def mark_run_terminated(
-    conn: sqlite3.Connection, run_id: str, turn_id: str, *, kind: str, reason: str
+    conn: sqlite3.Connection,
+    run_id: str,
+    turn_id: str,
+    *,
+    kind: str,
+    reason: str,
+    terminated_step_seq: int | None = None,
 ) -> None:
     now = iso_now()
     try:
         conn.execute(
             "UPDATE runs SET status = 'terminated', ended_at = ?, terminated_kind = ?, "
-            "terminated_reason = ?, updated_at = ? WHERE id = ?",
-            (now, kind, reason, now, run_id),
+            "terminated_reason = ?, terminated_step_seq = ?, updated_at = ? WHERE id = ?",
+            (now, kind, reason, terminated_step_seq, now, run_id),
         )
         conn.execute(
             "UPDATE turns SET status = 'terminated', updated_at = ? WHERE id = ?", (now, turn_id)
@@ -393,6 +415,7 @@ def update_step(
     result_summary: str | None,
     duration_ms: int | None,
     permission_id: str | None = None,
+    payload_ref: str | None = None,
 ) -> dict[str, Any] | None:
     fields, params = [], []
     for column, value in (
@@ -400,6 +423,7 @@ def update_step(
         ("result_summary", result_summary),
         ("duration_ms", duration_ms),
         ("permission_id", permission_id),
+        ("payload_ref", payload_ref),
     ):
         if value is not None:
             fields.append(f"{column} = ?")
@@ -415,8 +439,94 @@ def update_step(
     return get_step(conn, step_id)
 
 
-def list_run_steps(conn: sqlite3.Connection, run_id: str) -> list[dict[str, Any]]:
-    return _rows(conn.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY seq", (run_id,)))
+def list_run_steps(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    after_seq: int | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """`run.steps` 分页 (docs/design/02-w3-interfaces.md §2): ordered by `seq`
+    (monotonic per Run — assigned by `_handle_tool_call_start`), `after_seq`/
+    `limit` page forward through it. `after_seq=None` starts from the first Step;
+    `limit=None` returns every remaining Step (small Runs — the common case —
+    don't need a second round trip)."""
+    if after_seq is not None and limit is not None:
+        cur = conn.execute(
+            "SELECT * FROM steps WHERE run_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+            (run_id, after_seq, limit),
+        )
+    elif after_seq is not None:
+        cur = conn.execute(
+            "SELECT * FROM steps WHERE run_id = ? AND seq > ? ORDER BY seq", (run_id, after_seq)
+        )
+    elif limit is not None:
+        cur = conn.execute(
+            "SELECT * FROM steps WHERE run_id = ? ORDER BY seq LIMIT ?", (run_id, limit)
+        )
+    else:
+        cur = conn.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY seq", (run_id,))
+    return _rows(cur)
+
+
+def set_prompt_snapshot_ref(conn: sqlite3.Connection, run_id: str, ref: str) -> None:
+    conn.execute(
+        "UPDATE runs SET prompt_snapshot_ref = ?, updated_at = ? WHERE id = ?",
+        (ref, iso_now(), run_id),
+    )
+    conn.commit()
+
+
+def list_runs_with_payload_before(conn: sqlite3.Connection, cutoff_iso: str) -> list[str]:
+    """Run ids that ended before `cutoff_iso` and still have at least one payload
+    on disk to clean up (a Step's `payload_ref`, or the Run's own
+    `prompt_snapshot_ref`) — the retention sweep's candidate set
+    (`replay/retention.py`)."""
+    cur = conn.execute(
+        "SELECT r.id FROM runs r WHERE r.ended_at IS NOT NULL AND r.ended_at < ? "
+        "AND (r.prompt_snapshot_ref IS NOT NULL OR EXISTS ("
+        "  SELECT 1 FROM steps s WHERE s.run_id = r.id AND s.payload_ref IS NOT NULL))",
+        (cutoff_iso,),
+    )
+    return [row["id"] for row in cur.fetchall()]
+
+
+def clear_run_payload_refs(conn: sqlite3.Connection, run_id: str) -> None:
+    """Null out every payload pointer for a Run after its on-disk files have been
+    deleted (`replay/store.py::purge_run`) — SQLite stays the source of truth for
+    *whether* a payload still exists (PRD 10.4), so this must run only after the
+    delete actually succeeded, never before or unconditionally."""
+    now = iso_now()
+    try:
+        conn.execute(
+            "UPDATE steps SET payload_ref = NULL, updated_at = ? WHERE run_id = ? "
+            "AND payload_ref IS NOT NULL",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE runs SET prompt_snapshot_ref = NULL, updated_at = ? WHERE id = ? "
+            "AND prompt_snapshot_ref IS NOT NULL",
+            (now, run_id),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+
+
+def get_agent_model_pref(conn: sqlite3.Connection, agent_id: str) -> dict[str, Any] | None:
+    """Raw `agents.model_pref_json`, decoded — the shape `ProviderResolver.resolve()`
+    expects verbatim (01-w2-interfaces.md §3.2: `{"provider": str, "model": str |
+    None}`, or `{}`/`None`). Returns `None` if `agent_id` doesn't exist (the caller,
+    `_run_turn`'s pre-flight provider check, treats that the same as "no
+    preference" — an Agent row disappearing out from under a running Session is
+    not this check's job to diagnose)."""
+    row = conn.execute(
+        "SELECT model_pref_json FROM agents WHERE id = ?", (agent_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row["model_pref_json"])
 
 
 # -- permission decisions ---------------------------------------------------------
