@@ -13,8 +13,18 @@
 // bridge shape, not an actual RPC round-trip (design §3 already covers daemon
 // unreachability via ensureDaemonRunning()'s own retry/timeout path, exercised by
 // the vitest suite).
+//
+// 01-w2-interfaces.md §5 known issue: the real renderer bundle mounts several
+// components that call `window.jones.rpc.call(...)` on mount (daemon status,
+// the sessions/settings stores' initial loads). This script only stands up a
+// bare BrowserWindow, not the real main/index.ts — without a handler for
+// 'rpc:call' registered somewhere, Electron logs "No handler registered for
+// 'rpc:call'" to stderr for every one of those. main/index.ts (E's module)
+// already registers the real handler before createWindow() there; this script
+// registers an equivalent stub for the same reason, so the smoke test's own
+// stderr stays clean while still only asserting the preload bridge shape.
 
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, ipcMain } from 'electron'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -28,6 +38,11 @@ function fail(message) {
 }
 
 const timer = setTimeout(() => fail('timed out waiting for the window to load'), TIMEOUT_MS)
+
+// Registered before app.whenReady()/createWindow(), same ordering §5 requires
+// of the real main process — a stub is enough here since this test only checks
+// that the bridge exists and calls resolve, not real daemon behavior.
+ipcMain.handle('rpc:call', async () => ({ ok: false, message: 'smoke test stub: rpc not wired' }))
 
 app.whenReady().then(async () => {
   const win = new BrowserWindow({
@@ -43,13 +58,12 @@ app.whenReady().then(async () => {
   })
 
   try {
-    // Loading the real renderer bundle mounts <DaemonStatusCard>, which fires an
-    // `ipcRenderer.invoke('rpc:call', ...)` on mount. This script only stands up a
-    // BrowserWindow (not the real main/index.ts), so nothing has `ipcMain.handle`'d
-    // that channel — Electron logs "No handler registered for 'rpc:call'" to this
-    // process's stderr. That's expected and harmless here: this test only asserts
-    // the preload bridge shape (window.jones.rpc.call being a function), not an
-    // actual RPC round-trip.
+    // Loading the real renderer bundle mounts several components that fire
+    // `ipcRenderer.invoke('rpc:call', ...)` on mount (daemon status, the
+    // sessions/settings stores' initial loads) — the stub handler registered
+    // above answers all of them with `ok:false`, which is fine: this test only
+    // asserts the preload bridge shape (window.jones.rpc.call being a
+    // function), not an actual RPC round-trip.
     await win.loadFile(path.join(__dirname, '../out/renderer/index.html'))
     const bridgeType = await win.webContents.executeJavaScript(
       'typeof (window.jones && window.jones.rpc && window.jones.rpc.call)'
