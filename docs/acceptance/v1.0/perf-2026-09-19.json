@@ -16,7 +16,7 @@
   "metrics": [
     {
       "name": "daemon_cold_start_ms",
-      "value": 68.88870900002075,
+      "value": 84.26425000106974,
       "unit": "ms",
       "threshold": 6000,
       "threshold_source": "PRD 11.1 冷启动（守护进程未运行）≤ 6s",
@@ -25,7 +25,7 @@
     },
     {
       "name": "send_to_first_delta_ms",
-      "value": 0.12895800136902835,
+      "value": 0.11241700121900067,
       "unit": "ms",
       "threshold": 800,
       "threshold_source": "PRD 11.1 首个 Turn 首 token ≤ 模型 RTT + 800ms（此处 RTT≈0，仅测运行时开销）",
@@ -37,7 +37,7 @@
     },
     {
       "name": "idle_rss_mb",
-      "value": 36.3125,
+      "value": 36.4375,
       "unit": "MB",
       "threshold": 150,
       "threshold_source": "PRD 11.2 守护进程常驻内存（空闲）≤ 150MB",
@@ -57,7 +57,7 @@
     },
     {
       "name": "worker_cold_start_fake_agent_ms",
-      "value": 26.855333000639803,
+      "value": 33.94616700097686,
       "unit": "ms",
       "threshold": 2000,
       "threshold_source": "PRD 11.1 冷启动 worker ≤ 2s",
@@ -68,7 +68,7 @@
     },
     {
       "name": "desktop_window_visible_ms",
-      "value": 303.103333,
+      "value": 298.007958,
       "unit": "ms",
       "threshold": 1500,
       "threshold_source": "PRD 11.1 桌面壳可见 ≤ 1.5s",
@@ -77,7 +77,7 @@
     },
     {
       "name": "desktop_input_ready_ms",
-      "value": 729.430916,
+      "value": 739.402667,
       "unit": "ms",
       "threshold": 3000,
       "threshold_source": "PRD 11.1 可开始输入 ≤ 3s（守护进程已在运行的情况下）",
@@ -86,7 +86,7 @@
     },
     {
       "name": "desktop_electron_rss_mb",
-      "value": 276.34375,
+      "value": 275.796875,
       "unit": "MB",
       "threshold": 300,
       "threshold_source": "PRD 11.2 Electron 壳（Main + Renderer）≤ 300MB",
@@ -95,19 +95,19 @@
         "processes": [
           {
             "type": "Browser",
-            "rss_kb": 162464
+            "rss_kb": 161984
           },
           {
             "type": "GPU",
-            "rss_kb": 90064
+            "rss_kb": 89664
           },
           {
             "type": "Utility",
-            "rss_kb": 47040
+            "rss_kb": 46992
           },
           {
             "type": "Tab",
-            "rss_kb": 120512
+            "rss_kb": 120432
           }
         ]
       }
