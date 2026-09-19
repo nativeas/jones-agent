@@ -58,7 +58,15 @@ def _discover_migrations(migrations_dir: Path) -> list[tuple[int, Path]]:
         if not match:
             continue
         found.append((int(match.group(1)), path))
-    return sorted(found, key=lambda pair: pair[0])
+    ordered = sorted(found, key=lambda pair: pair[0])
+    versions = [v for v, _ in ordered]
+    dupes = sorted({v for v in versions if versions.count(v) > 1})
+    if dupes:
+        # Two parallel branches once both shipped a `006_*.sql`; the second was
+        # silently skipped on any DB that had already reached version 6. Refuse
+        # to start rather than guess which one the schema is missing.
+        raise RuntimeError(f"duplicate migration version(s) {dupes} in {migrations_dir}")
+    return ordered
 
 
 def _db_file_path(conn: sqlite3.Connection) -> Path | None:

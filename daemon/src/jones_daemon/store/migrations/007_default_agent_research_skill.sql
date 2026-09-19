@@ -1,4 +1,4 @@
--- 006_default_agent_research_skill.sql (owner: J, w4/15-16-browser-research, issue #16)
+-- 007_default_agent_research_skill.sql (owner: J, w4/15-16-browser-research, issue #16)
 --
 -- Controller ruling R-J5 (round-2 review, 2026-09-19): the default Agent's Skill
 -- set must include Hermes's bundled `research/grounded-citations` skill (PRD FR10

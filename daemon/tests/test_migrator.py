@@ -110,9 +110,14 @@ def test_apply_pending_backs_up_the_db_file_before_migrating(tmp_path):
         migrator.apply_pending(conn)
         backups = _backups(tmp_path)
         pending = migrator._discover_migrations(migrator.MIGRATIONS_DIR)
-        assert len(backups) == len(pending)
+        # One backup per pending migration, capped by `maintenance.MAX_BACKUPS`
+        # rotation (#23) — the *newest* ones survive.
+        from jones_daemon.store.maintenance import MAX_BACKUPS  # noqa: PLC0415
+
+        expected = [str(v) for v, _ in pending][-MAX_BACKUPS:]
+        assert len(backups) == len(expected)
         backup_versions = {b.name.split("-", 3)[1] for b in backups}
-        assert backup_versions == {str(v) for v, _ in pending}
+        assert backup_versions == set(expected)
     finally:
         conn.close()
 
