@@ -44,9 +44,9 @@ def register(
             name=_require_str(params, "name"),
             expr=_require_str(params, "expr"),
             prompt=_require_str(params, "prompt"),
-            # Round-1 fix (review #1/#13): was `"auto"` — see `service.py`'s
-            # module docstring "第 1 轮修复记录" and 04-w5-interfaces.md §2.
-            mode=params.get("mode", "task"),
+            # PRD 9.1 default — see `service.py::upsert`'s `mode` docstring and
+            # 04-w5-interfaces.md §2 for round-1/round-3's back-and-forth on this.
+            mode=params.get("mode", "auto"),
             enabled=enabled,
         )
 
