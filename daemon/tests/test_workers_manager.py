@@ -14,6 +14,7 @@ from jones_daemon.workers.manager import (
     DEFAULT_STARTUP_TIMEOUT_S,
     WorkerManager,
     WorkerStartupError,
+    _prepare_hermes_home,
     _worker_env,
 )
 
@@ -157,7 +158,7 @@ async def test_prepare_hermes_home_failure_surfaces_as_worker_startup_error(tmp_
     """
     monkeypatch.setenv("FAKE_ACP_MODE", "normal")
 
-    def _boom(_hermes_home):
+    def _boom(_hermes_home, **_kwargs):
         raise OSError("simulated disk failure")
 
     monkeypatch.setattr("jones_daemon.workers.manager._prepare_hermes_home", _boom)
@@ -270,5 +271,138 @@ async def test_worker_startup_latency_measurement(tmp_path, monkeypatch, _run):
     try:
         await manager.ensure_started(f"s-{_run}", cwd="/tmp")
         assert manager.startup_latencies_s[-1] < DEFAULT_STARTUP_TIMEOUT_S
+    finally:
+        await manager.stop()
+
+
+# -- `_prepare_hermes_home` mcp_servers/skill_dirs (Issue #17, FR13) -----------
+
+
+def test_prepare_hermes_home_writes_mcp_servers_into_config_yaml(tmp_path):
+    import yaml
+
+    hermes_home = tmp_path / "hh"
+    _prepare_hermes_home(
+        hermes_home,
+        mcp_servers=[
+            {"name": "echo", "command": "python3", "args": ["server.py"], "env": {"A": "b"}},
+            {"name": "docs", "url": "https://example.com/mcp", "headers": {}},
+            {"name": "off", "command": "x", "enabled": False},
+        ],
+    )
+    raw = (hermes_home / "config.yaml").read_text(encoding="utf-8")
+    parsed = yaml.safe_load(raw)
+    assert parsed["plugins"]["enabled"] == ["jones_gate"]
+    assert parsed["command_allowlist"] == []
+    assert parsed["mcp_servers"] == {
+        "echo": {"command": "python3", "args": ["server.py"], "env": {"A": "b"}},
+        "docs": {"url": "https://example.com/mcp", "headers": {}},
+    }
+
+
+def test_prepare_hermes_home_with_no_mcp_servers_writes_empty_dict(tmp_path):
+    import yaml
+
+    hermes_home = tmp_path / "hh"
+    _prepare_hermes_home(hermes_home)
+    parsed = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8"))
+    assert parsed["mcp_servers"] == {}
+
+
+def test_prepare_hermes_home_symlinks_skill_dirs(tmp_path):
+    real_skill = tmp_path / "some" / "research"
+    real_skill.mkdir(parents=True)
+    (real_skill / "SKILL.md").write_text("# research", encoding="utf-8")
+
+    hermes_home = tmp_path / "hh"
+    _prepare_hermes_home(hermes_home, skill_dirs=[real_skill])
+
+    link = hermes_home / "skills" / "research"
+    assert link.is_symlink()
+    assert (link / "SKILL.md").read_text(encoding="utf-8") == "# research"
+
+
+def test_prepare_hermes_home_skill_symlink_failure_does_not_raise(tmp_path, monkeypatch):
+    def _boom(self, target, target_is_directory=False):
+        raise OSError("simulated symlink failure")
+
+    monkeypatch.setattr(Path, "symlink_to", _boom)
+    hermes_home = tmp_path / "hh"
+    _prepare_hermes_home(hermes_home, skill_dirs=[tmp_path / "some-skill"])  # must not raise
+    assert (hermes_home / "skills").is_dir()
+    assert not (hermes_home / "skills" / "some-skill").exists()
+
+
+async def test_ensure_started_resolves_mcp_servers_from_injected_config(tmp_path, monkeypatch):
+    """`WorkerManager(config=...)` + `ensure_started(..., project_id=...)`
+    (03-w4-interfaces.md §2) — the real spawn path threads `ctx.config.
+    mcp_servers(project_id)` into the worker's `config.yaml`."""
+    import yaml
+
+    class _FakeConfig:
+        def mcp_servers(self, project_id):
+            assert project_id == "proj1"
+            return [{"name": "echo", "command": "python3", "args": [], "env": {}}]
+
+    monkeypatch.setenv("FAKE_ACP_MODE", "normal")
+    manager = WorkerManager(
+        user_root=tmp_path,
+        on_session_update=_noop_update,
+        on_request_permission=_noop_permission,
+        on_worker_crash=_noop_crash,
+        worker_cmd=[sys.executable, _FAKE_AGENT],
+        startup_timeout_s=5.0,
+        config=_FakeConfig(),
+    )
+    await manager.start()
+    try:
+        worker = await manager.ensure_started("s1", cwd="/tmp", project_id="proj1")
+        parsed = yaml.safe_load((worker.hermes_home / "config.yaml").read_text(encoding="utf-8"))
+        assert parsed["mcp_servers"] == {"echo": {"command": "python3", "args": [], "env": {}}}
+    finally:
+        await manager.stop()
+
+
+async def test_ensure_started_without_config_or_project_id_has_no_mcp_servers(
+    tmp_path, monkeypatch
+):
+    """Every pre-existing test's `WorkerManager(...)` call (no `config=`) — and any
+    `ensure_started` call with no `project_id` — must keep behaving exactly as
+    before this Issue's change: an empty `mcp_servers:` dict, never an error."""
+    import yaml
+
+    monkeypatch.setenv("FAKE_ACP_MODE", "normal")
+    manager = _make_manager(tmp_path)
+    await manager.start()
+    try:
+        worker = await manager.ensure_started("s1", cwd="/tmp")
+        parsed = yaml.safe_load((worker.hermes_home / "config.yaml").read_text(encoding="utf-8"))
+        assert parsed["mcp_servers"] == {}
+    finally:
+        await manager.stop()
+
+
+async def test_ensure_started_survives_a_broken_config_resolver(tmp_path, monkeypatch):
+    """DEV.md 工程原则 #4: a broken `mcp.json` (or any `ConfigResolver.mcp_servers`
+    failure) must not prevent the worker from starting at all."""
+
+    class _BrokenConfig:
+        def mcp_servers(self, project_id):
+            raise ValueError("simulated malformed mcp.json")
+
+    monkeypatch.setenv("FAKE_ACP_MODE", "normal")
+    manager = WorkerManager(
+        user_root=tmp_path,
+        on_session_update=_noop_update,
+        on_request_permission=_noop_permission,
+        on_worker_crash=_noop_crash,
+        worker_cmd=[sys.executable, _FAKE_AGENT],
+        startup_timeout_s=5.0,
+        config=_BrokenConfig(),
+    )
+    await manager.start()
+    try:
+        worker = await manager.ensure_started("s1", cwd="/tmp", project_id="proj1")
+        assert worker is not None
     finally:
         await manager.stop()

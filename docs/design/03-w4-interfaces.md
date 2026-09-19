@@ -56,3 +56,47 @@ Hermes 已经带全了能力域（`toolsets.py::_HERMES_CORE_TOOLS`：`read_file
 
 - 每条分支报告给性能数字：H 注册表对账耗时、I 终端 update→broadcast 时延、J 浏览器冷启动与工具往返、K 透明页渲染。
 - 诚实失败：MCP server 起不来 → `mcp_server_down` 隐藏原因 + `daemon.error`；浏览器起不来 → 明确错误卡片；Skill 格式错 → 列出并标 invalid，不静默跳过。
+
+## 7. H 落地时对 §2 的契约修正（2026-09-19，实现阶段发现，源码核对，非设计推测）
+
+本节记录 H/#17 实现时发现、需要修正 §2 原文假设的三处，源码核对对象是
+`/Users/nativeas/.hermes/hermes-agent`（`ee4452991d17534aa561f31ee55596d082aa94e7`）。
+
+- **不存在"按 Agent/Session 选择 Hermes 命名 toolset"这回事**：`acp_adapter/
+  session.py::SessionManager._make_agent` 把 ACP 会话的 `enabled_toolsets`
+  硬编码为 `["hermes-acp"] + [f"mcp-{name}" for name in <config.yaml 的
+  mcp_servers 键>]`——没有任何 `config.yaml` 字段、也没有任何 ACP 协议字段
+  （`NewSessionRequest` 只有 `cwd`/`mcpServers`）能让客户端换一个内置
+  toolset 包。`capabilities/registry.py::BUILTIN_TOOLS` 是 `"hermes-acp"`
+  toolset 的真实展开（手抄自 `toolsets.py`，逐行核对），是 ACP 会话能暴露
+  的**全部**内置工具全集；`kanban_*`/`ha_*`/`computer_use` 根本不在这个集合
+  里（它们的 `check_fn` 依赖 Jones 从不配置的子系统，结构性缺席，不需要
+  `disabled_toolsets`）；`delegate_task` 在集合里且 `check_fn` 恒真——对它
+  "v1 默认关"唯一可用的杠杆是 F/W3 已建好的 `jones_gate.json`
+  `tool_allowlist` 机制（执行期拦截，不影响模型是否"看得见"这个工具的
+  schema），不是 `_prepare_hermes_home` 能做到的。默认 Agent 的
+  `tool_allowlist_json` 是否已经排除 `delegate_task`，属于 Agent 默认值/
+  种子数据的产品决策，不在 `agents/store.py` 非本 Issue 所有目录范围内，见
+  报告"评审关注点"。
+- **`config.yaml` 的 `mcp_servers:` 字段才是真正接线点，不是 ACP `session/
+  new` 的 `mcpServers` 参数**：`acp_adapter/entry.py` 在 ACP server 启动时
+  就从 `config.yaml` 后台发现/连接 `mcp_servers`（`hermes_cli/mcp_startup.py`
+  ），且 `_make_agent` 用同一个字段计算 `enabled_toolsets` 的 `mcp-*` 项——
+  两者共享同一份配置。ACP 协议自带的 `mcpServers` 参数是给"编辑器按会话传
+  项目级 MCP 配置"用的另一条独立通道，Jones 每个 Session 本来就有专属隔离
+  `HERMES_HOME`，用不上。`_prepare_hermes_home` 因此写 `config.yaml` 的
+  `mcp_servers:`（JSON flow 语法，是合法 YAML 1.2，不需要引入 YAML 库也能
+  正确转义任意嵌套结构），不写 ACP `new_session` 参数。
+- **`mcp.json` 每条 server 记录的具体字段**（01-w2-interfaces.md §4.1 原文
+  只定义到 `{"name": string, ...}`，留给实际消费者定稿）：`capabilities/
+  mcp_config.py` 的模块 docstring是这份具体化后的规范，源码核对对象是
+  `tools/mcp_tool_server_run.py::_prepare_run`（`"url" in config` 判定
+  stdio/http）与 `acp_adapter/server.py::_mcp_server_config`（ACP 侧同款
+  两种形状，佐证字段名）：stdio 是
+  `{"name","transport":"stdio","command","args","env","enabled"}`，http 是
+  `{"name","transport":"http","url","headers","enabled"}`（`"transport":
+  "sse"` 可选，选 legacy SSE）。已用真实 Hermes（`uv sync --group worker` +
+  额外 `mcp==2.0.0`，见 `daemon/pyproject.toml` 的 `worker` 组新增一行）验证
+  一个 stdio + 一个 HTTP echo server 都能被 `tools.mcp_tool_discovery.
+  register_mcp_servers` 正确连接，工具名为 `mcp__<server>__<tool>`（
+  `tools/mcp_tool_schema.py::MCP_TOOL_NAME_PREFIX`/`build_mcp_tool_name`）。

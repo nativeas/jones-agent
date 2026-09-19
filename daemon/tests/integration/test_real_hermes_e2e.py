@@ -35,8 +35,8 @@ pytestmark = pytest.mark.skipif(
 async def test_real_worker_starts_and_completes_a_trivial_turn(tmp_path):
     real_prepare = manager_module._prepare_hermes_home
 
-    def _prepare_with_model_config(hermes_home):
-        real_prepare(hermes_home)
+    def _prepare_with_model_config(hermes_home, **kwargs):
+        real_prepare(hermes_home, **kwargs)
         config_path = hermes_home / "config.yaml"
         # Appended, not replacing what real_prepare wrote (plugins.enabled must
         # survive) — the exact shape 01-w2-interfaces.md §3.1 documents for

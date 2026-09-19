@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from jones_daemon.capabilities import mcp_config
+from jones_daemon.context import ConfigResolver
 from jones_daemon.kernel.acp_client import AcpClient, AcpError, AcpProtocolError
 from jones_daemon.logging import get_logger
 
@@ -117,11 +119,32 @@ def _worker_env(hermes_home: Path, extra_env: dict[str, str] | None = None) -> d
     return env
 
 
-def _prepare_hermes_home(hermes_home: Path) -> None:
+def _prepare_hermes_home(
+    hermes_home: Path,
+    *,
+    mcp_servers: list[dict[str, Any]] | None = None,
+    skill_dirs: list[Path] | None = None,
+) -> None:
     """Materialize an isolated HERMES_HOME: jones_gate plugin files + config.yaml
     enabling it. Never copies from a user's real `~/.hermes` profile (00-foundation.md
     §7: isolation is the point, not convenience) — this directory starts empty every
     time a worker is (re)spawned, notably including a fresh, empty `command_allowlist`.
+
+    `mcp_servers` (Issue #17/FR13, 03-w4-interfaces.md §2): the project's resolved
+    `ctx.config.mcp_servers(project_id)` list, converted to Hermes's `config.yaml`
+    `mcp_servers:` shape by `capabilities/mcp_config.py` — see that module's
+    docstring for the concrete per-server schema and the source verification for
+    why `config.yaml` (read by `acp_adapter/entry.py`'s background MCP discovery
+    AND by `acp_adapter/session.py::_make_agent`'s `enabled_toolsets` computation)
+    is the right channel, not the ACP `session/new` `mcpServers` protocol field.
+
+    `skill_dirs` (Issue #17's "skills 路径", real implementation is #18/K's —
+    `capabilities/registry.py`'s module docstring and the PR report explain this
+    is a symlink-based integration point wired here but not yet called with real
+    data pending K's `skills.worker_skill_dirs(ctx, session)`): each path is
+    symlinked into `<HERMES_HOME>/skills/<dirname>` (`tools/skills_tool.py`'s
+    `SKILLS_DIR = HERMES_HOME / "skills"`, source-verified) — best-effort, a
+    failed symlink is logged and skipped, never fatal to worker startup.
     """
     hermes_home.mkdir(parents=True, exist_ok=True)
     hermes_home.chmod(0o700)
@@ -129,16 +152,38 @@ def _prepare_hermes_home(hermes_home: Path) -> None:
     if plugin_dst.exists():
         shutil.rmtree(plugin_dst)
     shutil.copytree(_JONES_GATE_SRC, plugin_dst)
-    # Hand-written, not a YAML library call: the shape here is fixed and trivial
-    # (one enabled-plugins list, one empty allowlist) and daemon/pyproject.toml has
-    # no YAML dependency to add just for this (DEV.md 工程原则 #6). Deliberately does
-    # NOT write `approvals.mode` at all — Hermes's own default is `manual`, and
-    # omitting the key is the only way to be sure this file never accidentally
-    # writes the one value (`off`) that's forbidden (00-foundation.md §7/§8.1).
+    # Hand-written, not a YAML library call: daemon/pyproject.toml has no YAML
+    # dependency to add just for this (DEV.md 工程原则 #6). The `mcp_servers`
+    # value is emitted as JSON flow syntax — valid YAML 1.2 (a JSON document IS a
+    # conforming YAML document), which is what makes hand-writing this safe for
+    # arbitrary nested dicts/strings (proper escaping via `json.dumps`, no
+    # hand-rolled indentation/quoting rules that would mishandle a server name or
+    # header value containing `:`/quotes). Deliberately does NOT write
+    # `approvals.mode` at all — Hermes's own default is `manual`, and omitting the
+    # key is the only way to be sure this file never accidentally writes the one
+    # value (`off`) that's forbidden (00-foundation.md §7/§8.1).
+    hermes_servers = mcp_config.hermes_mcp_servers_dict(mcp_servers)
     (hermes_home / "config.yaml").write_text(
-        "plugins:\n  enabled:\n    - jones_gate\ncommand_allowlist: []\n",
+        "plugins:\n  enabled:\n    - jones_gate\n"
+        "command_allowlist: []\n"
+        f"mcp_servers: {json.dumps(hermes_servers, ensure_ascii=False)}\n",
         encoding="utf-8",
     )
+
+    if skill_dirs:
+        skills_root = hermes_home / "skills"
+        skills_root.mkdir(parents=True, exist_ok=True)
+        for path in skill_dirs:
+            try:
+                link = skills_root / path.name
+                if link.exists() or link.is_symlink():
+                    continue
+                link.symlink_to(path)
+            except OSError:
+                logger.warning(
+                    "failed to symlink skill dir into worker HERMES_HOME",
+                    extra={"detail": {"path": str(path), "hermes_home": str(hermes_home)}},
+                )
 
 
 def _probe_event_verdict(update: dict[str, Any]) -> str | None:
@@ -187,12 +232,21 @@ class WorkerManager:
         worker_cmd: list[str] | None = None,
         idle_timeout_s: float = DEFAULT_IDLE_TIMEOUT_S,
         startup_timeout_s: float = DEFAULT_STARTUP_TIMEOUT_S,
+        config: ConfigResolver | None = None,
     ) -> None:
         self._user_root = user_root
         self._on_session_update = on_session_update
         self._on_request_permission = on_request_permission
         self._on_worker_crash = on_worker_crash
         self._worker_cmd = worker_cmd or [sys.executable, "-m", "acp_adapter.entry"]
+        # Issue #17/FR13 (03-w4-interfaces.md §2): resolves `ctx.config.mcp_servers
+        # (project_id)` at spawn time so `_prepare_hermes_home` can write them into
+        # the worker's isolated `config.yaml`. `None` (every existing test's
+        # `WorkerManager(...)` call, and any caller with no MCP config to offer)
+        # means "don't resolve MCP servers" — `_spawn_and_check` degrades to an
+        # empty list, not an error; a worker with no configured MCP servers is a
+        # completely ordinary, supported case.
+        self._config = config
         self._idle_timeout_s = idle_timeout_s
         self._startup_timeout_s = startup_timeout_s
         self._workers: dict[str, Worker] = {}
@@ -234,7 +288,9 @@ class WorkerManager:
             worker.busy = busy
             worker.last_active = time.monotonic()
 
-    async def ensure_started(self, session_id: str, *, cwd: str) -> Worker:
+    async def ensure_started(
+        self, session_id: str, *, cwd: str, project_id: str | None = None
+    ) -> Worker:
         existing = self._workers.get(session_id)
         if existing is not None:
             return existing
@@ -243,7 +299,7 @@ class WorkerManager:
             existing = self._workers.get(session_id)
             if existing is not None:
                 return existing
-            worker = await self._spawn_and_check(session_id, cwd=cwd)
+            worker = await self._spawn_and_check(session_id, cwd=cwd, project_id=project_id)
             self._workers[session_id] = worker
             watch_task = asyncio.create_task(self._watch_exit(worker))
             self._background_tasks.add(watch_task)
@@ -261,11 +317,28 @@ class WorkerManager:
     def _hermes_home_for(self, session_id: str) -> Path:
         return self._user_root / "workers" / session_id / "hermes"
 
-    async def _spawn_and_check(self, session_id: str, *, cwd: str) -> Worker:
+    async def _spawn_and_check(
+        self, session_id: str, *, cwd: str, project_id: str | None = None
+    ) -> Worker:
         t0 = time.monotonic()
         hermes_home = self._hermes_home_for(session_id)
+        mcp_servers: list[dict[str, Any]] = []
+        if self._config is not None and project_id is not None:
+            try:
+                mcp_servers = self._config.mcp_servers(project_id)
+            except Exception:
+                # A broken mcp.json must not block a worker from starting at all
+                # (DEV.md 工程原则 #4: 诚实失败 — logged, not silently ignored;
+                # the session still gets a worker with zero MCP tools rather than
+                # failing to start entirely over an unrelated config file).
+                logger.warning(
+                    "failed to resolve mcp_servers for project; starting worker "
+                    "with no MCP servers configured",
+                    extra={"detail": {"project_id": project_id}},
+                    exc_info=True,
+                )
         try:
-            _prepare_hermes_home(hermes_home)
+            _prepare_hermes_home(hermes_home, mcp_servers=mcp_servers)
         except OSError as exc:
             # Was previously uncaught here, escaping `_spawn_and_check` as a bare
             # OSError instead of `WorkerStartupError` — `SessionService._run_turn`'s
