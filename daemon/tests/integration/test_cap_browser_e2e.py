@@ -78,6 +78,20 @@ class _LoginSiteHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"Secure Area" if ok else b"Not logged in")
+        elif self.path == "/form":
+            # Review finding #5: a real page with a real form field, for
+            # `test_snapshot_then_click_then_type_covers_the_form_filling_
+            # acceptance_bar` — labeled input Hermes's own accessibility
+            # snapshot can resolve a ref for.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b'<html><body><form>'
+                b'<label for="name">Name</label>'
+                b'<input id="name" name="name" type="text">'
+                b"</form></body></html>"
+            )
         else:
             self.send_response(404)
             self.end_headers()
@@ -210,43 +224,67 @@ def test_agent_browser_close_does_not_kill_the_shared_chrome(tmp_path, login_sit
         manager.shutdown()
 
 
+def _write_jones_probe_plugin(hermes_home: Path) -> None:
+    """Shared setup for the two gate-integration tests below: the SAME
+    `pre_tool_call` plugin every other Hermes tool goes through (no bespoke
+    MCP-client wiring needed) — `browser_cdp` (escape hatch) always `block`s,
+    every other `browser_*` tool `approve`s. Controller ruling R-J1 (round-2
+    review): NO `browser.allow_private_urls` in this config any more — see
+    `test_real_hermes_browser_navigate_goes_through_the_gate`'s docstring for
+    what that changes about what these two tests can demonstrate."""
+    plugin_dir = hermes_home / "plugins" / "jones_probe"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: jones_probe\nversion: 0.1.0\nhooks: [pre_tool_call]\n", encoding="utf-8"
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "def _on_pre_tool_call(tool_name='', args=None, tool_call_id='', **kw):\n"
+        "    if tool_name == 'browser_cdp':\n"
+        "        return {'action': 'block', 'message': 'JONES RULE GATE: escape hatch'}\n"
+        "    if tool_name.startswith('browser_'):\n"
+        "        return {'action': 'approve', 'message': tool_name, 'rule_key': tool_name}\n"
+        "    return None\n"
+        "def register(ctx):\n"
+        "    ctx.register_hook('pre_tool_call', _on_pre_tool_call)\n",
+        encoding="utf-8",
+    )
+    # No `browser:` section at all — controller ruling R-J1, this branch never
+    # writes `allow_private_urls` (see `capabilities/browser.py::
+    # browser_worker_config`'s docstring for the full reasoning).
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - jones_probe\n  hook_callback_timeout: 5\n",
+        encoding="utf-8",
+    )
+
+
 @pytest.mark.skipif(
     not (_chrome_available() and _hermes_available()),
     reason="needs a real Chrome AND hermes-agent importable (uv sync --group worker)",
 )
-def test_real_hermes_browser_navigate_goes_through_the_gate(tmp_path, login_site):
+def test_real_hermes_browser_navigate_goes_through_the_gate(tmp_path):
     """The gate-integration half of the α decision: `browser_navigate` must be
     interceptable by the SAME `pre_tool_call` plugin every other Hermes tool
     goes through (no bespoke MCP-client wiring needed) — a rule-gate block on
     `browser_cdp` (escape hatch) really stops it before execution, and an
     approve on `browser_navigate` really reaches the real Chrome over CDP.
     Same pattern as docs/spikes/hermes_hook_demo.py, extended past "block" to
-    "approve -> real execution"."""
+    "approve -> real execution".
+
+    Controller ruling R-J1 (round-2 review, findings #6/#8/#9): this test used
+    to navigate to the local `login_site` fixture WITH `browser.
+    allow_private_urls: true` set — that config is gone now (see
+    `_write_jones_probe_plugin`), and without it Hermes's own `_url_policy_
+    error` refuses a loopback target regardless of what the plugin approves
+    (`test_browser_navigate_to_a_loopback_target_is_refused_by_hermes_itself`
+    below locks that refusal in). This test now targets a real public URL
+    instead — real network access required — to keep demonstrating the thing
+    it actually exists to prove (the plugin intercept + real execution chain),
+    without relying on a config this branch no longer ships."""
     manager = BrowserManager(tmp_path / "profile", headless=True)
     handle = manager.ensure_started()
     try:
         hermes_home = Path(tempfile.mkdtemp(prefix="jones-cap-browser-e2e-"))
-        plugin_dir = hermes_home / "plugins" / "jones_probe"
-        plugin_dir.mkdir(parents=True)
-        (plugin_dir / "plugin.yaml").write_text(
-            "name: jones_probe\nversion: 0.1.0\nhooks: [pre_tool_call]\n", encoding="utf-8"
-        )
-        (plugin_dir / "__init__.py").write_text(
-            "def _on_pre_tool_call(tool_name='', args=None, tool_call_id='', **kw):\n"
-            "    if tool_name == 'browser_cdp':\n"
-            "        return {'action': 'block', 'message': 'JONES RULE GATE: escape hatch'}\n"
-            "    if tool_name.startswith('browser_'):\n"
-            "        return {'action': 'approve', 'message': tool_name, 'rule_key': tool_name}\n"
-            "    return None\n"
-            "def register(ctx):\n"
-            "    ctx.register_hook('pre_tool_call', _on_pre_tool_call)\n",
-            encoding="utf-8",
-        )
-        (hermes_home / "config.yaml").write_text(
-            "plugins:\n  enabled:\n    - jones_probe\n  hook_callback_timeout: 5\n"
-            "browser:\n  allow_private_urls: true\n",
-            encoding="utf-8",
-        )
+        _write_jones_probe_plugin(hermes_home)
         env_backup = dict(os.environ)
         os.environ["HERMES_HOME"] = str(hermes_home)
         os.environ["BROWSER_CDP_URL"] = handle.cdp_http_url
@@ -287,7 +325,7 @@ def test_real_hermes_browser_navigate_goes_through_the_gate(tmp_path, login_site
                 result = arh.invoke_tool(
                     stub_agent,
                     "browser_navigate",
-                    {"url": f"{login_site}/secure"},
+                    {"url": "https://example.com/"},
                     "t-1",
                     tool_call_id="c-2",
                 )
@@ -298,9 +336,120 @@ def test_real_hermes_browser_navigate_goes_through_the_gate(tmp_path, login_site
                 reset_hermes_interactive_context(token)
             parsed = json.loads(result)
             assert parsed.get("success") is True, parsed
-            assert parsed.get("url") == f"{login_site}/secure"
+            assert parsed.get("url") == "https://example.com/"
         finally:
             os.environ.clear()
             os.environ.update(env_backup)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(
+    not (_chrome_available() and _hermes_available()),
+    reason="needs a real Chrome AND hermes-agent importable (uv sync --group worker)",
+)
+def test_browser_navigate_to_a_loopback_target_is_refused_by_hermes_itself(tmp_path, login_site):
+    """Controller ruling R-J1's actual security property, proven end to end (not
+    just asserted in `permissions/review.py`'s unit tests): with no `browser.
+    allow_private_urls` in the worker's config.yaml, a `browser_navigate` call
+    that the plugin layer APPROVES (the review-gate escalation to the user
+    gate is a separate, earlier layer — this test starts from "the user already
+    said yes" to isolate Hermes's own SSRF floor) still gets refused by Hermes's
+    own `tools/browser_tool.py::_url_policy_error` when the target is a
+    loopback address — i.e. removing the forced config doesn't just move the
+    decision to the user gate, it makes local/private navigation genuinely not
+    work today, which is the documented trade-off (see `browser_worker_config`'s
+    docstring)."""
+    manager = BrowserManager(tmp_path / "profile", headless=True)
+    handle = manager.ensure_started()
+    try:
+        hermes_home = Path(tempfile.mkdtemp(prefix="jones-cap-browser-e2e-refuse-"))
+        _write_jones_probe_plugin(hermes_home)
+        env_backup = dict(os.environ)
+        os.environ["HERMES_HOME"] = str(hermes_home)
+        os.environ["BROWSER_CDP_URL"] = handle.cdp_http_url
+        try:
+            import agent.agent_runtime_helpers as arh
+            import hermes_cli.plugins as plugins
+            from tools import terminal_tool
+            from tools.approval_context import set_hermes_interactive_context
+
+            manager_ = plugins.get_plugin_manager()
+            manager_.discover_and_load()
+
+            class _StubAgent:
+                session_id = "s-1"
+                _current_turn_id = "tu-1"
+                _current_api_request_id = ""
+                valid_tool_names = {"browser_navigate"}
+                enabled_toolsets = None
+                disabled_toolsets = None
+                _memory_manager = None
+
+            prev_cb = terminal_tool._get_approval_callback()
+            token = set_hermes_interactive_context(True)
+            terminal_tool.set_approval_callback(lambda *a, **k: "allow")
+            try:
+                result = arh.invoke_tool(
+                    _StubAgent(),
+                    "browser_navigate",
+                    {"url": f"{login_site}/secure"},
+                    "t-1",
+                    tool_call_id="c-1",
+                )
+            finally:
+                terminal_tool.set_approval_callback(prev_cb)
+                from tools.approval_context import reset_hermes_interactive_context
+
+                reset_hermes_interactive_context(token)
+            parsed = json.loads(result)
+            assert parsed.get("success") is not True, (
+                "loopback navigation must be refused by Hermes without "
+                f"browser.allow_private_urls, got: {parsed}"
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(env_backup)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(
+    not (_chrome_available() and _hermes_available()),
+    reason="needs a real Chrome AND hermes-agent importable (uv sync --group worker)",
+)
+def test_snapshot_then_click_then_type_covers_the_form_filling_acceptance_bar(
+    tmp_path, login_site
+):
+    """Review finding #5: PRD 12.3 FR09's "导航/读页/点击/填表" acceptance had
+    zero click/type coverage before this test — the report's claim that
+    `browser_snapshot` → ref → `browser_click`/`browser_type` covers "填表" had
+    no run behind it. Drives the real `agent-browser` CLI directly (same level
+    as the other tests in this file, no model needed): snapshot a real form
+    page, resolve a `@ref` from it (`snapshot`'s own JSON:
+    `data.refs.<id> == {"name": ..., "role": ...}` — verified against a real
+    run against this exact fixture, not assumed), type into the field via that
+    ref (`type @e1 <text>`, NOT `find ... type` — that subaction genuinely
+    doesn't exist in agent-browser 0.26.0's CLI, verified the same way), and
+    read the value back via `get value @ref` — the actual composition this
+    branch's report claims works, actually run end to end while writing this
+    test (real Chrome, real agent-browser, this file's own `login_site`
+    fixture's new `/form` route)."""
+    manager = BrowserManager(tmp_path / "profile", headless=True)
+    handle = manager.ensure_started()
+    socket_dir = _short_socket_dir("form")
+    try:
+        _agent_browser_open(handle.cdp_http_url, socket_dir, f"{login_site}/form")
+        snap = _agent_browser_run(handle.cdp_http_url, socket_dir, "snapshot")
+        assert snap.get("success") is True, snap
+        refs = snap.get("data", {}).get("refs", {})
+        name_ref = next((ref for ref, info in refs.items() if info.get("name") == "Name"), None)
+        assert name_ref is not None, f"expected a ref for the Name field, got refs={refs}"
+
+        typed = _agent_browser_run(handle.cdp_http_url, socket_dir, "type", f"@{name_ref}", "Jones")
+        assert typed.get("success") is True, typed
+
+        value = _agent_browser_run(handle.cdp_http_url, socket_dir, "get", "value", f"@{name_ref}")
+        assert value.get("data", {}).get("value") == "Jones", value
     finally:
         manager.shutdown()

@@ -6,6 +6,17 @@
 > 接口契约草案已移到 `docs/design/00-foundation.md` 第 8 节——按 `docs/DEV.md`
 > 目录所有权表，`docs/spikes/` 只承载验证报告，契约的家是 `docs/design/`。
 >
+> **控制者裁定 R-J6（W4/#15-16 第二轮评审，2026-09-19）——本文件已被 §9 的
+> α 裁定取代，只作历史记录保留，不是当前契约**：下面这条「第二轮修订提醒」
+> 说的「控制者裁定 v1 不再由 Jones 自研 `browser.*` 工具集，改为复用现成浏览器
+> MCP Server（Playwright MCP）」本身也已经被推翻——W4/#15-16 又裁定回**方案
+> α**：Hermes 原生 `browser_*` 工具集，CDP attach 到 Jones 自己拉起的专属
+> Chrome（既不是本文件写的「Jones 自研」，也不是「Playwright MCP」）。当前唯一
+> 有效的契约版本是 `docs/design/00-foundation.md` §9（第四轮修订）；本文件
+> (a)/(b)/(c) 三条路径的**实测结论**（CDP attach 技术可行、单实例锁行为、
+> profile 复制的 cookie 类型限制等）仍然成立，不受这次变更影响——变的只是
+> 「这条 CDP 客户端代码由谁写/怎么接」，不是下面这些实测本身。
+>
 > **第二轮修订提醒**：下表「推荐」一栏里 a) CDP attach 的**技术结论**
 > （必须是 Jones 自己拉起、全程不重启的浏览器进程；不能字面接管用户当前
 > Chrome；等等）仍然成立，但**由谁实现这条 CDP 客户端代码**这一点变了——

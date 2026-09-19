@@ -114,38 +114,111 @@ _BROWSER_REVIEW_TOOLS = frozenset(
 _SAFE_URL_SCHEMES = frozenset({"http", "https"})
 
 
+# Round-2 review finding #2: CPython's `ipaddress` module does not classify
+# 100.64.0.0/10 (CGNAT -- what Tailscale/most cloud VPCs hand out) as private/
+# loopback/link-local at all (verified: `ip_address("100.64.1.1").is_private`
+# is `False`) -- Hermes's own `tools/url_safety.py::_is_blocked_ip` explicitly
+# special-cases `_CGNAT_NETWORK` for exactly this reason. `_looks_private_or_
+# loopback` below matches that.
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _parse_loose_ipv4(hostname: str) -> ipaddress.IPv4Address | None:
+    """Round-2 review finding #2/#8: Chrome's URL parser (WHATWG URL "IPv4
+    parser") accepts decimal (`2130706433`), octal (`0177.0.0.1`), hex
+    (`0x7f000001`), and short/"dotted" forms (`127.1`) as spellings of an
+    IPv4 address, and resolves all of them navigating with the browser -- but
+    `ipaddress.ip_address()` (used by `_looks_private_or_loopback` below)
+    raises `ValueError` on every one of them (verified empirically), so a
+    literal-only check using it alone falls through to `False` ("not
+    private") for `http://127.1/`, `http://2130706433/`, `http://0177.0.0.1/`
+    and `http://0x7f000001/` -- all four of which Chrome sends straight to
+    `127.0.0.1`. This is a deliberately loose reimplementation of that
+    algorithm (not a full WHATWG conformance target -- just enough to not be
+    fooled by these four well-known obfuscations); returns `None` for
+    anything that isn't a plausible numeric-IPv4 spelling (an ordinary
+    hostname like `example.com` correctly falls through to `None` here)."""
+    parts = hostname.split(".")
+    if not (1 <= len(parts) <= 4) or any(p == "" for p in parts):
+        return None
+    numbers: list[int] = []
+    for part in parts:
+        digits, radix = part, 10
+        if len(part) >= 2 and part[:2].lower() == "0x":
+            digits, radix = part[2:], 16
+        elif len(part) >= 2 and part[0] == "0":
+            digits, radix = part[1:], 8
+        if digits == "" or not all(c in "0123456789abcdefABCDEF" for c in digits):
+            return None
+        try:
+            value = int(digits, radix)
+        except ValueError:
+            return None
+        if value > 0xFFFFFFFF:
+            return None
+        numbers.append(value)
+    if len(numbers) > 1 and any(n > 0xFF for n in numbers[:-1]):
+        return None
+    last = numbers[-1]
+    if len(numbers) > 1 and last >= 256 ** (5 - len(numbers)):
+        return None
+    ipv4 = last
+    for i, n in enumerate(numbers[:-1]):
+        ipv4 += n * (256 ** (3 - i))
+    try:
+        return ipaddress.IPv4Address(ipv4)
+    except ipaddress.AddressValueError:
+        return None
+
+
 def _looks_private_or_loopback(hostname: str | None) -> bool:
     """Literal-string/IP check only -- no DNS resolution (`classify()` must
     stay synchronous with no I/O). Catches the common literal spellings
-    (`localhost`, `127.0.0.1`, `10.x`, `192.168.x`, link-local, `::1`, ...);
-    does NOT catch a private hostname that only *resolves* to a private
-    address (would need a network lookup this function deliberately doesn't
-    do)."""
+    (`localhost`, `127.0.0.1`, `10.x`, `192.168.x`, link-local, `::1`,
+    IPv4-mapped `::ffff:127.0.0.1`, CGNAT `100.64.0.0/10`, and the decimal/
+    octal/hex/short obfuscated IPv4 spellings a browser's URL parser
+    normalizes -- round-2 finding #2/#8) and does NOT catch a private
+    hostname that only *resolves* to a private address (would need a network
+    lookup this function deliberately doesn't do; `nip.io`-style DNS rebinding
+    is an accepted, documented gap -- see `browser_worker_config`'s docstring
+    for why Hermes's own real DNS-resolving check is the actual backstop for
+    that class, R-J1)."""
     if not hostname:
         return False
     if hostname.lower() == "localhost":
         return True
     try:
-        addr = ipaddress.ip_address(hostname)
+        addr: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(hostname)
     except ValueError:
-        return False
+        loose = _parse_loose_ipv4(hostname)
+        if loose is None:
+            return False
+        addr = loose
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if isinstance(addr, ipaddress.IPv4Address) and addr in _CGNAT_NETWORK:
+        return True
     return addr.is_private or addr.is_loopback or addr.is_link_local
 
 
 def _classify_browser_navigate(args: dict[str, Any]) -> Risk:
-    """Review finding #6 (critical): `capabilities/browser.py::
-    browser_worker_config` forces the worker config `browser.
-    allow_private_urls: true`, which is the ONLY thing gating Hermes's
-    `tools/url_safety.py::_is_safe_url` on a CDP-override backend -- that
-    function is also the only place Hermes rejects a non-http(s) scheme (e.g.
-    `file://`), so this branch's own config change silently disables it for
-    EVERY navigation, not just the private-IP ones the config name suggests.
-    A name-only `low` here (section 9.3's old text) would leave
-    `browser_navigate('file:///Users/x/.ssh/id_rsa')` auto-allowed in auto
-    mode with no `permission.requested` broadcast at all. This function is
-    the compensating control section 9.3 (round-1 fix) now requires: a
-    non-http(s) scheme, or a literal private/loopback host, escalates to the
-    user gate instead of auto-allowing."""
+    """Round-1 fix (review finding #6, critical) + round-2 controller ruling
+    R-J1: `capabilities/browser.py::browser_worker_config` does NOT set
+    `browser.allow_private_urls` (round-2 removed that forced config value --
+    see its docstring for why: the flag has no CDP-attach-scoped variant in
+    this hermes-agent version, and also silently lifts SSRF protection for
+    `web_extract`/vision/skills_hub, not just the browser). Without that flag,
+    Hermes's own `tools/browser_tool.py::_url_policy_error` already refuses a
+    non-http(s) scheme (e.g. `file://`) or a private/loopback navigation
+    target on a CDP-override backend -- so this function's `high` escalation
+    for those cases is DEFENSE IN DEPTH, not the only remaining check it was
+    when finding #6 was first written: it makes sure the user gate visibly
+    flags the attempt (auto/task mode would otherwise silently see only
+    Hermes's own internal refusal, with no `permission.requested` at all, if
+    this classifier had stayed at a name-only `low`) even on a future
+    hermes-agent version, or a future Jones-side patch to the vendored
+    dependency, that narrows the flag to only exempt the CDP attach itself and
+    stops blocking navigation targets outright."""
     url = args.get("url")
     if not isinstance(url, str) or not url:
         return _medium("browser_navigate call with no resolvable url to classify")
@@ -154,14 +227,14 @@ def _classify_browser_navigate(args: dict[str, Any]) -> Risk:
     if scheme not in _SAFE_URL_SCHEMES:
         return _high(
             f"browser_navigate targets a non-http(s) scheme ({scheme or '(none)'!r}) -- "
-            "this branch's forced browser.allow_private_urls disables Hermes's own "
-            "scheme check for this call (review finding #6)"
+            "controller ruling R-J1: never low/medium for this, regardless of what "
+            "Hermes's own url_safety does with this call"
         )
     if _looks_private_or_loopback(parts.hostname):
         return _high(
             f"browser_navigate targets a private/loopback host ({parts.hostname!r}) -- "
-            "this branch's forced browser.allow_private_urls disables Hermes's own "
-            "SSRF check for this call (review finding #6)"
+            "controller ruling R-J1: never low/medium for this, regardless of what "
+            "Hermes's own url_safety does with this call"
         )
     return _low(f"browser_navigate targets a public http(s) url (host={parts.hostname!r})")
 

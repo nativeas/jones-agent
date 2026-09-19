@@ -302,7 +302,7 @@ def test_get_browser_manager_is_a_process_wide_singleton_per_profile(tmp_path):
     assert m1.profile_dir == tmp_path / "browser" / "profile"
 
 
-def test_browser_worker_config_duck_types_ctx_and_lazy_starts(tmp_path, monkeypatch):
+async def test_browser_worker_config_duck_types_ctx_and_lazy_starts(tmp_path, monkeypatch):
     monkeypatch.setattr(browser_module, "_find_chrome_binary", lambda: "fake-chrome-sentinel")
     manager = get_browser_manager(tmp_path)
     manager._spawn = _fake_spawn
@@ -315,18 +315,41 @@ def test_browser_worker_config_duck_types_ctx_and_lazy_starts(tmp_path, monkeypa
     class _CtxWithAttr:
         user_root = tmp_path
 
+    class _FakePaths:
+        @staticmethod
+        def user_root() -> Path:
+            return tmp_path
+
+    class _CtxLikeRealDaemonContext:
+        # Round-2 review finding #10: shaped like the real
+        # `jones_daemon.context.DaemonContext` — a `.paths` attribute that is
+        # itself a module-like object with a `user_root()` callable, and NO
+        # `.user_root` of its own. The pre-fix `getattr(ctx, "user_root", ctx)`
+        # duck-type fell through to `ctx` itself here (neither callable nor a
+        # PathLike), which raised `TypeError` inside `Path(ctx)` instead of the
+        # documented `BrowserLaunchError` contract.
+        paths = _FakePaths
+
     try:
-        cfg1 = browser_worker_config(_CtxWithMethod())
+        cfg1 = await browser_worker_config(_CtxWithMethod())
         assert cfg1["env"]["BROWSER_CDP_URL"].startswith("http://127.0.0.1:")
-        assert cfg1["config_yaml"] == {"browser": {"allow_private_urls": True}}
+        # Controller ruling R-J1 (round-2 review, findings #6/#8/#9): never
+        # force browser.allow_private_urls — that flag also disables Hermes's
+        # own SSRF/scheme checks for web_extract/vision/skills_hub, not just
+        # the browser tools, and a same-origin redirect defeats the
+        # navigate-time compensating control anyway.
+        assert cfg1["config_yaml"] == {}
 
         # A bare Path ctx (what this branch's own probe/E2E tests pass) works too.
-        cfg2 = browser_worker_config(tmp_path)
+        cfg2 = await browser_worker_config(tmp_path)
         assert (
             cfg2["env"]["BROWSER_CDP_URL"] == cfg1["env"]["BROWSER_CDP_URL"]
         ), "reuses the same running Chrome"
 
-        cfg3 = browser_worker_config(_CtxWithAttr())
+        cfg3 = await browser_worker_config(_CtxWithAttr())
         assert cfg3["env"]["BROWSER_CDP_URL"] == cfg1["env"]["BROWSER_CDP_URL"]
+
+        cfg4 = await browser_worker_config(_CtxLikeRealDaemonContext())
+        assert cfg4["env"]["BROWSER_CDP_URL"] == cfg1["env"]["BROWSER_CDP_URL"]
     finally:
         manager.shutdown()

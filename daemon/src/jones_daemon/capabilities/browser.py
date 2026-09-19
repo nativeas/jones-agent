@@ -40,6 +40,7 @@ module never does).
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import signal
@@ -408,7 +409,9 @@ class BrowserManager:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             return  # already gone
-        logger.info("browser: shutting down reattached Jones Chrome", extra={"detail": {"pid": pid}})
+        logger.info(
+            "browser: shutting down reattached Jones Chrome", extra={"detail": {"pid": pid}}
+        )
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             if not _pid_alive(pid):
@@ -466,16 +469,18 @@ def shutdown_all(*, timeout_s: float = DEFAULT_SHUTDOWN_TIMEOUT_S) -> None:
         manager.shutdown(timeout_s=timeout_s)
 
 
-def browser_worker_config(ctx: object, session: object = None) -> dict:
+async def browser_worker_config(ctx: object, session: object = None) -> dict:
     """Env + config.yaml fragment for a worker's Hermes browser_* toolset to
     attach to the Jones Chrome over CDP (03-w4-interfaces.md §4, §1's shared-change
     grant on `workers/manager.py::_prepare_hermes_home` — H calls this once that
     branch lands; until then this report's own tests call it directly).
 
     `ctx` is duck-typed to tolerate whatever shape H's ServiceContext ends up
-    being: a `.user_root` attribute (callable or plain `Path`), OR (in this
-    branch's own tests, and any caller that already has the path) a bare `Path`.
-    `session` is accepted for interface stability but unused: §9 is one
+    being: a `.paths.user_root()` accessor (what the real `DaemonContext`
+    actually has, see below), a `.user_root` attribute (callable or plain
+    `Path`), OR (in this branch's own tests, and any caller that already has
+    the path) a bare `Path`. `session` is accepted for interface stability but
+    unused: §9 is one
     Jones-wide Chrome, not one per session — see the report's "契约变更" section
     for why a later per-session-isolation requirement would need to revisit this
     signature, not silently branch on `session` today.
@@ -489,35 +494,92 @@ def browser_worker_config(ctx: object, session: object = None) -> dict:
     / session start entirely: a Chrome-less machine should still get a working,
     browser-less session.
 
+    **Controller ruling R-J1 (round-2 review, 2026-09-19) — `browser.
+    allow_private_urls` is NEVER set here, on purpose, even though that means
+    `browser_navigate` to `file://`/localhost/private-net targets does not
+    actually work today**: `tools/browser_tool_cloud.py::_is_local_backend()`
+    treats a CDP override as "never local" unconditionally (its own docstring:
+    "A CDP override is never trusted as local"), and
+    `tools/browser_tool.py::_url_policy_error`/`_post_redirect_block` only
+    exempt a navigation target from the private-address/scheme check for
+    `local` backends, the hybrid-cloud "local sidecar" case (not applicable
+    here — this branch never configures a cloud provider), or
+    `browser.allow_private_urls`. There is no narrower flag in this
+    hermes-agent version that frees only the CDP *attach* (the daemon's own
+    `BROWSER_CDP_URL` env, read by `_get_cdp_override_raw()` — completely
+    unrelated to `allow_private_urls`, attach already works with this field
+    absent) without also freeing every *navigation target* from the SSRF/
+    scheme check — round-1's finding #6/#8 showed exactly how far that reaches
+    (a same-origin 302 redirect, or a bare `file://` URL, both auto-allowed in
+    auto/task mode with zero user visibility). Round-2 finding #9 additionally
+    showed the same global flag also lifts `web_extract`/vision/skills_hub's
+    SSRF checks, not just the browser's. Leaving this field unset means: (a)
+    public http(s) navigation works exactly as before; (b) `file://`/
+    localhost/private-net navigation is refused BY HERMES ITSELF (`_url_policy_
+    error` returns its own block, before this module's `permissions/
+    review.py::_classify_browser_navigate` compensating control even gets a
+    chance to matter) — stricter than "ask the user", not merely equivalent to
+    it, until either hermes-agent ships a CDP-attach-scoped variant of this
+    flag or a Jones-side patch to the vendored dependency adds one (out of
+    this branch's scope: hermes-agent is not a directory this repo owns).
+    `review.py`'s escalation-to-high for these URLs stays in place regardless,
+    as defense in depth for the day either of those lands.
+
     **Review finding #12 — two things any caller MUST account for, not just
     "call it"**:
-    1. This function is BLOCKING (`subprocess.Popen` + `urllib.request.urlopen`
+    1. This function is now `async def` (controller ruling R-J4) precisely so
+       callers never have to remember the off-thread wrapper themselves — the
+       actual blocking work (`subprocess.Popen` + `urllib.request.urlopen`
        liveness polling, up to `launch_timeout_s`; ~0.76s measured cold start,
-       10s worst case). A caller on the daemon's asyncio event loop must run it
-       off-thread (e.g. `asyncio.to_thread(browser_worker_config, ...)`) —
-       calling it directly from an `async def` stalls every RPC and
-       `session/update` broadcast in the daemon for the duration (§3/§6's
-       broadcast latency budget).
+       10s worst case) runs via `asyncio.to_thread` inside this function.
+       Calling it with a bare `.ensure_started()`-equivalent synchronous API
+       from the daemon's event loop would stall every RPC and `session/update`
+       broadcast in the daemon for the duration (§3/§6's broadcast latency
+       budget) — this function's signature now makes that mistake impossible
+       to make by accident.
     2. It eagerly launches a headed Chrome window on ITS OWN first call, with
        no regard for whether the calling Agent's tool whitelist even includes
-       any `browser_*` tool — a caller that invokes this unconditionally for
-       every session start will pop a visible Chrome window for every session,
-       browser tools or not. A caller should gate this behind "does this
-       Agent's toolset actually include browser tools", not call it
-       unconditionally.
+       any `browser_*` tool. **Calling contract (controller ruling R-J4)**: a
+       caller MUST NOT invoke this unconditionally at worker-spawn time for
+       every session — it must be invoked lazily, the first time a session
+       that actually has a `browser_*` tool enabled is about to use one. The
+       daemon already has exactly one natural hook for "about to use a
+       browser_* tool" that exists independently of whether H's registry
+       (#17) has landed: `sessions/service.py::_on_request_permission` sees
+       every `browser_*` tool call (via the rule/review gate) before it
+       decides whether to auto-allow it — the recommended call site is there,
+       on the first `browser_*`-tool `request_permission`/rule-gate pass for a
+       session, not at `workers/manager.py`'s worker-spawn path. (H/#17 owns
+       the actual wiring per `03-w4-interfaces.md` §1 — this paragraph is the
+       contract this module commits to, not a claim that the wiring exists
+       yet; see the report's "没做什么".) A machine with no Chrome installed
+       must surface `BrowserLaunchError` as a scoped `hidden_reason=
+       browser_unavailable` + error card for the browser toolset only (§6),
+       never fail the whole worker/session.
     """
     user_root = getattr(ctx, "user_root", ctx)
+    if user_root is ctx:
+        # Review finding #10 (round-2): the real `DaemonContext`
+        # (`daemon/src/jones_daemon/context.py`) has no `user_root` attribute
+        # at all — the real accessor is `ctx.paths.user_root()`
+        # (`jones_daemon.paths` module, see `sessions/service.py:1244`'s
+        # `self.ctx.paths.user_root()` for the call this codebase already
+        # makes elsewhere). Fall back to that shape before falling back to
+        # treating `ctx` itself as the path (what this branch's own tests and
+        # any caller that already has a bare `Path` pass).
+        paths_module = getattr(ctx, "paths", None)
+        candidate = getattr(paths_module, "user_root", None)
+        if callable(candidate):
+            user_root = candidate
     if callable(user_root):
         user_root = user_root()
     manager = get_browser_manager(Path(user_root))
-    handle = manager.ensure_started()
+    handle = await asyncio.to_thread(manager.ensure_started)
     return {
         "env": {"BROWSER_CDP_URL": handle.cdp_http_url},
-        # tools/browser_tool_cloud.py::_is_local_backend: "A CDP override is never
-        # trusted as local (that Chrome may live off-host)" — Jones's Chrome
-        # genuinely is on the same host as the worker, so the SSRF guard on
-        # private/LAN URLs must be explicitly lifted or every intranet/localhost
-        # navigate is blocked (see report "调研结论" for the source citation and
-        # the probe that hit this before this field was added).
-        "config_yaml": {"browser": {"allow_private_urls": True}},
+        # Deliberately NO "browser": {"allow_private_urls": True} here — see
+        # this function's docstring, controller ruling R-J1. Public http(s)
+        # navigation needs no extra config_yaml at all; private/loopback/
+        # non-http(s) targets are refused by Hermes itself.
+        "config_yaml": {},
     }

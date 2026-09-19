@@ -265,7 +265,18 @@ PRD 9.4 审批超时自动拒绝时如实记录，不借用 `rule`（规则闸�
   "会话是否处于宽松审批模式"应该是 Jones 自己 `sessions` 表的 `mode`/`settings_json`，不要跟 Hermes
   这个字段混用，避免未来 Hermes 给 ACP 补上 `/yolo` 等价物时，两套状态互相踩踏。
 
-## 9. FR09 浏览器能力：daemon 内部契约（W4/#15-16 第三轮重写：α 取代 β）
+## 9. FR09 浏览器能力：daemon 内部契约（W4/#15-16 第四轮修订：R-J1/R-J2 控制者裁定收口）
+
+**本节第四轮修订提醒（2026-09-19，第二轮评审后的控制者裁定 R-J1/R-J2，不可推翻）**：
+第三轮文本（α 取代 β）本身不变，但 §9.2 的 `allow_private_urls: true` 强制项和
+§9.3 的 `browser_navigate` 分级描述都需要订正——第二轮评审 finding #6/#8/#9
+发现：(1) 这个开关同时关掉了 Hermes 对**跳转后**目标的 SSRF 复查，一次公网 URL
+→ 302 跳转到内网页面即可绕过；(2) 这个开关的作用域不止浏览器，`web_extract`/
+`vision`/`skills_hub` 的 SSRF 防护也被一并关掉。控制者裁定 R-J1：**本分支绝不
+再设置这个开关**。§9.2/§9.3 下面已按这个裁定改写；`browser_worker_config` 的
+`config_yaml` 现在是空字典，`permissions/review.py::_classify_browser_navigate`
+的用户闸升级从「唯一剩下的闸」降级为「防御性冗余层」（Hermes 自己的
+`_url_policy_error` 现在才是主闸，见 §9.2 新增段落）。
 
 **本节第三轮修订**：上一版（W3 之前）裁定「复用现成浏览器 MCP Server（Playwright
 MCP）+ Jones 专属常驻 Chrome profile」（β）。`03-w4-interfaces.md` §4 把这份裁定重新
@@ -359,16 +370,64 @@ BrowserManager（daemon 内部状态，capabilities/browser.py，非 SQLite 表�
       登录态（这是 FR09「登录一次、持续复用」的字面要求，不是 per-session 隔离）。
 
 worker 侧接线（`capabilities/browser.py::browser_worker_config(ctx, session) -> dict`，
-03-w4-interfaces.md §1 授权 H 的 `_prepare_hermes_home` 调用这个函数）：
-  - 惰性启动 Jones Chrome（`ensure_started()`），返回
-      `{"env": {"BROWSER_CDP_URL": "<http://127.0.0.1:port>"}, "config_yaml":
-      {"browser": {"allow_private_urls": true}}}`。
-  - `allow_private_urls` **是必须项，不是可选优化**：`tools/browser_tool_cloud.py::
-      _is_local_backend()` 的 SSRF 防护把「CDP override」一律当成「可能在别的主机上」
-      （文档字符串原话："A CDP override is never trusted as local"），默认拒绝
-      `browser_navigate` 打到 `127.0.0.1`/私网地址——Jones 的 Chrome 明明和 worker/
-      terminal 同机，不放开这一项会导致每一次打向本机 web 服务、内网站点的导航都被
-      Hermes 自己的 SSRF 闸挡掉（本轮实测踩到过这个错误，见报告）。
+`async def`——见下方「为什么是 async」，03-w4-interfaces.md §1 授权 H 的
+`_prepare_hermes_home` 调用这个函数）：
+  - 惰性启动 Jones Chrome（`ensure_started()`，经 `asyncio.to_thread` 跑在 daemon
+      event loop 之外），返回 `{"env": {"BROWSER_CDP_URL": "<http://127.0.0.1:port>"},
+      "config_yaml": {}}`。
+  - **控制者裁定 R-J1（第二轮评审 finding #6/#8/#9 后，2026-09-19，不可推翻）：
+      `config_yaml` 绝不再写 `browser.allow_private_urls: true`。** 第三轮文本
+      曾要求这个开关，理由是 `tools/browser_tool_cloud.py::_is_local_backend()`
+      的 SSRF 防护把「CDP override」一律当成「可能在别的主机上」（文档字符串原话：
+      "A CDP override is never trusted as local"），默认拒绝 `browser_navigate`
+      打到 `127.0.0.1`/私网地址——这个技术判断没变，但第二轮评审核实到这个开关的
+      真实作用域比文本暗示的大得多，且有一个第三轮文本没写的绕过口子：
+      1. **跳转绕过（finding #8，critical）**：`tools/browser_tool.py::
+         _post_redirect_block` 的私网复查同样看这个开关——开着它，一次公网
+         `browser_navigate('http://attacker.example/x')` 跳转到
+         `http://127.0.0.1:<daemon 自己的端口>/` 或内网管理页，跳转后的内容照样
+         回到模型上下文，`_classify_browser_navigate` 只看模型传入的原始 URL，
+         对这条跳转链路完全无感。
+      2. **作用域外溢（finding #9）**：`tools/url_safety.py::
+         _resolve_allow_private_urls` 把 `browser.allow_private_urls` 当作
+         legacy 别名读取（`HERMES_ALLOW_PRIVATE_URLS` → `security.
+         allow_private_urls` → 这个键），进而影响 `tools/web_tools.py`
+         （`web_extract`）、`tools/vision_tools.py`（图片下载）、
+         `tools/skills_hub.py`、`tools/image_source.py`、
+         `tools/kanban_tools.py` 的 SSRF 检查——不是「浏览器专属」开关。
+      源码核对（`tools/browser_tool_cloud.py::_is_local_backend`/`tools/
+      browser_tool.py::_url_policy_error`/`_post_redirect_block`）确认：这个
+      hermes-agent 版本里，「CDP attach 本身」（daemon 塞进 worker env 的
+      `BROWSER_CDP_URL`，`_get_cdp_override_raw()` 读取）和「导航目标 SSRF/
+      scheme 检查」共用同一个开关，没有更窄的、只放行 attach 控制通道的变体
+      ——attach 这条控制通道本身完全不需要这个开关（它走 env var，跟
+      `allow_private_urls` 无关），需要它的只是「导航到私网/`file://`目标」这
+      一件事，而这正是评审要收紧的那一件事。**后果（诚实写下，不是回避）**：
+      不设置这个开关意味着 `browser_navigate` 到 `file://`/`localhost`/私网地址
+      现在被 Hermes 自己的 `_url_policy_error` 直接拒绝（返回错误，不是「转交
+      用户闸后可以被批准放行」）——比「转用户闸」更严格，直到 hermes-agent 上游
+      给这个开关拆出一个只作用于 CDP attach 的窄变体，或 Jones 自己给这份依赖
+      打一个范围更窄的本地 patch（都不在本分支范围内：`hermes-agent` 不是这个
+      仓库拥有的目录）。`permissions/review.py::_classify_browser_navigate` 对
+      这些 URL 仍然分级 `high`（§9.3 新增条款）——现在是防御性冗余层（等那天真
+      的拆出窄变体了，用户闸的可见批准仍然生效），不再是唯一的闸。
+  - **为什么是 `async`（控制者裁定 R-J4）**：第二轮评审 finding #12 指出
+      `ensure_started()` 是阻塞调用（`subprocess.Popen` + HTTP 轮询，~0.76s 常见、
+      10s 最坏），调用方必须自己记得包一层 `asyncio.to_thread` 才不卡住 daemon
+      event loop——`browser_worker_config` 现在直接是 `async def`，内部自己做
+      `asyncio.to_thread(manager.ensure_started)`，调用方不需要（也不应该）自己
+      再包一层。
+  - **懒启动的触发时机（控制者裁定 R-J4）**：不允许在 worker spawn 时无条件调用
+      这个函数（会给每个 Session 弹一个可见 Chrome 窗口，不管这个 Session 的
+      Agent 有没有启用任何 `browser_*` 工具）。推荐的触发点：`sessions/
+      service.py::_on_request_permission` 已经是「daemon 看到这个 Session 第一次
+      真的要调 `browser_*` 工具」这件事天然发生的地方（规则闸/审查闸都要经过它才
+      能决定放行），H（#17）落地实际接线时应该挂在这里，而不是 worker 启动路径；
+      没有 Chrome 的机器上，`BrowserLaunchError` 必须映射成只针对浏览器工具集的
+      `hidden_reason=browser_unavailable` + 错误卡片，不能让整个 worker/Session
+      失败（本条是 `capabilities/browser.py` 对调用方的契约承诺，实际接线仍然是
+      H 的工作，见 03-w4-interfaces.md §1；本分支没有落地这条接线，见报告
+      「没做什么」）。
   - `session` 参数目前不参与决策（收到但不使用）——FR09 是「一个 Jones 安装一个
     Chrome」，不是 per-session 隔离；如果未来产品要求「每个 Session 独立浏览器身份」，
     需要重新设计这个签名，不能在今天的实现里悄悄按 session 分支。
@@ -399,33 +458,58 @@ Playwright MCP 曾提供的 `browser_fill_form`（原子化表单填写）、`br
 缺口）——本分支不做这一步（不在 §1 授权范围内新增工具语义，只做浏览器进程管理），
 写进报告「没做什么」。
 
-### 9.3 权限分级（按 Hermes 真实工具名重写）
+### 9.3 权限分级（按 Hermes 真实工具名重写；第四轮修订同步 `permissions/
+review.py::classify()` 的真实实现——控制者裁定 R-J2：这份表和那份代码必须
+互相校验，见 `daemon/tests/test_gates_review.py::
+test_section_9_3_table_matches_the_real_classifier`，改一边不改另一边这条测试
+会红）
 
 分级原则不变（PRD FR05 三道闸：机械工具名判定 → 规则闸；需要语义判断 → 审查闸；
 高风险信号 → 用户闸）：
 
-- **规则闸放行**（只读、按工具名机械匹配即可判定）：`browser_navigate`、
-  `browser_snapshot`、`browser_get_images`、`browser_vision`（只读页面理解，不产生
-  副作用）、`browser_console`（`expression=None`/`clear=False` 时是只读读取；带
+- **规则闸放行**（只读、按工具名机械匹配即可判定）：`browser_snapshot`、
+  `browser_get_images`、`browser_vision`（只读页面理解，不产生副作用）、
+  `browser_console`（`expression=None`/`clear=False` 时是只读读取；带
   `expression` 求值时降级到审查闸——工具函数签名本身允许两种用法，机械判定按「是否传
-  了 `expression`」区分，不需要语义判断）。
+  了 `expression`」区分，不需要语义判断）、**`browser_navigate` 仅在目标 URL 通过
+  下面④的机械安全检查时**（scheme ∈ `{http, https}` 且 host 不是字面
+  private/loopback/link-local/CGNAT 地址，含十进制/八进制/十六进制/短点分等解析
+  等价形式与 IPv4-mapped IPv6——`permissions/review.py::
+  _looks_private_or_loopback`/`_parse_loose_ipv4`，round-2 finding #2/#8）——不
+  满足则见④，不是「browser_navigate 无条件规则闸放行」（第三轮文本这里的表述不
+  完整，第四轮改正）。
 - **审查闸**（有副作用或工具名本身不足以判断风险，需要模型看参数/页面上下文）：
   `browser_click`、`browser_type`、`browser_scroll`、`browser_back`、`browser_press`、
-  `browser_console`（带 `expression`）、`browser_dialog`。
-- **用户闸**（审查闸判断满足以下任一条件即标红升级，语义判断来自模型，不是单独的
-  工具名规则——Hermes 原生工具集里没有语义化的「提交表单」工具）：①这次点击/按键实质
-  是提交表单（即将触发导航或向服务器发起写请求）；②任何触发外发的动作；③
-  `browser_console` 求值的表达式含网络请求（`fetch`/`XMLHttpRequest`）或存储写入
-  （`localStorage`/`sessionStorage`/`indexedDB`/写 cookie）。
+  `browser_console`（带 `expression`，且④的网络/存储标记扫描未命中）、`browser_dialog`。
+- **用户闸**（满足以下任一条件即标红升级）：①这次点击/按键实质
+  是提交表单（即将触发导航或向服务器发起写请求）——语义判断来自模型，不是单独的
+  工具名规则，v1 未实现（Hermes 原生工具集里没有语义化的「提交表单」工具，见
+  `classify()` 文档字符串「v1 用规则先满足可测性，模型判断是 W4+ 增强」）；②任何
+  触发外发的动作——同①，语义判断，v1 未实现；③`browser_console` 求值的表达式含
+  网络请求（`fetch`/`XMLHttpRequest`）或存储写入（`localStorage`/`sessionStorage`/
+  `indexedDB`/写 cookie）——**已实现**，`_classify_browser_console` 的字符串标记
+  扫描；④`browser_navigate` 的目标 URL scheme 不是 `http(s)`，或 host 是字面
+  private/loopback/link-local/CGNAT 地址（见上「规则闸放行」的判定细节）——**已
+  实现**，`_classify_browser_navigate`；机械判定，不是语义判断。**控制者裁定
+  R-J1（第二轮评审 finding #6/#8/#9）**：④现在是防御性冗余层，不是唯一的闸——
+  §9.2 已改为不再设置 `browser.allow_private_urls`，这类 URL 首先被 Hermes 自己
+  的 `_url_policy_error` 直接拒绝（比「转用户闸后可批准」更严格），④确保这个拒绝
+  在 auto/task 模式下对用户仍然可见（`permission.requested` 广播），不是静默失败。
 - **恒定用户闸**（工具名本身即代表高风险操作，不经过审查闸的语义判断，直接钉死）：
   `browser_cdp`（原始 CDP 透传——可以执行 `Network.setCookie`、`Input.dispatchMouseEvent`
   等绕过所有语义分级的原语，本轮实测用真实 `invoke_tool()` 验证过插件层能够拦住它，
   见「验证方法」）、`browser_vault_unlock`/`browser_vault_fill`/`browser_vault_save_login`/
   `browser_vault_enter_code`（触碰密码库）。
 - **兜底档**（上面没点名的任何工具——包括未来新版本 hermes-agent 新增的
-  `browser_*` 工具）：一律用户闸（fail-closed）。规则闸的默认映射表在 daemon 启动时
-  与 worker 实际暴露的工具名比对，出现未映射的 `browser_*` 工具名即记 warning 日志并
-  按用户闸处理，不允许「未知即放行」（同 §8.1 的启动自检精神）。
+  `browser_*` 工具）：一律用户闸（fail-closed，`classify()` 的 catch-all 返回
+  `medium`——见本文件顶部/`review.py` 文档字符串：「非 `low` 在 `sessions/
+  service.py::_on_request_permission` 的分支里行为等同 `high`」，`medium` 从不
+  自动放行，语义上就是「用户闸」）。**规则闸的默认映射表在 daemon 启动时与
+  worker 实际暴露的工具名比对，出现未映射的 `browser_*` 工具名即记 warning 日志
+  并按用户闸处理，不允许「未知即放行」**（同 §8.1 的启动自检精神）——这一条
+  在代码里尚未实现（没有启动时的工具名比对/warning 逻辑），只有「未知工具名
+  → `classify()` 兜底 medium」这一半；本分支没有补上启动自检那一半，见报告
+  「没做什么」。
 - **下载**：v1 不支持浏览器下载，与旧 β 文本结论一致；`browser_navigate`/`browser_click`
   触发的下载按触发它的那次调用定级，不低于审查闸。
 - 用户可以在 `permissions.json` 里针对具体 `browser_*` 工具名进一步收紧（例如把

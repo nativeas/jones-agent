@@ -25,7 +25,12 @@ Two independent things:
     `{"success": false, "error": ...}` shape 03-w4-interfaces.md §4 says daemon
     must turn into an explicit `provider_error` card (not implemented by this
     branch — daemon-side RPC error mapping is out of `capabilities/browser.py`'s
-    ownership, see report "没做什么") rather than fail silently.
+    ownership, see report "没做什么") rather than fail silently. Controller
+    ruling R-J5 (round-2 review): this test needs no network and must NOT sit
+    behind the `JONES_E2E` gate the other two tests need — it's only gated on
+    `hermes-agent` being importable at all (the same `_hermes_available()`
+    check every test in this file already uses), same as CI-runnable unit
+    tests elsewhere in this branch.
 """
 
 from __future__ import annotations
@@ -38,9 +43,9 @@ import urllib.request
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
+_needs_jones_e2e = pytest.mark.skipif(
     not os.environ.get("JONES_E2E"),
-    reason="needs real hermes-agent + real network: set JONES_E2E=1 (see module docstring)",
+    reason="needs real network: set JONES_E2E=1 (see module docstring)",
 )
 
 
@@ -56,32 +61,22 @@ def _url_reachable(url: str, timeout_s: float = 8.0) -> bool:
     """Review findings #4/#13: the original `exc.code not in (0,)` check was
     vacuously true for every `HTTPError` (`.code` is never `0`), so 404/410/500
     dead links all counted as "reachable" and this test's PRD 12.3 90% bar
-    could not fail on connection-level success. A HEAD that comes back 405/501
-    (the METHOD itself rejected, not the resource) falls back to a real GET
-    before judging; 403/429 (bot-blocked/rate-limited, but the resource
-    unambiguously exists) still count reachable. Every other 4xx/5xx is a real
-    failure and must NOT be counted."""
+    could not fail on connection-level success. Controller ruling R-J5 (round-2
+    review): count 2xx/3xx ONLY — no exception for a HEAD-rejecting 405/501 or
+    a bot-blocked 403/429; PRD 12.3's bar is meant to catch real dead links, and
+    a laxer definition of "reachable" than "the server answered success" makes
+    the bar easier to pass than what it's supposed to measure."""
     req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "jones-agent-e2e/1"})
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             return 200 <= resp.status < 400
-    except urllib.error.HTTPError as exc:
-        if exc.code in (405, 501):
-            get_req = urllib.request.Request(
-                url, method="GET", headers={"User-Agent": "jones-agent-e2e/1"}
-            )
-            try:
-                with urllib.request.urlopen(get_req, timeout=timeout_s) as resp:
-                    return 200 <= resp.status < 400
-            except urllib.error.HTTPError as get_exc:
-                return get_exc.code in (403, 429)
-            except (urllib.error.URLError, OSError, ValueError):
-                return False
-        return exc.code in (403, 429)
+    except urllib.error.HTTPError:
+        return False
     except (urllib.error.URLError, OSError, ValueError):
         return False
 
 
+@_needs_jones_e2e
 @pytest.mark.skipif(
     not _hermes_available(), reason="hermes-agent not importable (uv sync --group worker)"
 )
@@ -109,6 +104,7 @@ def test_web_search_results_meet_the_citation_reachability_bar():
     )
 
 
+@_needs_jones_e2e
 @pytest.mark.skipif(
     not _hermes_available(), reason="hermes-agent not importable (uv sync --group worker)"
 )

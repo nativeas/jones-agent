@@ -24,7 +24,12 @@ def test_migration_004_seeds_agent_default_with_expected_defaults(conn):
     agent = service.get(DEFAULT_AGENT_ID)
     assert agent["project_id"] is None
     assert agent["tool_allowlist"] == []  # 空 = 全部工具经闸
-    assert agent["skills"] == []
+    # 006_default_agent_research_skill.sql (J, controller ruling R-J5, #16): the
+    # default Agent's skill set now includes Hermes's bundled
+    # `research/grounded-citations` skill on top of 004's original `[]` seed —
+    # this fixture applies every migration, 006 included, so this is the real
+    # post-migration state, not 004's alone (the test's name predates 006).
+    assert agent["skills"] == ["research/grounded-citations"]
     assert agent["model_pref"] == {}
 
 
