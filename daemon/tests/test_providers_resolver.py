@@ -1,9 +1,11 @@
 import json
 import os
+import socket
 from unittest.mock import patch
 
 import pytest
 
+from jones_daemon.providers import resolver as resolver_module
 from jones_daemon.providers.catalog import VENDOR_PRIORITY, VENDORS
 from jones_daemon.providers.resolver import (
     DaemonProviderResolver,
@@ -202,7 +204,16 @@ def test_list_models_does_not_query_the_db(conn, vault):
     resolver.list_models("anthropic")  # must not raise sqlite3.ProgrammingError
 
 
-def test_ollama_live_probe_returns_empty_list_when_unreachable():
-    # No local Ollama server is expected to be running in the test sandbox; the probe must
-    # degrade to an empty list rather than raising.
+def test_ollama_live_probe_returns_empty_list_when_unreachable(monkeypatch):
+    # Round 1 review: this used to assume "no local Ollama server is running in the test
+    # sandbox" — true in CI, false on any dev machine that actually has Ollama up (one of the
+    # six vendors this Issue supports), which turned the test red for reasons unrelated to the
+    # code under test. Point the probe at a port nothing is listening on so "unreachable" is a
+    # condition this test manufactures, not an assumption about the environment.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_socket:
+        probe_socket.bind(("127.0.0.1", 0))
+        closed_port = probe_socket.getsockname()[1]
+    # Socket is closed again by the `with` block above — nothing listens on `closed_port`, so the
+    # probe's connection attempt fails immediately instead of depending on what else is running.
+    monkeypatch.setattr(resolver_module, "_OLLAMA_NATIVE_ROOT", f"http://127.0.0.1:{closed_port}")
     assert _ollama_live_models() == []

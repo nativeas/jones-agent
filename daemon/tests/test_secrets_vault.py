@@ -99,6 +99,50 @@ def test_corrupt_envelope_raises_vault_error_not_silently(tmp_path):
         Vault(path, data_key=_TEST_KEY).get("anthropic")
 
 
+# --- reset(): the explicit recovery path for a vault _read_entries() can no longer read ---------
+# (round 1 review: without this, `set`/`delete` raising VaultError forever on a corrupt file or a
+# rotated Keychain data key was a permanent dead end for BYOK — see providers/methods.py's `force`.)
+
+
+def test_reset_succeeds_on_a_file_get_and_set_cannot_read(tmp_path):
+    path = tmp_path / "vault.enc"
+    path.write_text("not json at all")
+    v = Vault(path, data_key=_TEST_KEY)
+    with pytest.raises(VaultError):
+        v.get("anthropic")  # confirms the file really is unreadable before reset()
+
+    v.reset({"anthropic": "sk-ant-fresh"})
+    assert v.get("anthropic") == "sk-ant-fresh"
+
+
+def test_reset_discards_every_previous_entry_not_just_the_corrupt_file(tmp_path):
+    path = tmp_path / "vault.enc"
+    v = Vault(path, data_key=_TEST_KEY)
+    v.set("anthropic", "key-a")
+    v.set("openai", "key-b")
+
+    v.reset({"deepseek": "key-c"})
+
+    assert set(v.names()) == {"deepseek"}
+    assert v.get("anthropic") is None
+    assert v.get("openai") is None
+    assert v.get("deepseek") == "key-c"
+
+
+def test_reset_recovers_from_the_wrong_data_key_case_too(tmp_path):
+    # The other real-world trigger named in the review: the Keychain item was deleted/migrated
+    # without the machine, so a *new* data key gets generated and the old vault.enc permanently
+    # fails to decrypt (InvalidTag) — not just literal JSON corruption.
+    path = tmp_path / "vault.enc"
+    Vault(path, data_key=_TEST_KEY).set("anthropic", "key-a")
+    new_data_key_vault = Vault(path, data_key=os.urandom(32))
+    with pytest.raises(VaultError, match="decrypt"):
+        new_data_key_vault.get("anthropic")
+
+    new_data_key_vault.reset({"anthropic": "sk-ant-rotated"})
+    assert new_data_key_vault.get("anthropic") == "sk-ant-rotated"
+
+
 # --- data key resolution (JONES_VAULT_KEY test gate) ------------------------------------------
 
 

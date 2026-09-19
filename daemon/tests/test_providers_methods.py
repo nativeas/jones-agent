@@ -7,13 +7,14 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from jones_daemon.logging import JsonLinesFormatter
 from jones_daemon.providers.catalog import VENDORS
 from jones_daemon.providers.methods import register
-from jones_daemon.rpc.errors import INVALID_PARAMS, NOT_FOUND
+from jones_daemon.rpc.errors import INVALID_PARAMS, NOT_FOUND, PROVIDER_ERROR
 from jones_daemon.rpc.server import RpcServer
 from jones_daemon.store.db import connect, run_in_db_thread
 from jones_daemon.store.migrator import apply_pending
@@ -140,6 +141,78 @@ async def test_delete_key_unknown_provider_returns_not_found(server):
     assert response["error"]["code"] == NOT_FOUND
 
 
+# --- round 1 review: a vault that can't be decrypted must not permanently lock BYOK out --------
+
+
+def _corrupt_the_vault(tmp_path: Path) -> None:
+    vault_path = Path(os.environ["JONES_HOME"]) / "secrets" / "vault.enc"
+    assert vault_path.exists(), "corrupt a vault that was never created — test setup bug"
+    vault_path.write_text("not json at all")
+
+
+async def test_set_key_on_unreadable_vault_returns_provider_error_not_internal(server, tmp_path):
+    await _call(
+        server.socket_path, "provider.set_key", {"provider": "anthropic", "key": "sk-ant-abcd1234"}
+    )
+    _corrupt_the_vault(tmp_path)
+
+    response = await _call(
+        server.socket_path, "provider.set_key", {"provider": "openai", "key": "sk-openai-zyx98765"}
+    )
+    assert response["error"]["code"] == PROVIDER_ERROR
+    assert "force=true" in response["error"]["message"]
+
+    # Without force, nothing changed — anthropic's db row is untouched, still has_key=1.
+    list_response = await _call(server.socket_path, "provider.list")
+    row = next(r for r in list_response["result"] if r["provider"] == "anthropic")
+    assert row["has_key"] is True
+
+
+async def test_set_key_force_true_discards_broken_vault_and_recovers(server, tmp_path):
+    await _call(
+        server.socket_path, "provider.set_key", {"provider": "anthropic", "key": "sk-ant-abcd1234"}
+    )
+    _corrupt_the_vault(tmp_path)
+
+    response = await _call(
+        server.socket_path,
+        "provider.set_key",
+        {"provider": "openai", "key": "sk-openai-zyx98765", "force": True},
+    )
+    assert "error" not in response
+    assert response["result"] == {"provider": "openai", "has_key": True, "key_hint": "8765"}
+
+    rows = {r["provider"]: r for r in (await _call(server.socket_path, "provider.list"))["result"]}
+    assert rows["openai"]["has_key"] is True
+    # anthropic's key lived only in the vault that was just discarded — has_key must drop too, or
+    # `providers` would keep claiming a key that exists nowhere (the "db/vault out of sync" state
+    # resolver.py refuses to guess through).
+    assert rows["anthropic"]["has_key"] is False
+
+    # The vault is genuinely usable again — a plain (non-force) set_key now succeeds.
+    followup = await _call(
+        server.socket_path, "provider.set_key", {"provider": "deepseek", "key": "ds-key-abcd"}
+    )
+    assert "error" not in followup
+
+
+async def test_delete_key_on_unreadable_vault_returns_provider_error_not_internal(server, tmp_path):
+    await _call(
+        server.socket_path, "provider.set_key", {"provider": "anthropic", "key": "sk-ant-abcd1234"}
+    )
+    _corrupt_the_vault(tmp_path)
+
+    response = await _call(server.socket_path, "provider.delete_key", {"provider": "anthropic"})
+    assert response["error"]["code"] == PROVIDER_ERROR
+    assert "force=true" in response["error"]["message"]
+
+    # The `providers` row is the authoritative, externally-visible state and is cleared before the
+    # vault write is even attempted — so has_key is already False despite the RPC reporting error.
+    list_response = await _call(server.socket_path, "provider.list")
+    row = next(r for r in list_response["result"] if r["provider"] == "anthropic")
+    assert row["has_key"] is False
+
+
 async def test_model_list_for_known_provider(server):
     response = await _call(server.socket_path, "model.list", {"provider": "deepseek"})
     assert "error" not in response
@@ -153,7 +226,12 @@ async def test_model_list_unknown_provider_returns_not_found(server):
 
 
 async def test_model_list_without_provider_aggregates_catalog(server):
-    response = await _call(server.socket_path, "model.list")
+    # Round 1 review: this used to skip patching the Ollama probe (the `>=` assertion hid a real
+    # failure, but every run still fired a real HTTP request at localhost:11434 — harmless but
+    # adds latency and depends on what's running on the machine). Same fix as
+    # test_list_models_none_aggregates_every_vendor in test_providers_resolver.py.
+    with patch("jones_daemon.providers.resolver._ollama_live_models", return_value=[]):
+        response = await _call(server.socket_path, "model.list")
     assert "error" not in response
     got_providers = {m["provider"] for m in response["result"]}
     assert got_providers >= set(VENDORS) - {"ollama"}  # ollama depends on a live local probe
