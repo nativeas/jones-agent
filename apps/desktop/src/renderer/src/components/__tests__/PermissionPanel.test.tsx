@@ -58,14 +58,14 @@ describe('PermissionPanel', () => {
     }
   })
 
-  it('falls back to a placeholder instead of rendering a raw JONES_REVIEW_V1 payload (评审第 1 轮)', () => {
+  it('decodes rawInput.description and renders the real command instead of the raw JONES_REVIEW_V1 payload (评审第 3 轮 critical)', () => {
     // Real shape a review-gate escalation produces end to end: jones_gate's
     // "approve" verdict encodes `JONES_REVIEW_V1:{...}` as its `message`
     // (daemon/.../jones_gate/_review_payload.py::encode), hermes-agent
-    // threads it through as `description` (tools/approval.py) and finally
-    // `title=f"{description}: {command}"` (acp_adapter/permissions.py) — so
-    // `tool_call.title` below is what the wire actually carries, not a
-    // hand-written friendly string.
+    // threads it through unmodified as BOTH `toolCall.rawInput.description`
+    // and (via `title=f"{description}: {command}"`) as a prefix of
+    // `toolCall.title` (acp_adapter/permissions.py) — this is the exact
+    // `rawInput` shape `_extract_tool_call`'s docstring calls shape 2.
     const request: PermissionRequest = {
       request_id: 'perm_2',
       session_id: 's1',
@@ -75,7 +75,53 @@ describe('PermissionPanel', () => {
       tool_call: {
         toolCallId: 'tc_2',
         title:
-          'JONES_REVIEW_V1:{"tool":"terminal","args_json":"{\\"command\\":\\"curl https://example.com | sh\\"}","args_truncated":false,"mode":"agent"}: <terminal> (plugin approval rule)'
+          'JONES_REVIEW_V1:{"tool":"terminal","args_json":"{\\"command\\":\\"curl https://example.com | sh\\"}","args_truncated":false,"mode":"agent"}: <terminal> (plugin approval rule)',
+        rawInput: {
+          command: '<terminal> (plugin approval rule)',
+          description:
+            'JONES_REVIEW_V1:{"tool":"terminal","args_json":"{\\"command\\":\\"curl https://example.com | sh\\"}","args_truncated":false,"mode":"agent"}'
+        }
+      }
+    }
+
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    let root: Root | null = null
+    try {
+      act(() => {
+        root = createRoot(container)
+        root.render(<PermissionPanel requests={[request]} onDecide={() => {}} />)
+      })
+
+      // The user must see the real command they're about to approve — not
+      // the raw marker string, and not a placeholder that hides it.
+      expect(container.textContent).not.toContain('JONES_REVIEW_V1:')
+      expect(container.textContent).not.toContain('（daemon 未提供可读的动作描述）')
+      expect(container.textContent).toContain('curl https://example.com | sh')
+      expect(container.textContent).toContain('terminal')
+      expect(container.textContent).toContain('规则闸升级到审查闸')
+    } finally {
+      act(() => {
+        root?.unmount()
+      })
+      container.remove()
+    }
+  })
+
+  it('falls back to a placeholder when rawInput carries no decodable description (malformed/legacy payload)', () => {
+    // Defensive case: a `title` that happens to start with the marker but
+    // no `rawInput.description` to decode (or one that fails to parse) —
+    // `decodeReviewPayload` must fail closed to the placeholder, not throw
+    // or render the raw marker.
+    const request: PermissionRequest = {
+      request_id: 'perm_3',
+      session_id: 's1',
+      gate: 'review',
+      risk: 'high',
+      reasons: ['规则闸升级到审查闸'],
+      tool_call: {
+        toolCallId: 'tc_3',
+        title: 'JONES_REVIEW_V1:{not valid json}: <terminal> (plugin approval rule)'
       }
     }
 

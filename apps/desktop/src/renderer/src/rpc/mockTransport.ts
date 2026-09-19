@@ -498,7 +498,7 @@ export class MockTransport implements RpcTransport {
       run_id: runId,
       seq: 1,
       tool: 'read_file',
-      args_summary: 'path=README.md',
+      args: { path: 'README.md' },
       result_summary: null,
       duration_ms: null,
       status: 'running'
