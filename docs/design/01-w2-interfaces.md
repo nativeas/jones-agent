@@ -149,6 +149,28 @@ class ConfigResolver(Protocol):
 - `agents/`：Agent 定义落 `<user_root>/agents/<id>/agent.yaml`（项目级在 `<path>/.jones/agents/<id>/`），`agents` 表是索引（同步策略：文件为事实源，启动与 `agent.upsert` 时同步入表）；RPC `agent.*`。内置默认 Agent `agent_default`（人设最小、白名单为空=全部工具经闸、模型偏好 None）。
 - 004 迁移：补全 A 在 002 里 seed 的 `proj_default`（path = 用户 home）/`agent_default` 的字段；`settings_json` 结构由 C 定义并写在本节。
 
+### 4.1 `settings.json` / `permissions.json` / `mcp.json` 结构（C 补充，2026-09-19，实现见 `daemon/src/jones_daemon/config/`）
+
+三份 JSON 都是普通文件（PRD §10.2/§10.3），不是 SQLite 行；`projects.settings_json` 列只是项目级 `settings.json` 的**只读缓存索引**（`settings.set` 写文件后同步一份，供 `SELECT` 直接读，不必每次开文件），事实源仍是文件本身。
+
+**`settings.json`**（用户级 `~/.jones/config/settings.json`，项目级 `<project>/.jones/settings.json`）：纯 key 覆盖合并（`dict.update`），项目级同名 key 整体覆盖用户级。内置默认值（`config/resolver.py::DEFAULT_SETTINGS`，即使两级都没有 `settings.json` 也保证存在）：
+
+```jsonc
+{
+  "default_mode": "task",          // chat | task | auto，PRD 9.1
+  "default_agent_id": "agent_default", // 项目级覆盖此 key = "项目级 Agent 覆盖用户级"（FR03）的落地方式，
+                                        // 见 agents/service.py 模块注释：不是同 id 跨作用域遮蔽，是指针换绑
+  "concurrency_limit": 4,
+  "approval_timeout_minutes": null // null = 不超时（PRD 9.4 默认）
+}
+```
+
+**`permissions.json`**（同上两级路径）：`{"rules": [{"match": string, "action": "allow" | "deny"}]}`。`match` 是这条规则管的动作的不透明标识（工具名或命令前缀字符串，W2 不做 glob/正则重叠判定——裁决引擎是 W3 FR05 的范围，这里只做"两条规则是否管同一件事"的 key 相等比较）。合并规则（PRD 10.1 / G14 / N11）：以 `match` 为键，项目级条目能覆盖用户级**当且仅当不是把一个用户级 `deny` 改成 `allow`**；试图这样做的条目被丢弃（不生效、不报错）并产出一条 warning（`ConfigResolver.permissions()` 返回值里的 `warnings` 元组 + 同时写 daemon 日志）。其它情况（新增规则、重申同一 `action`、收紧 `allow`→`deny`）都按项目级覆盖生效。
+
+**`mcp.json`**（同上两级路径）：`{"servers": [{"name": string, ...}]}`。**不是权限**，没有收紧限制——按 `name` 覆盖合并，项目级同名条目整体替换用户级条目，新 `name` 直接追加。
+
+**已知的一个开放解读**（写在此处供评审）：PRD FR03"项目级 Agent 覆盖用户级"没有规定"覆盖"在 Agent 的表结构里怎么表示——`agents.id` 是全局唯一 ULID（§5），不支持"同一个 id 在两个作用域各一行"。C 的实现把它落到 `settings.json` 的 `default_agent_id` 指针上（项目 settings.json 把默认 Agent 指向一个项目专属 Agent，而不是"同 id 遮蔽"）；如果评审认为 PRD 原意是别的形状（例如按名字覆盖），需要改的是这里的 schema，不是 `agents` 表结构。
+
 ## 5. D：桌面 UI（#5）
 
 只依赖 RPC v0 与通知（§4 of 00-foundation）。在 renderer 内实现 `RpcTransport` 接口 + `MockTransport`（vitest 与 `pnpm dev:mock` 用），真实实现走 `window.jones.rpc`。

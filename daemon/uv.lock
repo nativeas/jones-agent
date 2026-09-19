@@ -262,7 +262,7 @@ wheels = [
 [[package]]
 name = "hermes-agent"
 version = "0.21.2"
-source = { editable = "../../../../../../../../../../Users/nativeas/.hermes/hermes-agent" }
+source = { editable = "../../../.hermes/hermes-agent" }
 dependencies = [
     { name = "certifi" },
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'" },
@@ -602,6 +602,7 @@ source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
     { name = "keyring" },
+    { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
@@ -618,6 +619,7 @@ worker = [
 requires-dist = [
     { name = "cryptography", specifier = ">=50.0.0" },
     { name = "keyring", specifier = ">=25.7.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -626,7 +628,7 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "ruff", specifier = ">=0.7" },
 ]
-worker = [{ name = "hermes-agent", extras = ["acp"], editable = "../../../../../../../../../../Users/nativeas/.hermes/hermes-agent" }]
+worker = [{ name = "hermes-agent", extras = ["acp"], editable = "../../../.hermes/hermes-agent" }]
 
 [[package]]
 name = "keyring"

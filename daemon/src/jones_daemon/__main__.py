@@ -18,8 +18,13 @@ import sys
 from typing import TextIO
 
 from jones_daemon import paths
-from jones_daemon.context import DaemonContext, NullConfigResolver
+from jones_daemon.agents.methods import register as register_agents
+from jones_daemon.config.methods import register as register_config
+from jones_daemon.config.resolver import DefaultConfigResolver
+from jones_daemon.context import DaemonContext
 from jones_daemon.logging import configure_logging, get_logger
+from jones_daemon.projects.bootstrap import bootstrap_projects_and_agents
+from jones_daemon.projects.methods import register as register_projects
 from jones_daemon.providers import methods as providers_methods
 from jones_daemon.providers.resolver import DaemonProviderResolver
 from jones_daemon.rpc.methods import register_builtin_methods
@@ -96,24 +101,30 @@ async def _run() -> None:
         conn, version = await run_in_db_thread(_open_store)
         logger.info("store ready", extra={"detail": {"schema_version": version}})
 
+        # C (#8 #9): default Project/Agent bootstrap — the logic itself lives in
+        # projects/bootstrap.py (C's own package), not here; see that module's
+        # docstring for why. Must run on the DB thread, before the RPC server
+        # starts accepting connections.
+        await run_in_db_thread(bootstrap_projects_and_agents, conn)
+
         server = RpcServer(paths.sock_file())
         register_builtin_methods(server)
 
-        # Real `DaemonContext` (docs/design/01-w2-interfaces.md §1). `providers` is
-        # B/#7's real `DaemonProviderResolver` (landed on main) — no `Null*` stand-in
-        # needed there anymore. `config` stays `NullConfigResolver` until C (#8/#9)
-        # lands `config/resolver.py`; A/B only ever pass it through untouched (see
-        # `NullConfigResolver`'s docstring in context.py), so a Null value here is
-        # honest, not a fabrication.
+        # Real `DaemonContext` (docs/design/01-w2-interfaces.md §1): B/#7's
+        # `DaemonProviderResolver` and C/#8#9's `DefaultConfigResolver`, shared by
+        # every module's register().
         vault = build_default_vault(paths.secrets_dir())
         ctx = DaemonContext(
             db=conn,
             paths=paths,
             server=server,
             providers=DaemonProviderResolver(conn, vault),
-            config=NullConfigResolver(),
+            config=DefaultConfigResolver(conn),
         )
         providers_methods.register(server, ctx)
+        register_config(server, ctx)
+        register_projects(server, ctx)
+        register_agents(server, ctx)
         session_service = sessions_methods.register(server, ctx)
         await session_service.startup()
         await server.start()
