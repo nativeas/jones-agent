@@ -176,6 +176,32 @@ def _extract_tool_call(params: dict[str, Any]) -> tuple[str, dict[str, Any], str
     return "", {}, None
 
 
+# Round 1 fix (2026-09-19, review finding #7): `newText`/`oldText` here are
+# not a unified diff, they're the WHOLE file's contents (Hermes's own
+# `write_file`/`patch` ACP adapter passes the full post-write text, not a
+# diff — see `_extract_diff_content`'s docstring). Left unbounded, one large
+# file write turns `_handle_tool_call_update`'s `json.dumps(to_dump, ...)`
+# (line ~1232, runs SYNCHRONOUSLY on the ACP read loop thread — CPython's C
+# json encoder holds the GIL for the entire call) into a multi-MB blocking
+# call, exactly the cost 02-w3-interfaces.md §3's "回放 payload 写入异步、不
+# 阻塞 ACP 读循环" mandate exists to avoid, and grows both `steps.
+# result_summary` and the on-disk replay payload (`replay/store.py::
+# write_payload`, itself uncapped) without limit — including the full
+# plaintext of any `.env`/credentials file written this way, where before
+# this branch only a short `rawOutput` summary ever reached either place.
+# Capped at the same order of magnitude `result_summary`'s own truncation
+# already uses a few lines below (4000 chars) — `"truncated": True` recorded
+# alongside so replay/UI can say so rather than silently showing a partial
+# file as if it were the whole thing.
+_DIFF_TEXT_MAX_CHARS = 4000
+
+
+def _truncate_diff_text(text: str) -> tuple[str, bool]:
+    if len(text) <= _DIFF_TEXT_MAX_CHARS:
+        return text, False
+    return text[:_DIFF_TEXT_MAX_CHARS], True
+
+
 def _extract_diff_content(content: Any) -> dict[str, Any] | None:
     """Find an ACP diff-kind `ToolCallContent` block (`{"type": "diff",
     "path": ..., "newText": ..., "oldText": ...}` — the wire shape of the
@@ -214,12 +240,21 @@ def _extract_diff_content(content: Any) -> dict[str, Any] | None:
         path = block.get("path")
         if not isinstance(path, str) or not path:
             continue
-        new_text = block.get("newText")
-        return {
-            "path": path,
-            "old_text": block.get("oldText"),
-            "new_text": new_text if isinstance(new_text, str) else "",
-        }
+        new_text_raw = block.get("newText")
+        new_text, new_truncated = _truncate_diff_text(
+            new_text_raw if isinstance(new_text_raw, str) else ""
+        )
+        old_text_raw = block.get("oldText")
+        old_truncated = False
+        old_text: str | None
+        if isinstance(old_text_raw, str):
+            old_text, old_truncated = _truncate_diff_text(old_text_raw)
+        else:
+            old_text = None
+        result: dict[str, Any] = {"path": path, "old_text": old_text, "new_text": new_text}
+        if new_truncated or old_truncated:
+            result["truncated"] = True
+        return result
     return None
 
 

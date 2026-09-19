@@ -172,12 +172,31 @@ def _workspace_root_too_wide(root: Path) -> bool:
     return _is_relative_to(home, root)
 
 
-def _classify_path_access(path: Any, *, cwd: str | None, verb: str) -> Risk:
+def _classify_path_access(
+    path: Any, *, cwd: str | None, verb: str, escalate_too_wide_workspace: bool = True
+) -> Risk:
     """Shared "which real filesystem location does this touch" reasoning for
     both a write-family call (`_classify_write`) and, since Issue #13/#14
     (G15) found read_file/search_files needed the identical judgment (see
     `_classify_read`'s docstring for why), a read-family one too. `verb` only
-    varies the wording of the "no resolvable path" fallback message."""
+    varies the wording of the "no resolvable path" fallback message.
+
+    Round 1 fix (2026-09-19, review finding #3): `escalate_too_wide_workspace`
+    controls whether "the workspace root IS $HOME (today's placeholder
+    Project boundary, 01-w2-interfaces.md §2.2)" downgrades an otherwise-`low`
+    result to `medium`. This step exists to bound WRITE risk — an over-wide
+    workspace means "could write anywhere in $HOME", which is worth a second
+    look regardless of which single path was named. It does not carry over to
+    a single-file READ: `read_file` only ever discloses the ONE path it was
+    given, which the sensitive-root check just above and the
+    escapes-the-workspace check just below already bound; degrading it to
+    `medium` too made EVERY `read_file` call medium under today's $HOME
+    placeholder (nothing under $HOME can ever be "narrow enough"), which
+    forced a `permission.requested` user-gate stop on every single read in
+    task/auto mode — a direct violation of PRD 9.1's "任务模式：只读工具直接
+    放行" and G06 (see `_classify_read`'s `directory_scope` parameter for
+    which callers pass which value, and why `search_files` keeps the
+    escalation on)."""
     if not isinstance(path, str) or not path:
         return _medium(f"{verb} tool call with no resolvable path")
     try:
@@ -208,7 +227,7 @@ def _classify_path_access(path: Any, *, cwd: str | None, verb: str) -> Risk:
     except OSError:
         return _high(f"could not resolve workspace root {cwd!r} to classify {path!r}")
 
-    if _workspace_root_too_wide(root):
+    if escalate_too_wide_workspace and _workspace_root_too_wide(root):
         return _medium(
             f"workspace root {cwd!r} is the user's home directory (or an ancestor of it) — "
             "'inside the workspace' can't be treated as a low-risk boundary here (the "
@@ -224,30 +243,54 @@ def _classify_write(path: Any, *, cwd: str | None) -> Risk:
     return _classify_path_access(path, cwd=cwd, verb="write-family")
 
 
-def _classify_read(path: Any, *, cwd: str | None) -> Risk:
+def _classify_read(path: Any, *, cwd: str | None, directory_scope: bool) -> Risk:
     """Issue #13/#14 (G15): `read_file`/`search_files` used to be
     unconditionally `_low` (via `_READ_ONLY_LOW`) regardless of `path` — a
     sensitive-path read (or one outside the Project workspace, FR07's "越界
     路径走权限闸") was silently auto-allowed in auto/task mode with no
     user-gate visibility at all. Read and write share the exact same "which
     real filesystem location does this touch" question, so this reuses
-    `_classify_write`'s reasoning verbatim via `_classify_path_access`
-    rather than a second, independent implementation. `search_files`'s
-    `path` argument is a directory/glob root rather than a single file, but
-    the same containment reasoning applies unchanged — see 00-foundation.md
-    §3's file-tools contract for that tool's schema (both use `path` as the
-    argument name, verified against `hermes-agent`'s
-    `acp_adapter/tools.py::extract_locations`/`_START_CONTENT_BUILDERS`,
-    which read `arguments.get("path")` generically for every file tool). A
-    call with no `path` at all (e.g. a directory-less `search_files`
-    defaulting to the whole workspace) degrades to `_low` here rather than
-    `_medium`/`_high` — unlike a write-family call missing a path (which is
-    always a malformed call worth flagging), "search the whole workspace" is
-    `search_files`'s own documented default, not evidence of anything
-    suspicious."""
+    `_classify_write`'s reasoning via `_classify_path_access` rather than a
+    second, independent implementation.
+
+    `directory_scope` (round 1 fix, review findings #2/#3/#5/#6) is the one
+    place read and write genuinely diverge, and it is NOT a knob a caller
+    picks freely — it is `tool_name == "search_files"`, set by `classify()`:
+    - `read_file` (`directory_scope=False`): the `path` names exactly the one
+      file that will be disclosed. The sensitive-root check bounds that, and
+      the escapes-the-workspace check bounds it further; there is nothing
+      left for a "workspace too wide" downgrade to protect against, so it's
+      skipped — see `_classify_path_access`'s docstring for why leaving it on
+      broke PRD 9.1/G06 for ordinary reads under today's $HOME placeholder.
+    - `search_files` (`directory_scope=True`): the `path` is a ROOT the tool
+      recursively walks and greps — unlike a single file, a directory can
+      CONTAIN a sensitive root (`~/.ssh` is *under* `~`, not equal to it) that
+      the sensitive-root check alone would never catch, because that check
+      only fires when the resolved path IS (or is under) a sensitive root,
+      not the reverse. Keeping the "workspace too wide" escalation on is what
+      stops `search_files` with `path="."` at today's $HOME-cwd placeholder
+      from grepping the entire home directory — including `~/.ssh`,
+      `~/.aws`, `~/.jones/secrets` — at `low` risk (review finding #5's exact
+      repro). It only reaches `medium`, not `high`, because this is a
+      structural "the scope is too broad to bound" signal, not proof the
+      search actually touched a sensitive file — same non-`low` floor
+      `_classify_path_access` already uses for "no resolvable path"/"unknown
+      workspace", just for a different reason.
+
+    A missing/blank `path` is no longer special-cased to `_low` here (review
+    findings #2/#5: that made "omit the argument entirely" the single
+    lowest-risk way to call `search_files`, strictly safer than passing its
+    own documented default `"."` explicitly) — `classify()` now substitutes
+    `"."` before calling this function at all, so a missing path and an
+    explicit `path="."` are the exact same call by the time it gets here.
+    The `isinstance` guard below is a defensive fallback for a hypothetical
+    future caller that skips that substitution, not a path any current input
+    reaches."""
     if not isinstance(path, str) or not path:
-        return _low("read-only call with no specific path to classify")
-    return _classify_path_access(path, cwd=cwd, verb="read-family")
+        return _medium("read-family tool call with no resolvable path")
+    return _classify_path_access(
+        path, cwd=cwd, verb="read-family", escalate_too_wide_workspace=directory_scope
+    )
 
 
 _PRIVILEGE_ESCALATION_PROGRAMS = frozenset({"sudo", "doas", "su", "pkexec"})
@@ -262,7 +305,7 @@ _GIT_MUTATING_SUBCOMMANDS = frozenset({
 })
 
 
-def _classify_terminal(args: dict[str, Any]) -> Risk:
+def _classify_terminal(args: dict[str, Any], *, cwd: str | None) -> Risk:
     # Round 5 (controller ruling R5/R7, 2026-09-19): the FIRST thing this
     # function does is the same `transparency(command)` judgment the rule
     # gate's allow fast path uses (`kernel/plugin/jones_gate/_rules.py`) —
@@ -315,11 +358,16 @@ def _classify_terminal(args: dict[str, Any]) -> Risk:
         return _high("could not parse this command for risk analysis")
     # Issue #13/#14 (G15): a `plain` command can still reference one of
     # `permissions/defaults.py`'s default-deny sensitive locations by an
-    # absolute or `~`-expanded path token (`cat ~/.ssh/id_rsa`) without
-    # tripping any operator/quoting-based `opaque` signal — checked before
-    # the network-egress/mutation checks below since touching a sensitive
-    # location is the more specific, more important reason to escalate.
-    sensitive_root = _terminal_token_sensitive_root(tokens)
+    # absolute, `~`-expanded, OR workspace-relative path token (`cat
+    # ~/.ssh/id_rsa` as much as plain `cat .ssh/id_rsa` when `cwd` is
+    # $HOME — round 1 fix, review findings #1/#6: a relative token used to
+    # `continue` past this check untested, so the exact same target the `~`
+    # form correctly caught was silently `low` when spelled without the
+    # `~`) without tripping any operator/quoting-based `opaque` signal —
+    # checked before the network-egress/mutation checks below since
+    # touching a sensitive location is the more specific, more important
+    # reason to escalate.
+    sensitive_root = _terminal_token_sensitive_root(tokens, cwd=cwd)
     if sensitive_root is not None:
         return _high(
             f"command references a default-deny sensitive location ({sensitive_root}) — "
@@ -379,24 +427,37 @@ def _classify_terminal(args: dict[str, Any]) -> Risk:
     )
 
 
-def _terminal_token_sensitive_root(tokens: list[str]) -> Path | None:
+def _terminal_token_sensitive_root(tokens: list[str], *, cwd: str | None) -> Path | None:
     """Does any token in a `terminal` command's flat token stream, once
-    `~`-expanded, resolve under a `permissions/defaults.py` default-deny
-    root? Only absolute-after-expansion tokens are checked (no `cwd`
-    threading into `_classify_terminal`'s signature for this — the
-    realistic G15 shape, `cat ~/.ssh/id_rsa`, always uses `~` or an already-
-    absolute path; a relative reference would additionally need the
-    session's workspace root, adding complexity for a case this function
-    deliberately leaves to the existing "escapes the project workspace"
-    reasoning `_classify_read`/`_classify_write` already cover for the
-    file-tool equivalents of the same access)."""
+    `~`-expanded (and, for a still-relative token, resolved against `cwd`),
+    resolve under a `permissions/defaults.py` default-deny root?
+
+    Round 1 fix (2026-09-19, review findings #1/#6): this used to `continue`
+    past any token that was still relative after `~`-expansion, reasoning
+    that the realistic G15 shape always uses `~` or an already-absolute
+    path — that was wrong on the exact case that matters most: the DEFAULT
+    Project's `cwd` IS `$HOME` (01-w2-interfaces.md §2.2's documented
+    placeholder), so `cat .ssh/id_rsa` run from it targets the identical
+    file `cat ~/.ssh/id_rsa` does, with neither a `~` nor a leading `/` in
+    the command text to catch. Mirrors the three-line "expand relative
+    against cwd" step `_classify_path_access` already does for the
+    file-tool equivalent of this same access, rather than a second,
+    independent implementation of it. A token that's still relative with no
+    `cwd` available is left unresolved (skipped, as before) — with no
+    workspace root to resolve against there's nothing more specific to
+    check here than the plain-command `low` default already gives it."""
     for tok in tokens:
         try:
             candidate = Path(tok).expanduser()
         except (OSError, ValueError):
             continue
         if not candidate.is_absolute():
-            continue
+            if cwd is None:
+                continue
+            try:
+                candidate = Path(cwd).expanduser() / candidate
+            except (OSError, ValueError):
+                continue
         try:
             resolved = candidate.resolve(strict=False)
         except OSError:
@@ -427,11 +488,21 @@ def classify(tool_name: str, args: dict[str, Any] | None, *, cwd: str | None = N
     if tool_name in _READ_ONLY_LOW:
         return _low(f"{tool_name} is read-only")
     if tool_name in ("read_file", "search_files"):
-        return _classify_read(args.get("path"), cwd=cwd)
+        # Round 1 fix (review findings #2/#5): a missing/blank `path` is
+        # substituted with `search_files`'s own documented default (`"."`,
+        # verified against Hermes's `SEARCH_FILES_SCHEMA`) BEFORE
+        # classification, not treated as a special always-`low` case inside
+        # `_classify_read` — see that function's docstring for why "the
+        # caller didn't say" must never be a lower-risk signal than "the
+        # caller said the default explicitly".
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            path = "."
+        return _classify_read(path, cwd=cwd, directory_scope=tool_name == "search_files")
     if tool_name in ("write_file", "patch"):
         return _classify_write(args.get("path"), cwd=cwd)
     if tool_name == "terminal":
-        return _classify_terminal(args)
+        return _classify_terminal(args, cwd=cwd)
     if tool_name == "browser_evaluate":
         return _classify_browser_evaluate(args)
     if tool_name in _BROWSER_REVIEW_TOOLS:

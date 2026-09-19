@@ -152,17 +152,25 @@ async def test_auto_mode_low_risk_auto_allows_with_no_pending_broadcast(tmp_path
     service = await _make_service(tmp_path, monkeypatch)
     try:
         session_id = await _new_session(service, mode="auto")
-        # `browser_navigate` (unconditionally `low`, no path/cwd involved) rather
-        # than `read_file`: Issue #13/#14 (G15) made `read_file`'s risk depend on
-        # `path` vs. the session's workspace root, and the DEFAULT project's cwd
-        # is still the placeholder `Path.home()` (01-w2-interfaces.md §2.2) — a
-        # root `permissions/review.py::_workspace_root_too_wide` always treats as
-        # "too wide to mean anything by 'inside the workspace'", so no `read_file`
-        # path is ever genuinely `low` here until a real Project cwd lands
-        # (see tests/test_cap_files_g15.py for the read_file-specific coverage
-        # this correction exists for).
+        # `read_file` on an ordinary, non-sensitive path — round 1 fix
+        # (review finding #3): a prior version of this branch made
+        # `_classify_read` share `_classify_write`'s "workspace root too
+        # wide -> medium" escalation unconditionally, which meant NO
+        # `read_file` call was ever genuinely `low` under the DEFAULT
+        # project's placeholder cwd (`Path.home()`, 01-w2-interfaces.md
+        # §2.2) — this test used `browser_navigate` instead to stay green
+        # (see git history), which silently stopped covering PRD 9.1's
+        # "任务模式: 只读工具直接放行" / G06 for the tool it actually names.
+        # `read_file` now skips that escalation (single-file reads are
+        # already bounded by the sensitive-path and escapes-workspace
+        # checks — see `permissions/review.py::_classify_read`'s
+        # docstring), so this is `read_file` again. The default Project's
+        # real `cwd` is the actual `Path.home()` (not `tmp_path` — see
+        # `_make_service`'s `bootstrap_projects_and_agents` call above),
+        # so the path must be a subpath of it to land `low` rather than
+        # `high` ("escapes the project workspace").
         prompt = _custom_permission_prompt(
-            "browser_navigate", {"url": "https://example.com"}, mode="auto"
+            "read_file", {"path": f"{Path.home()}/project/src/main.py"}, mode="auto"
         )
         await service.send(session_id, prompt)
         await _wait_until(
@@ -213,9 +221,10 @@ async def test_task_mode_low_risk_auto_allows_with_no_pending_broadcast_G06(tmp_
     try:
         session_id = await _new_session(service, mode="task")
         # See test_auto_mode_low_risk_auto_allows_with_no_pending_broadcast's
-        # comment just above for why `browser_navigate`, not `read_file`.
+        # comment just above for why this is `read_file` again, not
+        # `browser_navigate`.
         prompt = _custom_permission_prompt(
-            "browser_navigate", {"url": "https://example.com"}, mode="task"
+            "read_file", {"path": f"{Path.home()}/project/src/main.py"}, mode="task"
         )
         await service.send(session_id, prompt)
         await _wait_until(

@@ -25,8 +25,16 @@ def test_read_file_with_unknown_workspace_is_medium_not_low():
     assert risk.level == "medium"
 
 
-def test_search_files_is_low_risk():
-    assert classify("search_files", {"pattern": "*.py"}).level == "low"
+def test_search_files_with_no_path_is_medium_not_low():
+    # Round 1 fix (review findings #2/#5): a missing `path` used to be a
+    # special always-`low` case — strictly SAFER than `search_files`' own
+    # documented default (`path="."`) classified explicitly, which already
+    # went through the same "which real filesystem location does this
+    # touch" reasoning as a write. `classify()` now substitutes `"."` first,
+    # so omitting the argument can never again be the lowest-risk way to
+    # call this tool (see tests/test_cap_files_g15.py for the fuller
+    # coverage this fix needed, including the $HOME-placeholder repro).
+    assert classify("search_files", {"pattern": "*.py"}).level == "medium"
 
 
 def test_browser_navigate_is_low_risk():

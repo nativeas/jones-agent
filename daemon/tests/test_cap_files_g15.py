@@ -132,11 +132,53 @@ def test_read_file_outside_workspace_is_high_fr07(tmp_path):
     assert risk.level == "high"
 
 
-def test_search_files_with_no_path_defaults_to_low():
-    # search_files with no `path` searches the whole workspace by Hermes's
-    # own default — not evidence of anything suspicious (see
-    # `permissions/review.py::_classify_read`'s docstring).
+def test_search_files_with_no_path_and_no_cwd_is_medium_not_low():
+    # Round 1 fix, review findings #2/#5: a missing `path` used to be a
+    # special always-`low` case — strictly SAFER than passing `search_files`'
+    # own documented default (`path="."`) explicitly, which already
+    # classified `medium`/`high` depending on `cwd`. `classify()` now
+    # substitutes `"."` before this ever reaches `_classify_read`, so a
+    # missing path and an explicit `path="."` are the exact same call.
     risk = classify("search_files", {"pattern": "*.py"})
+    assert risk.level == "medium"
+
+
+def test_search_files_missing_path_matches_explicit_path_dot(tmp_path):
+    # Same repro, with a `cwd` this time — missing `path` and explicit
+    # `path="."` must classify identically (review finding #2's exact
+    # complaint: omitting the argument was strictly lower-risk than
+    # spelling out its own default).
+    cwd = str(tmp_path)
+    no_path = classify("search_files", {"pattern": "BEGIN RSA"}, cwd=cwd)
+    explicit_dot = classify("search_files", {"pattern": "BEGIN RSA", "path": "."}, cwd=cwd)
+    assert no_path.level == explicit_dot.level
+
+
+def test_search_files_default_path_under_home_placeholder_is_not_low(tmp_path, monkeypatch):
+    # Review finding #5's exact repro: the DEFAULT Project's `cwd` is
+    # `$HOME` (01-w2-interfaces.md §2.2's documented placeholder) — a
+    # `search_files` call with no `path` at that `cwd` recursively greps the
+    # entire home directory, `~/.ssh`/`~/.aws`/`~/.jones/secrets` included.
+    # Must never be `low` (which `auto`/`task` mode auto-allows with zero
+    # user-gate visibility).
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("search_files", {"pattern": "BEGIN OPENSSH PRIVATE KEY"}, cwd=str(tmp_path))
+    assert risk.level != "low"
+
+
+def test_read_file_under_home_placeholder_normal_file_is_low(tmp_path, monkeypatch):
+    # Review finding #3: unlike `search_files` (a recursive directory scan,
+    # see the test above), `read_file` only ever discloses the ONE path it
+    # names — an ordinary, non-sensitive file must stay `low` even when the
+    # session's `cwd` is today's `$HOME` placeholder, or PRD 9.1's "任务模式:
+    # 只读工具直接放行" / G06 breaks for every single read in task/auto mode
+    # (this is the exact scenario `tests/test_gates_sessions_integration.py`'s
+    # G06 tests had to swap `read_file` out for `browser_navigate` to keep
+    # passing — see git history for that workaround, now unnecessary).
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify(
+        "read_file", {"path": str(tmp_path / "project" / "src" / "main.py")}, cwd=str(tmp_path)
+    )
     assert risk.level == "low"
 
 
@@ -155,6 +197,51 @@ def test_terminal_cat_ssh_key_via_tilde_is_high_risk(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     risk = classify("terminal", {"command": "cat ~/.ssh/id_rsa"})
     assert risk.level == "high"
+
+
+def test_terminal_cat_ssh_key_via_relative_path_with_home_cwd_is_high_risk(tmp_path, monkeypatch):
+    # Round 1 fix, review finding #1 (critical): the DEFAULT Project's `cwd`
+    # is `$HOME` — `cat .ssh/id_rsa` run from it targets the exact same file
+    # as `cat ~/.ssh/id_rsa` (the test just above), with neither a `~` nor a
+    # leading `/` in the command text for the old absolute-only check to
+    # catch. Before this fix this classified `low` while the `~` form
+    # classified `high` — a bare formatting difference silently deciding
+    # whether G15's user gate fired at all.
+    (tmp_path / ".ssh").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("terminal", {"command": "cat .ssh/id_rsa"}, cwd=str(tmp_path))
+    assert risk.level == "high"
+
+
+def test_terminal_head_aws_credentials_via_relative_path_with_home_cwd_is_high_risk(
+    tmp_path, monkeypatch
+):
+    # Same repro as above, review finding #6's second example.
+    (tmp_path / ".aws").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("terminal", {"command": "head -5 .aws/credentials"}, cwd=str(tmp_path))
+    assert risk.level == "high"
+
+
+def test_terminal_relative_sensitive_path_with_no_cwd_stays_the_documented_edge_case(
+    tmp_path, monkeypatch
+):
+    # Documents the one case `_terminal_token_sensitive_root`'s docstring
+    # explicitly leaves unresolved: no `cwd` at all means there's nothing to
+    # resolve a relative token against, so this legitimately can't be told
+    # apart from any other plain, no-signal command and correctly falls
+    # through to the R10 plain-command default (`low`) — NOT a regression of
+    # findings #1/#6, which are about `cwd` being available (the real
+    # Session/Project cwd, e.g. `$HOME`) and simply not threaded through; the
+    # real `classify()` call site (`sessions/service.py::
+    # _on_request_permission`) populates `cwd` from the session's real
+    # Project path whenever that lookup succeeds — it only falls back to
+    # `None` on a lookup failure unrelated to what the command text says —
+    # so this bare-unit case is not the realistic shape those findings are
+    # about; see the tests above for the reachable, previously-broken case.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("terminal", {"command": "cat .ssh/id_rsa"})
+    assert risk.level == "low"
 
 
 # ---------------------------------------------------------------------------

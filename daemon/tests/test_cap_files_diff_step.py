@@ -78,6 +78,34 @@ def test_extract_diff_content_handles_missing_content():
     assert _extract_diff_content("not a list or dict") is None
 
 
+def test_extract_diff_content_caps_large_new_text_and_flags_truncated():
+    # Round 1 fix, review finding #7: `newText`/`oldText` are the WHOLE
+    # file's contents, not a unified diff — an uncapped large write used to
+    # make `_handle_tool_call_update`'s `json.dumps` block the ACP read loop
+    # and grow `result_summary`/the replay payload without limit.
+    big = "x" * 10_000
+    content = [{"type": "diff", "path": "/x/big.py", "newText": big, "oldText": "old"}]
+    diff = _extract_diff_content(content)
+    assert diff["new_text"] == big[:4000]
+    assert len(diff["new_text"]) == 4000
+    assert diff["old_text"] == "old"
+    assert diff["truncated"] is True
+
+
+def test_extract_diff_content_caps_large_old_text_too():
+    big = "y" * 10_000
+    content = [{"type": "diff", "path": "/x/big.py", "newText": "new", "oldText": big}]
+    diff = _extract_diff_content(content)
+    assert diff["old_text"] == big[:4000]
+    assert diff["truncated"] is True
+
+
+def test_extract_diff_content_small_diff_is_not_marked_truncated():
+    content = [{"type": "diff", "path": "/x/y.py", "newText": "new", "oldText": "old"}]
+    diff = _extract_diff_content(content)
+    assert "truncated" not in diff
+
+
 # ---------------------------------------------------------------------------
 # Integration (SessionService-level): the three-method round trip
 # ---------------------------------------------------------------------------
