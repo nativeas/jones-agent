@@ -744,7 +744,14 @@ class SessionService:
         try" decision and the worker teardown, not the delete mechanics
         themselves (04-w5-interfaces.md §1: this branch's `sessions/service.py`
         access is for exactly this kind of guard, not a rewrite of `send()`'s
-        own logic)."""
+        own logic).
+
+        Round-3 review (review item 2): `session.export {delete_after: true}`
+        goes through this same guard now too (`sessions/methods.py::
+        session_export` -> `_run_export_honestly`), not just `session.delete` —
+        it can trigger the exact same `delete_session` call and was racing the
+        same window and leaving the same live-worker `HERMES_HOME` purge bug
+        when it called `maintenance.export_session` directly."""
         async with self._lock(session_id):
             running = session_id in self._active_turns or (
                 session_id in self._turn_tasks and not self._turn_tasks[session_id].done()

@@ -90,12 +90,11 @@ def _release_single_instance_lock(fh: TextIO) -> None:
 
 
 async def _run() -> None:
-    # Issue #23 round-1 review (04-w5-interfaces.md §5): pass `logs_dir` so the
-    # daemon's own structured log stream gets real, self-managed 7-day rotation
-    # (see `configure_logging`'s docstring) — the mtime-based `rotate_logs` sweep
-    # below never could, for the two files launchd actually keeps under
-    # `logs_dir` (they're continuously appended to for as long as the process
-    # runs, so their mtime never goes stale).
+    # Issue #23 (04-w5-interfaces.md §5): pass `logs_dir` so the daemon's own
+    # structured log stream gets real, self-managed, size-bounded rotation —
+    # see `configure_logging`'s docstring (round-3 review, controller ruling
+    # R-O3: size-based `RotatingFileHandler`, and the stderr handler is only
+    # added for an actual tty, not under launchd).
     configure_logging(logs_dir=paths.logs_dir())
     lock_fh = _acquire_single_instance_lock()
 
@@ -155,10 +154,13 @@ async def _run() -> None:
             extra={"detail": {"sock": str(paths.sock_file()), "pid": os.getpid()}},
         )
 
-        # Issue #23 (04-w5-interfaces.md §5): logs/ 滚动 7 天 — a low-frequency
-        # background sweep, same shape/lifecycle as replay/retention.py's payload
-        # sweep (owned by G/#12, not touched here).
-        log_rotation_task = asyncio.create_task(maintenance.run_log_rotation_loop(paths.logs_dir()))
+        # Round-3 review (controller ruling R-O3): the old `logs/` mtime-based
+        # rotation sweep (`maintenance.run_log_rotation_loop`) is gone —
+        # `logging.py::configure_logging`'s `RotatingFileHandler` now rotates
+        # `daemon.log` itself on size, and the stderr stream is only opened for
+        # an actual tty (not under launchd), so there is nothing left under
+        # `logs_dir` for a periodic sweep to clean up. See that module's own
+        # comment where the functions used to live.
 
         async def _on_redaction_hit(code: str, message: str, detail: dict) -> None:
             payload = {"code": code, "message": message, "detail": detail}
@@ -168,21 +170,25 @@ async def _run() -> None:
         # background loop rather than a single startup-time call. Round-1 review:
         # a single call fires before `server.serve_forever()` has accepted its
         # first client, so `server.recent_response_samples()` at that instant is
-        # always empty — the "最近 100 条 RPC 响应样本" half of the contract never
-        # actually scanned anything. Looping it (same lifecycle as
-        # `log_rotation_task` below: started here, cancelled on shutdown) means
-        # every pass after daemon startup's first one has real response bodies to
-        # look at. A malfunctioning self-check pass (e.g. the vault's data key is
-        # unavailable) is logged and skipped inside the loop, not fatal to the
-        # daemon — see `run_redaction_self_check_loop`'s own docstring; a real
-        # *hit* (a key actually found unredacted) is what must never be silent,
-        # via `_on_redaction_hit` -> `daemon.error` above.
+        # always empty — the response-samples half of the contract never
+        # actually scanned anything. Looping it (started here, cancelled on
+        # shutdown) means every pass after daemon startup's first one has real
+        # response bodies to look at. A malfunctioning self-check pass (e.g. the
+        # vault's data key is unavailable) is logged and skipped inside the
+        # loop, not fatal to the daemon — see `run_redaction_self_check_loop`'s
+        # own docstring; a real *hit* (a key actually found unredacted) is what
+        # must never be silent, via `_on_redaction_hit` -> `daemon.error` above.
+        # Round-3 review (controller ruling R-O2): the scan itself now opens its
+        # own read-only connection to `paths.db_path()` on a dedicated executor
+        # thread rather than reusing the shared `conn` on the DB thread — see
+        # `maintenance.run_redaction_self_check_loop`'s own docstring.
         redaction_check_task = asyncio.create_task(
             maintenance.run_redaction_self_check_loop(
                 vault=vault,
                 logs_dir=paths.logs_dir(),
-                conn=conn,
+                db_path=paths.db_path(),
                 runs_dir=paths.runs_dir(),
+                runtime_dir=paths.runtime_dir(),
                 recent_response_samples=server.recent_response_samples,
                 on_hit=_on_redaction_hit,
             )
@@ -198,16 +204,13 @@ async def _run() -> None:
         logger.info("shutting down", extra={"detail": {}})
 
         serve_task.cancel()
-        log_rotation_task.cancel()
         # Round-1 review: this became a long-running loop (see
         # `run_redaction_self_check_loop`'s docstring above) instead of a
-        # one-shot task — it must be cancelled like `log_rotation_task`, not just
-        # awaited, or shutdown would hang forever on its `while True`.
+        # one-shot task — it must be cancelled, not just awaited, or shutdown
+        # would hang forever on its `while True`.
         redaction_check_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await serve_task
-        with contextlib.suppress(asyncio.CancelledError):
-            await log_rotation_task
         with contextlib.suppress(asyncio.CancelledError):
             await redaction_check_task
         await server.stop()

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-import time
 from pathlib import Path
 
 import pytest
@@ -14,7 +13,7 @@ from jones_daemon import paths
 from jones_daemon.replay import store as replay_store
 from jones_daemon.rpc.errors import RpcError
 from jones_daemon.sessions import queries
-from jones_daemon.store import apply_pending, connect, maintenance, run_in_db_thread
+from jones_daemon.store import apply_pending, connect, maintenance
 
 
 @pytest.fixture
@@ -27,19 +26,24 @@ def conn(tmp_path, monkeypatch) -> sqlite3.Connection:
 
 
 @pytest.fixture
-async def scan_conn(conn):
-    """A second connection to the same `jones.db`, opened ON the dedicated DB-
-    thread executor (`store.run_in_db_thread`) — unlike the `conn` fixture
-    above (opened on the pytest test thread for the many synchronous tests in
-    this file that call `maintenance.*` directly). `startup_key_redaction_self_
-    check`'s own DB scan goes through `run_in_db_thread` internally (it must,
-    in production, since the daemon's real shared connection is born on that
-    same executor thread — `store/db.py`'s `check_same_thread=True`), so a
-    connection born on a different thread would trip that same guard here. The
-    two connections see the same committed rows (WAL, same file on disk)."""
-    c = await run_in_db_thread(connect, paths.db_path())
-    yield c
-    await run_in_db_thread(c.close)
+def scan_db_path(conn) -> Path:
+    """`paths.db_path()`, after the `conn` fixture has connected + migrated it
+    (round-3 review, controller ruling R-O2): `startup_key_redaction_self_
+    check` no longer takes a live `sqlite3.Connection` — it opens its own
+    short-lived, read-only connection to this path from a dedicated executor
+    thread, separate from both the event loop and `store/db.py`'s own
+    dedicated DB thread (`_recent_db_texts_readonly`). `conn` (the shared
+    writer, opened on the pytest test thread) and the self-check's read-only
+    connection see the same committed rows — same file on disk, WAL mode."""
+    return paths.db_path()
+
+
+@pytest.fixture
+def scan_runtime_dir(conn) -> Path:
+    """`paths.runtime_dir()` under the same `JONES_HOME` the `conn` fixture set
+    up — where the redaction self-check persists its per-log-file scan
+    offsets (round-3 review, controller ruling R-O2)."""
+    return paths.runtime_dir()
 
 
 def _seed_session(conn, *, session_id="s1", is_main=False, parent_id=None) -> None:
@@ -580,59 +584,13 @@ def test_rotate_backups_is_a_noop_when_within_the_limit(tmp_path):
 
 
 # --- log rotation --------------------------------------------------------------------
-
-
-def test_rotate_logs_deletes_only_files_older_than_the_retention_window(tmp_path):
-    logs_dir = tmp_path / "logs"
-    logs_dir.mkdir()
-    old_file = logs_dir / "old.log"
-    new_file = logs_dir / "new.log"
-    old_file.write_text("old")
-    new_file.write_text("new")
-    old_ts = time.time() - 8 * 86400
-    import os
-
-    os.utime(old_file, (old_ts, old_ts))
-
-    removed = maintenance.rotate_logs(logs_dir, retention_days=7)
-
-    assert removed == 1
-    assert not old_file.exists()
-    assert new_file.exists()
-
-
-def test_rotate_logs_on_a_missing_directory_is_a_noop(tmp_path):
-    assert maintenance.rotate_logs(tmp_path / "does-not-exist") == 0
-
-
-def test_rotate_logs_never_deletes_a_file_an_active_handler_still_has_open(tmp_path):
-    # Round-2 review: a quiet daemon that goes `retention_days` without logging
-    # a single line lets `daemon.log`'s mtime cross the cutoff while
-    # `logging.py::configure_logging`'s `TimedRotatingFileHandler` still holds
-    # an open fd on it — this sweep must never unlink a file a handler on the
-    # `jones_daemon` logger is still writing to, regardless of mtime.
-    import logging
-
-    logs_dir = tmp_path / "logs"
-    logs_dir.mkdir()
-    active_path = logs_dir / "daemon.log"
-    handler = logging.FileHandler(active_path)
-    logger = logging.getLogger("jones_daemon")
-    logger.addHandler(handler)
-    try:
-        active_path.write_text("still being written")
-        old_ts = time.time() - 8 * 86400
-        import os
-
-        os.utime(active_path, (old_ts, old_ts))
-
-        removed = maintenance.rotate_logs(logs_dir, retention_days=7)
-
-        assert removed == 0
-        assert active_path.exists()
-    finally:
-        logger.removeHandler(handler)
-        handler.close()
+# Round-3 review (controller ruling R-O3): the old mtime-based `rotate_logs`/
+# `run_log_rotation_loop` sweep this section used to test is gone — see
+# `store/maintenance.py`'s own comment at the point those functions used to
+# live for why (`logging.py::configure_logging`'s `RotatingFileHandler` now
+# owns `daemon.log`'s rotation directly, and the stderr handler is gated on
+# `isatty()` so nothing unmanaged lands under `logs_dir` under launchd
+# any more). `test_logging.py` covers the replacement.
 
 
 # --- clear_cache ---------------------------------------------------------------------
@@ -746,8 +704,12 @@ class _FakeVault:
         return dict(self._keys)
 
 
+async def _noop_on_hit(*_args) -> None:
+    return None
+
+
 async def test_startup_key_redaction_self_check_reads_real_logs_and_calls_on_hit(
-    scan_conn, tmp_path
+    scan_db_path, scan_runtime_dir, tmp_path
 ):
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir()
@@ -761,8 +723,9 @@ async def test_startup_key_redaction_self_check_reads_real_logs_and_calls_on_hit
     hits = await maintenance.startup_key_redaction_self_check(
         vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
         logs_dir=logs_dir,
-        conn=scan_conn,
+        db_path=scan_db_path,
         runs_dir=tmp_path / "runs",
+        runtime_dir=scan_runtime_dir,
         recent_response_samples=[],
         on_hit=on_hit,
     )
@@ -774,7 +737,9 @@ async def test_startup_key_redaction_self_check_reads_real_logs_and_calls_on_hit
     assert detail == {"providers": ["anthropic"]}
 
 
-async def test_startup_key_redaction_self_check_scans_response_samples_too(scan_conn, tmp_path):
+async def test_startup_key_redaction_self_check_scans_response_samples_too(
+    scan_db_path, scan_runtime_dir, tmp_path
+):
     logs_dir = tmp_path / "logs"  # left empty — the hit must come from responses alone
     logs_dir.mkdir()
     hit_calls = []
@@ -785,8 +750,9 @@ async def test_startup_key_redaction_self_check_scans_response_samples_too(scan_
     hits = await maintenance.startup_key_redaction_self_check(
         vault=_FakeVault({"openai": "sk-oa-abcdef1234567890"}),
         logs_dir=logs_dir,
-        conn=scan_conn,
+        db_path=scan_db_path,
         runs_dir=tmp_path / "runs",
+        runtime_dir=scan_runtime_dir,
         recent_response_samples=[b'{"result":"sk-oa-abcdef1234567890 leaked here"}'],
         on_hit=on_hit,
     )
@@ -796,7 +762,7 @@ async def test_startup_key_redaction_self_check_scans_response_samples_too(scan_
 
 
 async def test_startup_key_redaction_self_check_does_not_call_on_hit_when_clean(
-    scan_conn, tmp_path
+    scan_db_path, scan_runtime_dir, tmp_path
 ):
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir()
@@ -808,8 +774,9 @@ async def test_startup_key_redaction_self_check_does_not_call_on_hit_when_clean(
     hits = await maintenance.startup_key_redaction_self_check(
         vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
         logs_dir=logs_dir,
-        conn=scan_conn,
+        db_path=scan_db_path,
         runs_dir=tmp_path / "runs",
+        runtime_dir=scan_runtime_dir,
         recent_response_samples=[],
         on_hit=on_hit,
     )
@@ -820,7 +787,9 @@ async def test_startup_key_redaction_self_check_does_not_call_on_hit_when_clean(
 # --- steps.args_json/messages.content_json, and runs/<id>/ payload files) --------------
 
 
-async def test_startup_key_redaction_self_check_scans_recent_step_args(conn, scan_conn, tmp_path):
+async def test_startup_key_redaction_self_check_scans_recent_step_args(
+    conn, scan_db_path, scan_runtime_dir, tmp_path
+):
     _seed_session(conn, session_id="s1")
     _seed_full_run(conn, session_id="s1", run_id="r1")
     conn.execute(
@@ -839,8 +808,9 @@ async def test_startup_key_redaction_self_check_scans_recent_step_args(conn, sca
     hits = await maintenance.startup_key_redaction_self_check(
         vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
         logs_dir=logs_dir,
-        conn=scan_conn,
+        db_path=scan_db_path,
         runs_dir=tmp_path / "runs",
+        runtime_dir=scan_runtime_dir,
         recent_response_samples=[],
         on_hit=on_hit,
     )
@@ -849,7 +819,9 @@ async def test_startup_key_redaction_self_check_scans_recent_step_args(conn, sca
     assert hit_calls == [{"providers": ["anthropic"]}]
 
 
-async def test_startup_key_redaction_self_check_scans_recent_run_payload_files(scan_conn, tmp_path):
+async def test_startup_key_redaction_self_check_scans_recent_run_payload_files(
+    scan_db_path, scan_runtime_dir, tmp_path
+):
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir()  # left empty — the hit must come from the payload file alone
     runs_dir = tmp_path / "runs"
@@ -865,8 +837,9 @@ async def test_startup_key_redaction_self_check_scans_recent_run_payload_files(s
     hits = await maintenance.startup_key_redaction_self_check(
         vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
         logs_dir=logs_dir,
-        conn=scan_conn,
+        db_path=scan_db_path,
         runs_dir=runs_dir,
+        runtime_dir=scan_runtime_dir,
         recent_response_samples=[],
         on_hit=on_hit,
     )
@@ -875,8 +848,89 @@ async def test_startup_key_redaction_self_check_scans_recent_run_payload_files(s
     assert hit_calls == [{"providers": ["anthropic"]}]
 
 
+async def test_startup_key_redaction_self_check_only_rescans_newly_appended_log_bytes(
+    scan_db_path, scan_runtime_dir, tmp_path
+):
+    # Round-3 review, controller ruling R-O2: incremental log scanning — a
+    # provider key that was present in a log file's *already-scanned* region
+    # must not still be flagged forever on every subsequent pass, since that
+    # region is never re-read once its offset has been persisted.
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    log_path = logs_dir / "daemon.log"
+    log_path.write_text("leaked: sk-ant-abcdef1234567890 in the clear\n")
+
+    async def on_hit(code, message, detail):
+        pass
+
+    first = await maintenance.startup_key_redaction_self_check(
+        vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
+        logs_dir=logs_dir,
+        db_path=scan_db_path,
+        runs_dir=tmp_path / "runs",
+        runtime_dir=scan_runtime_dir,
+        recent_response_samples=[],
+        on_hit=on_hit,
+    )
+    assert first == ["anthropic"]
+
+    # Nothing new appended — a second pass must not re-find the same, already-
+    # scanned bytes.
+    second = await maintenance.startup_key_redaction_self_check(
+        vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
+        logs_dir=logs_dir,
+        db_path=scan_db_path,
+        runs_dir=tmp_path / "runs",
+        runtime_dir=scan_runtime_dir,
+        recent_response_samples=[],
+        on_hit=on_hit,
+    )
+    assert second == []
+
+    # A genuinely new leak, appended after the first pass, must still be found.
+    with log_path.open("a") as f:
+        f.write("also leaked: sk-ant-abcdef1234567890 again\n")
+    third = await maintenance.startup_key_redaction_self_check(
+        vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
+        logs_dir=logs_dir,
+        db_path=scan_db_path,
+        runs_dir=tmp_path / "runs",
+        runtime_dir=scan_runtime_dir,
+        recent_response_samples=[],
+        on_hit=on_hit,
+    )
+    assert third == ["anthropic"]
+
+
+async def test_startup_key_redaction_self_check_caps_each_source_independently(
+    scan_db_path, scan_runtime_dir, tmp_path
+):
+    # Review item 1: a payload source far larger than a single source's own
+    # budget must not push an unrelated, small source (logs) out of the scan
+    # — each source is capped before joining, not the combined haystack after.
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    (logs_dir / "daemon.log").write_text("leaked: sk-ant-abcdef1234567890 in the clear")
+
+    runs_dir = tmp_path / "runs"
+    oversized = "x" * (maintenance.MAX_HAYSTACK_CHARS_PER_SOURCE + 1024)
+    replay_store.write_payload(tmp_path, "r1", 1, oversized.encode("utf-8"), "txt")
+
+    hits = await maintenance.startup_key_redaction_self_check(
+        vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
+        logs_dir=logs_dir,
+        db_path=scan_db_path,
+        runs_dir=runs_dir,
+        runtime_dir=scan_runtime_dir,
+        recent_response_samples=[],
+        on_hit=_noop_on_hit,
+    )
+
+    assert hits == ["anthropic"]
+
+
 async def test_run_redaction_self_check_loop_runs_immediately_then_on_every_interval(
-    scan_conn, tmp_path
+    scan_db_path, scan_runtime_dir, tmp_path
 ):
     # Round-1 review: a one-shot call at process startup can never see a real
     # RPC response (the server hasn't accepted a client yet at that instant) —
@@ -903,8 +957,9 @@ async def test_run_redaction_self_check_loop_runs_immediately_then_on_every_inte
         maintenance.run_redaction_self_check_loop(
             vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
             logs_dir=logs_dir,
-            conn=scan_conn,
+            db_path=scan_db_path,
             runs_dir=tmp_path / "runs",
+            runtime_dir=scan_runtime_dir,
             recent_response_samples=_samples,
             on_hit=on_hit,
             interval_s=0.01,
@@ -934,7 +989,9 @@ async def test_run_redaction_self_check_loop_runs_immediately_then_on_every_inte
             await task
 
 
-async def test_run_redaction_self_check_loop_survives_a_failing_pass(scan_conn, tmp_path):
+async def test_run_redaction_self_check_loop_survives_a_failing_pass(
+    scan_db_path, scan_runtime_dir, tmp_path
+):
     # A malfunctioning check (e.g. vault access blows up) must be logged and
     # skipped, not crash the loop — DEV.md 诚实失败 applies to the guard's own
     # plumbing too, but a broken self-check must not itself take the daemon down.
@@ -956,8 +1013,9 @@ async def test_run_redaction_self_check_loop_survives_a_failing_pass(scan_conn, 
         maintenance.run_redaction_self_check_loop(
             vault=_BoomVault(),
             logs_dir=tmp_path / "logs",
-            conn=scan_conn,
+            db_path=scan_db_path,
             runs_dir=tmp_path / "runs",
+            runtime_dir=scan_runtime_dir,
             recent_response_samples=_samples,
             on_hit=_noop,
             interval_s=0.01,

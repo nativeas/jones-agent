@@ -58,14 +58,18 @@ MAX_INFLIGHT_PER_CONNECTION = 16
 MAX_INFLIGHT_GLOBAL = 64
 
 # Issue #23 (04-w5-interfaces.md §5): the periodic Key-redaction self-check
-# (`store/maintenance.py::run_redaction_self_check_loop`) scans "最近 100 条 RPC
-# 响应样本" alongside log files — this is that buffer's size. A plain bounded
-# ring, not a persisted log: it only ever needs to answer "did a response body
-# in the recent past contain a configured key", never survive a restart. Round-1
-# review: this used to be read exactly once, before startup had accepted its
-# first client connection — always empty in practice. It's now polled
-# periodically instead, so it actually gets read while it holds real data.
-RECENT_RESPONSES_MAXLEN = 100
+# (`store/maintenance.py::run_redaction_self_check_loop`) scans a bounded window
+# of recent RPC response samples alongside log files — this is that buffer's
+# size. A plain bounded ring, not a persisted log: it only ever needs to answer
+# "did a response body in the recent past contain a configured key", never
+# survive a restart. Round-1 review: this used to be read exactly once, before
+# startup had accepted its first client connection — always empty in practice.
+# It's now polled periodically instead, so it actually gets read while it holds
+# real data. Round-3 review (controller ruling R-O2): shrunk from 100 to 32 —
+# together with the wider per-entry cap just below, this keeps the *aggregate*
+# response-sample budget bounded (32 * 8KB = 256KB) rather than growing the
+# product of "how many" and "how big" independently.
+RECENT_RESPONSES_MAXLEN = 32
 
 # Round-2 review: this buffer used to hold each response's *entire* serialized
 # body — `run.payload`'s own `limit` is allowed to be `None` (read to EOF), and
@@ -75,9 +79,12 @@ RECENT_RESPONSES_MAXLEN = 100
 # scan only ever needs a bounded prefix of each response to do its job — a
 # truncated sample still contains any leaked key that isn't itself split across
 # the truncation boundary, the same trade every other bound in this self-check
-# already makes (`store/maintenance.py::MAX_SCAN_BYTES_PER_FILE`/
-# `MAX_HAYSTACK_CHARS`).
-RECENT_RESPONSE_SAMPLE_MAX_CHARS = 4096
+# already makes (`store/maintenance.py`'s own per-source scan budgets). Round-3
+# review (controller ruling R-O2): widened from 4KB to 8KB per entry — paired
+# with shrinking `RECENT_RESPONSES_MAXLEN` above from 100 to 32, so the total
+# buffer size drops (100*4KB=400KB -> 32*8KB=256KB) even though each individual
+# sample now covers more of its response body.
+RECENT_RESPONSE_SAMPLE_MAX_CHARS = 8192
 
 
 def _peek_request_id(line: bytes) -> Any:

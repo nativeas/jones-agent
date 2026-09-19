@@ -32,38 +32,79 @@ def _require_str(params: dict[str, Any], key: str) -> str:
     return value
 
 
-async def _run_delete_honestly(
-    server: RpcServer, fn: Any, *args: Any, **kwargs: Any
-) -> dict[str, Any]:
-    """Shared `session.delete`/`run.delete` tail: run a `store/maintenance.py`
-    delete on the DB thread and translate `maintenance.PartialDeleteError`
-    (04-w5-interfaces.md §6 "诚实失败") into the two outcomes it actually
-    represents, instead of letting both fall through to `rpc/server.py::
-    _dispatch`'s generic `except Exception` -> opaque `INTERNAL_ERROR` (round-1
-    review: that path also never told anyone else on the daemon — `daemon.error`
-    — regardless of which of the two shapes below it was).
+async def _broadcast_partial_delete_and_translate(
+    server: RpcServer, exc: maintenance.PartialDeleteError
+) -> None:
+    """The one `PartialDeleteError` -> `daemon.error` translation layer, shared
+    by every delete/export path that can raise it after its own point of no
+    return (round-3 review, controller ruling R-O1: "session.export
+    {delete_after:true} 与 delete_project 的 commit 后步骤全部接入
+    PartialDeleteError → daemon.error 翻译层；删除路径只有两种结局：全部完成，
+    或 PartialDeleteError 带「已完成/未完成」清单") — `session.delete`,
+    `run.delete`, `project.delete` (via `projects/methods.py::project_delete`,
+    which imports `_run_delete_honestly` below), and `session.export
+    {delete_after: true}` (via `_run_export_honestly`) all funnel through this
+    one function instead of each hand-rolling the same broadcast-then-decide
+    logic, so there is exactly one place that can drift from the two-outcome
+    contract, not four.
 
     Every `PartialDeleteError` is broadcast as `daemon.error` unconditionally —
     "记录部分完成状态并 daemon.error" applies whether or not the delete itself
     ends up reported to *this* caller as success:
       - `detail["fully_deleted"]` True (only the trailing WAL checkpoint stayed
-        busy — rows and payload are already fully gone): reported to the caller
-        as an ordinary success. Turning a completed delete into a client-visible
-        error would be the opposite mistake the review flagged.
-      - otherwise (a payload purge failed partway): re-raised as a structured
-        `RpcError(INVALID_STATE, ...)` carrying the same detail, so the caller
-        gets something actionable instead of a bare `PartialDeleteError:` string.
+        busy — rows and payload are already fully gone): returns normally: the
+        caller must treat this as success and build its own success payload
+        from `exc.detail` (e.g. the export path `export_session` stashes
+        there). Turning a completed delete into a client-visible error would
+        be the opposite mistake the review flagged.
+      - otherwise (a purge failed partway, genuinely incomplete): raises
+        `RpcError(INVALID_STATE, ...)` carrying the same detail — "已完成/未
+        完成" is exactly what `exc.detail` already lists (e.g. `purged_run_ids`
+        vs. `remaining_run_ids`) — so the caller gets something actionable
+        instead of a bare `PartialDeleteError:` string.
     """
+    await server.broadcast_all(
+        "daemon.error",
+        {"code": "delete_partially_failed", "message": str(exc), "detail": exc.detail},
+    )
+    if not exc.detail.get("fully_deleted"):
+        raise RpcError(INVALID_STATE, str(exc), exc.detail) from exc
+
+
+async def _run_delete_honestly(
+    server: RpcServer, fn: Any, *args: Any, **kwargs: Any
+) -> dict[str, Any]:
+    """Shared `session.delete`/`run.delete`/`project.delete` tail: run a
+    `store/maintenance.py` delete on the DB thread and translate any
+    `maintenance.PartialDeleteError` via `_broadcast_partial_delete_and_translate`
+    above, instead of letting it fall through to `rpc/server.py::_dispatch`'s
+    generic `except Exception` -> opaque `INTERNAL_ERROR` (round-1 review: that
+    path also never told anyone else on the daemon — `daemon.error` — regardless
+    of which of the two shapes it was)."""
     try:
         await run_in_db_thread(fn, *args, **kwargs)
     except maintenance.PartialDeleteError as exc:
-        await server.broadcast_all(
-            "daemon.error",
-            {"code": "delete_partially_failed", "message": str(exc), "detail": exc.detail},
-        )
-        if not exc.detail.get("fully_deleted"):
-            raise RpcError(INVALID_STATE, str(exc), exc.detail) from exc
+        await _broadcast_partial_delete_and_translate(server, exc)
     return {"deleted": True}
+
+
+async def _run_export_honestly(server: RpcServer, call: Any) -> dict[str, Any]:
+    """`session.export`'s counterpart to `_run_delete_honestly` above — `call`
+    is a zero-arg async callable (`functools.partial(run_in_db_thread,
+    maintenance.export_session, ...)`) rather than `fn, *args` the way
+    `_run_delete_honestly` takes it, since `delete_guard` below needs a
+    zero-arg callable to invoke once it's done deciding whether the export may
+    proceed. On `fully_deleted: True` (round-2 review: the export file is
+    already durably on disk at that point — `export_session` stashes its path
+    into `exc.detail["export_path"]` for exactly this branch, see that
+    function's own docstring), returns the path as an ordinary success rather
+    than losing an export that, in fact, succeeded."""
+    try:
+        path = await call()
+    except maintenance.PartialDeleteError as exc:
+        await _broadcast_partial_delete_and_translate(server, exc)
+        return {"path": exc.detail["export_path"]}
+    return {"path": str(path)}
 
 
 def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
@@ -191,42 +232,37 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
         )
 
     async def session_export(params: dict[str, Any], conn: Connection) -> Any:
+        # Round-3 review (04-w5-interfaces.md §5, review item 2): `delete_after=
+        # True` used to skip straight to `run_in_db_thread(maintenance.
+        # export_session, ...)`, bypassing `service.delete_guard` entirely —
+        # the exact race `session.delete` closed (see that method's own
+        # comment / `SessionService.delete_guard`'s docstring) was still wide
+        # open on this second path into the same `delete_session` call, and a
+        # session with a live-but-idle worker had its `HERMES_HOME` (real
+        # credentials — `store/maintenance.py::delete_session`'s own round-2
+        # fix) `rmtree`d out from under a process that was still running.
+        # `delete_after=False` (a plain export, nothing destructive) does not
+        # need the guard — only the branch that can actually delete does.
         session_id = _require_str(params, "id")
         delete_after = params.get("delete_after", False)
         if not isinstance(delete_after, bool):
             raise RpcError(
                 INVALID_PARAMS, "'delete_after' must be a boolean", {"params": params}
             )
-        try:
-            path = await run_in_db_thread(
+        user_root = ctx.paths.user_root()
+
+        async def _export() -> Any:
+            return await run_in_db_thread(
                 maintenance.export_session,
                 ctx.db,
-                ctx.paths.user_root(),
+                user_root,
                 session_id,
                 delete_after=delete_after,
             )
-        except maintenance.PartialDeleteError as exc:
-            # Round-2 review: `delete_after=True`'s inner `delete_session` call
-            # can raise this exact same `PartialDeleteError` `session.delete`
-            # does — this handler used to let it fall straight through to
-            # `rpc/server.py::_dispatch`'s generic `except Exception`, an opaque
-            # `INTERNAL_ERROR` with no `daemon.error` broadcast, the identical
-            # bug round-1 review already fixed for `session.delete`/`run.delete`
-            # via `_run_delete_honestly` just never reached here.
-            await server.broadcast_all(
-                "daemon.error",
-                {"code": "delete_partially_failed", "message": str(exc), "detail": exc.detail},
-            )
-            if not exc.detail.get("fully_deleted"):
-                raise RpcError(INVALID_STATE, str(exc), exc.detail) from exc
-            # fully_deleted True: the export file, the session's rows, and every
-            # run's payload are all genuinely gone — only the trailing WAL
-            # checkpoint stayed busy. `export_session` stashes the export path
-            # into `exc.detail` for exactly this branch (see its docstring) so
-            # the caller still gets a normal success response instead of losing
-            # an export that is, in fact, sitting durably on disk.
-            return {"path": exc.detail["export_path"]}
-        return {"path": str(path)}
+
+        if delete_after:
+            return await service.delete_guard(session_id, _run_export_honestly, server, _export)
+        return await _run_export_honestly(server, _export)
 
     async def run_delete(params: dict[str, Any], conn: Connection) -> Any:
         run_id = _require_str(params, "run_id")
