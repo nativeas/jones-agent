@@ -64,6 +64,24 @@ to parse, is simply not unwrapped — same "don't hard-deny what we can't
 positively identify" rule as everywhere else in this module; it still falls
 through to the review gate for whatever the wrapper's own argv looks like
 verbatim.
+
+## Combined short-option `-c` forms (review finding #1, round 2, 2026-09-19)
+
+The first cut of the shell-interpreter branch above only recognized a
+standalone `-c` token (`argv.index("-c")`) — real-world shell invocations
+routinely combine `-c` with another single-letter flag in one token
+(`bash -lc '...'` for a login shell, `bash -ic '...'` interactive, `sh -xc
+'...'` xtrace, `-ec`, etc.), which is exactly as common as bare `-c` and was
+not recognized at all: the whole payload fell through `except ValueError`
+(no, worse — `argv.index("-c")` just raised `ValueError` because no token
+equals the string `"-c"` exactly) and the function returned `[argv]`
+unexpanded, silently reopening the same hole finding #2 closed for the bare
+form. `_shell_dash_c_index` now matches the standalone `-c` **or** any
+single-dash cluster of letters ending in `c` (`-lc`, `-ic`, `-xc`, `-ec`,
+`-ilc`, …) — `getopt`-style combined short options are unordered, but `c`'s
+own convention is to always be the flag that consumes the next argv as its
+payload, so matching "ends in `c`" (rather than "contains `c`") stays
+conservative about what counts as a `-c` cluster instead of guessing.
 """
 
 from __future__ import annotations
@@ -229,6 +247,24 @@ def _strip_xargs_wrapper(argv: list[str]) -> list[str] | None:
     return rest or None
 
 
+def _shell_dash_c_index(argv: list[str]) -> int | None:
+    """Index of a shell `-c`-equivalent flag in `argv`: either the standalone
+    `-c` token, or a single-dash combined short-option cluster ENDING in `c`
+    (`-lc`, `-ic`, `-xc`, `-ec`, …) — see the module docstring's "Combined
+    short-option `-c` forms" section. `--` (a long option, or the end-of-
+    options marker) never matches. Returns `None` when no such flag is
+    present."""
+    for i, tok in enumerate(argv):
+        if tok.startswith("--"):
+            continue
+        if not tok.startswith("-"):
+            continue
+        letters = tok[1:]
+        if letters and letters.isalpha() and letters[-1] == "c":
+            return i
+    return None
+
+
 def _expand_wrapped_argv(argv: list[str], depth: int) -> list[list[str]]:
     """Return `[argv]` plus, for a recognized wrapper, every argv it would
     actually go on to run (recursively, up to `depth`) — see the module
@@ -240,9 +276,8 @@ def _expand_wrapped_argv(argv: list[str], depth: int) -> list[list[str]]:
         return out
     prog = Path(argv[0]).name
     if prog in _SHELL_INTERPRETERS:
-        try:
-            c_index = argv.index("-c")
-        except ValueError:
+        c_index = _shell_dash_c_index(argv)
+        if c_index is None:
             return out
         if c_index + 1 >= len(argv):
             return out

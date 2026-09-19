@@ -201,3 +201,35 @@ def test_bash_c_wrapped_command_touching_user_root_is_denied():
         user_root="~/.jones", project_permissions_path=None, cwd=None,
     )
     assert denied
+
+
+# Review finding #1, round 2 (2026-09-19): the wrapper-unwrapping above only
+# recognized a standalone `-c` token — combined short-option forms like
+# `-lc`/`-ic`/`-xc` (all everyday shell usage) fell through unexpanded.
+
+
+def test_bash_lc_wrapped_rm_rf_is_denied():
+    verdict = _hard_deny.classify_command("bash -lc 'rm -rf /Users/alice'")
+    assert verdict.denied
+
+
+def test_bash_ic_wrapped_rm_rf_is_denied():
+    verdict = _hard_deny.classify_command("bash -ic 'rm -rf ~'")
+    assert verdict.denied
+
+
+def test_sh_xc_wrapped_rm_rf_is_denied():
+    verdict = _hard_deny.classify_command("sh -xc 'rm -rf ~'")
+    assert verdict.denied
+
+
+def test_bash_ec_wrapped_rm_rf_is_denied():
+    verdict = _hard_deny.classify_command("bash -ec 'rm -rf ~'")
+    assert verdict.denied
+
+
+def test_bash_l_without_c_is_not_treated_as_a_dash_c_wrapper():
+    # `-l` alone never takes a script payload — must not be misread as a
+    # `-c` cluster just because it's a combined-looking short option.
+    verdict = _hard_deny.classify_command("bash -l 'echo hello'")
+    assert not verdict.denied
