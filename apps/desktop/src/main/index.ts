@@ -3,7 +3,8 @@ import { join } from 'node:path'
 import os from 'node:os'
 import { spawn } from 'node:child_process'
 import { app, BrowserWindow, ipcMain } from 'electron'
-import { RpcClient } from './rpcClient'
+import { RpcClient, RpcError } from './rpcClient'
+import { ensureDaemonRunning as runDaemonLifecycle, startHeartbeat } from './daemonLifecycle'
 
 // Same override the daemon's paths.py honors, so `JONES_HOME=... electron-vite dev`
 // points both processes at the same sandbox during development/tests.
@@ -24,13 +25,11 @@ const rpcClient = new RpcClient(daemonSocketPath())
 // later issues add methods from design §4.1.
 const ALLOWED_RPC_METHODS: ReadonlySet<string> = new Set(['daemon.ping', 'daemon.status'])
 
-// Matches the label packaging/*.plist will install as a launchd service (spike
-// #2, not built yet) — kickstart is a harmless no-op until then; spawnDevDaemon()
+// Matches `service.DEFAULT_LABEL` in daemon/src/jones_daemon/service.py — the label
+// `python -m jones_daemon service install` registers with launchd (design §6).
+// Before that install has ever run, kickstart is a harmless no-op; spawnDevDaemon()
 // below is what actually recovers the common local-dev case (daemon not started).
-const DAEMON_LAUNCHD_LABEL = 'com.jones.daemon'
-const MAX_DAEMON_START_ATTEMPTS = 3
-const DAEMON_PING_TIMEOUT_MS = 2000
-const DAEMON_RETRY_WAIT_MS = 1000
+const DAEMON_LAUNCHD_LABEL = 'ai.jones.daemon'
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -118,8 +117,13 @@ async function pingOnce(timeoutMs: number): Promise<boolean> {
   try {
     await rpcClient.call('daemon.ping', undefined, timeoutMs)
     return true
-  } catch {
-    return false
+  } catch (err) {
+    // An RpcError means the daemon received the request and answered it (e.g.
+    // `too_many_requests` when this connection's in-flight cap is hit) — that
+    // still proves it's alive, the opposite of what daemonLifecycle's recovery
+    // path (kickstart -k first) should react to. Only a connection-level
+    // failure or timeout (no response at all) counts as unreachable.
+    return err instanceof RpcError
   }
 }
 
@@ -127,11 +131,31 @@ function reportDaemonUnreachable(): void {
   const payload = {
     code: -32000,
     message: 'daemon unreachable after retries',
-    detail: { attempts: MAX_DAEMON_START_ATTEMPTS }
+    detail: { attempts: 3 }
   }
-  for (const win of BrowserWindow.getAllWindows()) {
+  const windows = BrowserWindow.getAllWindows()
+  if (windows.length === 0) {
+    // PRD 5.5 永不静默 / design §7 "worker/子进程失败必须变成 run.terminated 或
+    // daemon.error 通知" — no window to deliver to (e.g. the last window was
+    // closed on macOS) must not mean the failure vanishes silently.
+    console.error('[daemon] unreachable after retries, no window to notify', payload)
+    return
+  }
+  for (const win of windows) {
     win.webContents.send('rpc:notify', 'daemon.error', payload)
   }
+}
+
+// Real dependencies for daemonLifecycle.ts's injectable sequencing (design §3, §6):
+// connect/ping this rpcClient, kickstart/spawn the real subprocess, push a real
+// `daemon.error` notification. See daemonLifecycle.test.ts for the fake-dependency
+// version of this same sequencing.
+const daemonLifecycleDeps = {
+  connect: () => rpcClient.connect(),
+  ping: (timeoutMs: number) => pingOnce(timeoutMs),
+  kickstart: attemptLaunchdKickstart,
+  spawnDev: spawnDevDaemon,
+  onUnreachable: reportDaemonUnreachable
 }
 
 /**
@@ -142,19 +166,8 @@ function reportDaemonUnreachable(): void {
  * keeps a single ping from hanging forever, but this is what actually gets the
  * daemon running in the common dev case and reports it when it can't.
  */
-async function ensureDaemonRunning(): Promise<void> {
-  rpcClient.connect()
-  if (await pingOnce(DAEMON_PING_TIMEOUT_MS)) return
-
-  for (let attempt = 1; attempt <= MAX_DAEMON_START_ATTEMPTS; attempt++) {
-    await attemptLaunchdKickstart()
-    spawnDevDaemon()
-    rpcClient.connect()
-    await new Promise((resolve) => setTimeout(resolve, DAEMON_RETRY_WAIT_MS))
-    if (await pingOnce(DAEMON_PING_TIMEOUT_MS)) return
-  }
-
-  reportDaemonUnreachable()
+function ensureDaemonRunning(): Promise<boolean> {
+  return runDaemonLifecycle(daemonLifecycleDeps)
 }
 
 rpcClient.onAnyNotification((method, params) => {
@@ -174,9 +187,22 @@ ipcMain.handle('rpc:call', async (_event, method: string, params?: Record<string
   }
 })
 
+let stopHeartbeat: (() => void) | null = null
+
+// design §6: "健康检测：daemon.ping 心跳 5s，断线走 RpcClient 状态机重连" — started
+// once per "app has a window" period (see window-all-closed / activate below),
+// independent of ensureDaemonRunning's own outcome, since a daemon that answers
+// now can still wedge later. Idempotent: a no-op if the heartbeat is already
+// running, so activate can call it unconditionally.
+function startDaemonHeartbeat(): void {
+  if (stopHeartbeat) return
+  stopHeartbeat = startHeartbeat(daemonLifecycleDeps)
+}
+
 app.whenReady().then(() => {
   createWindow()
   void ensureDaemonRunning()
+  startDaemonHeartbeat()
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -185,12 +211,27 @@ app.whenReady().then(() => {
     // already connected/connecting) — otherwise every rpc call after "⌘W then
     // click the Dock icon" would hang on a socket nobody ever reopened.
     rpcClient.connect()
+    // ...and the heartbeat that window-all-closed stopped alongside it (below)
+    // needs restarting too, or a wedged-but-connected daemon would go undetected
+    // until the next full quit/relaunch.
+    startDaemonHeartbeat()
   })
 })
 
 app.on('window-all-closed', () => {
   // The daemon outlives the Electron shell by design (design §3); only stop the
-  // client's own socket, never signal the daemon to exit here.
+  // client's own socket, never signal the daemon to exit here. Stop the
+  // heartbeat in the same breath: left running, its next tick would find
+  // rpcClient disconnected, treat that as an outage, and run the full recovery
+  // sequence (reconnect + kickstart) — reviving the socket `stop()` just closed
+  // within one heartbeat interval and making `stop()` a no-op in practice.
   rpcClient.stop()
+  stopHeartbeat?.()
+  stopHeartbeat = null
   if (process.platform !== 'darwin') app.quit()
+})
+
+app.on('will-quit', () => {
+  stopHeartbeat?.()
+  stopHeartbeat = null
 })
