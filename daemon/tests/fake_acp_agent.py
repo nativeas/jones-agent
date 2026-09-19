@@ -49,8 +49,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
+import time
 
 PROBE_TOOL_NAME = "jones.__probe__"
 MODE = os.environ.get("FAKE_ACP_MODE", "normal")
@@ -96,9 +98,16 @@ def _handle_probe_prompt(session_id: str) -> None:
     final_status = "completed" if MODE == "probe_completes" else "failed"
     _send_update(
         session_id,
-        {"sessionUpdate": "tool_call_update", "toolCallId": tool_call_id, "status": final_status,
-         "rawOutput": {"blocked": final_status == "failed"}},
+        # Real ACP `tool_call_update` events carry the tool's identifying fields
+        # again (they're a full snapshot, not a diff against the initial
+        # `tool_call` event) — `title` here is what lets a listener resolve
+        # "this update is about the probe tool" from the update alone.
+        {"sessionUpdate": "tool_call_update", "toolCallId": tool_call_id, "title": PROBE_TOOL_NAME,
+         "status": final_status, "rawOutput": {"blocked": final_status == "failed"}},
     )
+
+
+_SLEEP_MARKER = re.compile(r"SLEEP_MS:(\d+)")
 
 
 def _handle_normal_prompt(session_id: str, text: str) -> None:
@@ -110,6 +119,12 @@ def _handle_normal_prompt(session_id: str, text: str) -> None:
         session_id,
         {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "lo"}},
     )
+    sleep_match = _SLEEP_MARKER.search(text)
+    if sleep_match:
+        # Lets a test hold a Turn "running" long enough to exercise queueing,
+        # stop()/cancel, and parallel-session behavior deterministically instead
+        # of racing real wall-clock timing against an instant fake response.
+        time.sleep(int(sleep_match.group(1)) / 1000)
     if "USE_TOOL" in text:
         tool_call_id = "demo-1"
         _send_update(
@@ -119,8 +134,8 @@ def _handle_normal_prompt(session_id: str, text: str) -> None:
         )
         _send_update(
             session_id,
-            {"sessionUpdate": "tool_call_update", "toolCallId": tool_call_id, "status": "completed",
-             "rawOutput": {"ok": True}},
+            {"sessionUpdate": "tool_call_update", "toolCallId": tool_call_id, "title": "demo_tool",
+             "status": "completed", "rawOutput": {"ok": True}},
         )
     if "NEEDS_PERMISSION" in text:
         _next_id[0] += 1

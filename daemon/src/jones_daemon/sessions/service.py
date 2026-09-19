@@ -13,9 +13,13 @@ RPC handler. It owns:
 
 Known W2 scope gaps (see the PR report): per-mode tool suppression (chat mode should
 refuse to run tools at all — PRD 9.1/N12), Goal/budget-triggered termination (PRD
-9.3's third termination kind — Goals are FR17, not #10), and full `payload_ref`
-offload storage for large tool results (`FR06` 回放 completeness) are not
-implemented here; nothing in this file pretends otherwise.
+9.3's third termination kind — Goals are FR17, not #10), full `payload_ref`
+offload storage for large tool results (`FR06` 回放 completeness), and calling
+`ctx.providers.resolve()` to actually pass a worker's provider/model binding
+(env + `hermes_config`) into `WorkerManager.ensure_started()` (today every
+worker launches with no `model:`/`providers:` block in its `config.yaml` at
+all — `tests/integration/test_real_hermes_e2e.py` works around this by hand)
+are not implemented here; nothing in this file pretends otherwise.
 """
 
 from __future__ import annotations

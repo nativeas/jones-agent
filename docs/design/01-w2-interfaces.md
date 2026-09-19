@@ -42,6 +42,14 @@ class DaemonContext:
 - **测试**：用一个假的 ACP agent（`tests/fake_acp_agent.py`，纯 stdlib，按脚本回放 update/request_permission）覆盖 client、WorkerManager 生命周期、队列串行、stop、崩溃恢复；真实 Hermes 的端到端放 `tests/integration/`，用 `JONES_E2E=1` 门控（需要模型 Key，CI 不跑）。
 - **通知路由**：`session.subscribe/unsubscribe` 在 A 里实现，`Connection` 上挂订阅集合；`RpcServer.broadcast(session_id, method, params)` 由 A 加到 `rpc/server.py`（这是 A 唯一允许改的 rpc/ 文件，加法不改法）。
 
+### 2.1 落地时的契约变更（2026-09-19，实现阶段发现，非设计推测）
+
+- **`queue_items.turn_id`**：002 迁移给 `queue_items` 加了一列 `turn_id TEXT REFERENCES turns(id)`。00-foundation.md §5 把 Turn 定义为"一次用户输入"（1 Turn -> 1 Run），但 `queue_items` 原表没有 `turn_id`，无法表达"排队中的输入已经有一行 Turn，只是还没轮到执行"。现在的语义：`session.send` 无论立即执行还是排队都先建 Turn+Message（`turn.messages` 里立刻可见），排队只是"这个 Turn 还没轮到 `worker.client.prompt()`"。理由与实现见 `store/migrations/002_seed_defaults_and_queue_turn.sql` 文件头注释。
+- **`permission_decisions.decided_by` 从 `NOT NULL` 改为可空**：001 把这一列声明成 `NOT NULL`，但一个刚创建、还没人裁决的 `decision='pending'` 请求没有诚实的非空值可填——这是 001 的一个 bug，不是设计选择（用实际跑 `INSERT` 复现过 `NOT NULL constraint failed`，不是猜测）。已有迁移不能就地改，修复走 002 里标准的"重建表"手法（见该文件）。
+- **`hermes-agent` 依赖形态与 §2 原文不同**：原文"锁到 commit...git 依赖或 PyPI 同版本...提交的 pyproject 必须是可复现的远端引用"这条在实现阶段发现走不通——PyPI 目前最新是 `0.19.0`（早于这个 commit 自报的 `0.21.2`，即这个 commit 还没发过 PyPI 包），而 `hermes-agent` 自己的 `setup.py` 对非 editable 安装（含普通的 `@ git+...` 直接引用）直接抛错拒绝（"Building wheels or sdists for hermes-agent is not supported...use an editable install instead"，已实测复现，非猜测），`uv` 的 `[tool.uv.sources]` 又不接受 `git` + `editable` 同时出现（"cannot specify both `git` and `editable`"，同样已实测）。结果是**唯一能让 `uv sync` 成功的形态是本机路径 editable 依赖**（`daemon/pyproject.toml` 的 `[tool.uv.sources]` 指向 `/Users/nativeas/.hermes/hermes-agent`，恰好是这个 commit 的完整 checkout）——这在别的机器/CI 上不是开箱可复现的，需要那台机器有同一 commit 的本地 checkout（或把这一行改指到它自己的路径）。这是这条子任务范围内能做到的最接近"可复现"的形态；真正跨机器可复现需要 Hermes 官方发一个匹配这个 commit 的 PyPI/可安装 artifact，不是 A 这条分支能解决的。
+- **`cryptography` 版本下限从 `>=50.0.1` 放宽到 `>=50.0.0`**：B/#7 的 `uv add cryptography` 落了 `>=50.0.1`；`hermes-agent` 对每个直接依赖都精确锁定（它自己的补给链安全策略），锁的是 `cryptography==50.0.0`，与 `>=50.0.1` 无解可解。50.0.0 已有 `secrets/vault.py` 用到的全部原语（`AESGCM` 多年前就稳定），降下限不影响 B 的实现。
+- **Provider 绑定未接入 worker 启动**：`ProviderResolver.resolve()`（B 已落地）目前没有被 `SessionService`/`WorkerManager` 调用——worker 的 `config.yaml` 里没有写入任何 `model:`/`providers:` 段。这不在 Issue #10 验收清单内（验收清单只要求队列/并行/重启/schema 版本，不要求真实模型能出字），且本机没有可用 Key 也无法验证接上之后的真实效果，所以留作明确记录的缺口（`sessions/service.py` 模块 docstring、本 PR 报告"没做什么"一节）而不是没说明地漏掉；`tests/integration/test_real_hermes_e2e.py` 用测试内 monkeypatch 手工绕过这个缺口以证明 worker 生命周期本身是对的。
+
 ## 3. B：Provider / Key vault（#7）
 
 ```python
