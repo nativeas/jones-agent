@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +95,36 @@ async def test_send_when_idle_runs_immediately_and_completes(tmp_path, monkeypat
         messages = await service.turn_messages(session_id, limit=10)
         texts = [m["content"]["text"] for m in messages if m["role"] == "assistant"]
         assert "Hello" in texts
+    finally:
+        await service.shutdown()
+
+
+async def test_unexpected_exception_in_run_turn_still_terminates_the_run(tmp_path, monkeypatch):
+    """Round-1 review fix: `_run_turn` used to only catch `WorkerStartupError` and
+    `(AcpError, AcpProtocolError)` — any other exception (a DB failure,
+    `_cwd_for_project`'s `RpcError` for a non-default project, a filesystem error
+    from worker setup surfacing as something other than `WorkerStartupError`, ...)
+    escaped the coroutine entirely (nobody awaits a task started via
+    `asyncio.create_task` in `_start_turn`), leaving the Run stuck 'running'
+    forever with no `run.terminated` and nothing surfaced anywhere (contract §7
+    诚实失败)."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+
+    def _boom(_self, _project_id):
+        raise RuntimeError("simulated unexpected failure")
+
+    monkeypatch.setattr(SessionService, "_cwd_for_project", _boom)
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "hello there")
+        await _wait_until(
+            lambda: any(m == "run.terminated" for _sid, m, _p in service.ctx.server.broadcasts),
+            timeout=5,
+        )
+        terminated = [p for _sid, m, p in service.ctx.server.broadcasts if m == "run.terminated"]
+        assert terminated[0]["kind"] == "error"
+        assert "simulated unexpected failure" in terminated[0]["reason"]
     finally:
         await service.shutdown()
 
@@ -233,6 +264,230 @@ async def test_permission_request_and_decide_round_trip(tmp_path, monkeypatch):
             (await service.get(session_id))["latest_turn"]["run_id"]
         )
         assert run_row["status"] == "completed"
+    finally:
+        await service.shutdown()
+
+
+async def test_turn_started_is_broadcast_when_a_turn_begins_running(tmp_path, monkeypatch):
+    """RPC v0 §4.2 `turn.started {session_id, turn_id, run_id}` — round-1 review
+    fix: this notification was never sent at all (every other §4.2 notification
+    was implemented). It's the only signal the front end has that a Turn started
+    running, in particular for the queue-auto-advance path, which never calls
+    `send()` and so has nothing else to watch."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        result = await service.send(session_id, "hello there")
+        await _wait_until(lambda: len(service.ctx.server.events("turn.started")) >= 1)
+        started = service.ctx.server.events("turn.started")[0][1]
+        assert started == {
+            "session_id": session_id,
+            "turn_id": result["turn_id"],
+            "run_id": (await service.get(session_id))["latest_turn"]["run_id"],
+        }
+    finally:
+        await service.shutdown()
+
+
+async def test_turn_started_is_broadcast_for_a_turn_the_queue_auto_advances_to(
+    tmp_path, monkeypatch
+):
+    """Same notification, but for the queue-auto-advance path (PRD 9.2) — the one
+    case where nothing calls `send()` for the Turn that starts."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        first = await service.send(session_id, "SLEEP_MS:200 first turn")
+        second = await service.send(session_id, "second turn")
+        assert second["queued"] is True
+
+        await _wait_until(
+            lambda: any(
+                p.get("turn_id") == second["turn_id"]
+                for _sid, p in service.ctx.server.events("turn.started")
+            ),
+            timeout=5,
+        )
+        turn_ids = {p["turn_id"] for _sid, p in service.ctx.server.events("turn.started")}
+        assert turn_ids == {first["turn_id"], second["turn_id"]}
+    finally:
+        await service.shutdown()
+
+
+async def test_stop_while_a_permission_is_pending_still_terminates_the_turn(
+    tmp_path, monkeypatch
+):
+    """Round-1 review fix: `stop()` alone only sends `session/cancel` — it can't
+    unblock a worker that's itself stuck waiting on our answer to a
+    `session/request_permission` it already sent (the fake agent's prompt
+    handler thread blocks on exactly that, same as a real Hermes would). Without
+    resolving that pending permission, `run.terminated` never arrives and the
+    Turn is stuck 'running' forever."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "NEEDS_PERMISSION do the risky thing")
+        await _wait_until(lambda: len(service.ctx.server.events("permission.requested")) >= 1)
+
+        result = await service.stop(session_id)
+        assert result["stopped"] is True
+
+        await _wait_until(
+            lambda: any(m == "run.terminated" for _sid, m, _p in service.ctx.server.broadcasts),
+            timeout=5,
+        )
+        terminated = [p for _sid, m, p in service.ctx.server.broadcasts if m == "run.terminated"]
+        assert terminated[0]["kind"] == "user"
+    finally:
+        await service.shutdown()
+
+
+async def test_worker_crash_while_a_permission_is_pending_still_terminates_the_turn(
+    tmp_path, monkeypatch
+):
+    """Round-1 review fix companion case: killing the worker outright (not
+    `stop()`) while a permission is pending must also still reach
+    `run.terminated` — this used to hang too, because `AcpClient`'s read loop was
+    blocked awaiting the pending-permission handler and never got back to
+    `readline()` to observe the closed pipe."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "NEEDS_PERMISSION do the risky thing")
+        await _wait_until(lambda: len(service.ctx.server.events("permission.requested")) >= 1)
+
+        worker = service.worker_manager.get(session_id)
+        worker.process.kill()
+
+        await _wait_until(
+            lambda: any(m == "run.terminated" for _sid, m, _p in service.ctx.server.broadcasts),
+            timeout=5,
+        )
+        terminated = [p for _sid, m, p in service.ctx.server.broadcasts if m == "run.terminated"]
+        assert terminated[0]["kind"] == "error"
+    finally:
+        await service.shutdown()
+
+
+async def test_streamed_assistant_text_is_kept_when_the_worker_errors_mid_turn(
+    tmp_path, monkeypatch
+):
+    """Round-1 review fix: text already streamed via `message.delta` must not be
+    lost when the Turn ends in error — `insert_assistant_message` writes an
+    empty placeholder and only `_finalize_streamed_messages`
+    (`queries.finalize_message`) fills in the real text, so the error path must
+    call it too, not just the success/stop paths."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        # "normal" mode streams "Hel"+"lo" *before* handling a SLEEP_MS marker
+        # (see fake_acp_agent.py's `_handle_normal_prompt`) — the sleep keeps the
+        # prompt() call in flight long enough to reliably kill the worker after
+        # the delta lands but before it would otherwise finish on its own.
+        await service.send(session_id, "SLEEP_MS:500 hello there")
+        await _wait_until(lambda: len(service.ctx.server.events("message.delta")) >= 1)
+
+        worker = service.worker_manager.get(session_id)
+        worker.process.kill()
+
+        await _wait_until(
+            lambda: any(m == "run.terminated" for _sid, m, _p in service.ctx.server.broadcasts),
+            timeout=5,
+        )
+        terminated = [p for _sid, m, p in service.ctx.server.broadcasts if m == "run.terminated"]
+        assert terminated[0]["kind"] == "error"
+
+        completed = service.ctx.server.events("message.completed")
+        assert completed, "the partially-streamed assistant message was never finalized"
+        assert completed[0][1]["content"]["text"] == "Hello"
+
+        messages = await service.turn_messages(session_id, limit=10)
+        assistant_texts = [m["content"]["text"] for m in messages if m["role"] == "assistant"]
+        assert "Hello" in assistant_texts
+    finally:
+        await service.shutdown()
+
+
+async def test_send_racing_the_end_of_a_turn_never_strands_a_queued_message(
+    tmp_path, monkeypatch
+):
+    """Round-1 review fix: `_advance_queue` used to run without holding the
+    session lock, so a `send()` racing in right as a Turn finished could decide
+    "running" from stale state (the finishing task isn't `.done()` yet), submit
+    its own enqueue write *after* `_advance_queue`'s `pop_next_queue_item` had
+    already run and found nothing — that message then sits 'pending' forever
+    with no Turn ever started for it, since nothing calls `_advance_queue` again.
+
+    Pins down that exact interleaving with real synchronization (a
+    `threading.Event` gate inside a patched `pop_next_queue_item`, since the DB
+    call runs on `run_in_db_thread`'s own worker thread) instead of hoping wall-
+    clock sleeps land in the right order:
+      1. let the first Turn's `_advance_queue()` call reach `pop_next_queue_item`
+         and block there (proving, if unlocked, `_turn_tasks[session_id]` is
+         still "not done" at this exact instant);
+      2. only then start the second `send()` (concurrently, not awaited yet) and
+         give it a moment to make its own "is this session running" decision and
+         queue its DB write behind the still-blocked pop;
+      3. only then unblock the pop — reproducing precisely "pop already
+         committed to 'nothing to advance to', second message's write lands
+         after" for the *unlocked* code. The fix (holding `self._lock` across
+         that whole decision) makes `send()` block until `_advance_queue` is
+         fully done deciding either way, so nothing is ever stranded regardless
+         of which branch `send()` ends up taking."""
+    service = await _make_service(tmp_path, monkeypatch)
+
+    real_pop = queries.pop_next_queue_item
+    pop_started = threading.Event()
+    release_pop = threading.Event()
+
+    def _gated_pop(conn, session_id):
+        pop_started.set()
+        release_pop.wait(timeout=5.0)
+        return real_pop(conn, session_id)
+
+    monkeypatch.setattr(queries, "pop_next_queue_item", _gated_pop)
+
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        first = await service.send(session_id, "first turn")
+        assert first["queued"] is False
+
+        # Block here (off-loop, so the event loop keeps running everything else)
+        # until `_advance_queue`'s `pop_next_queue_item` call has actually
+        # started and is itself now blocked on `release_pop`.
+        await asyncio.get_running_loop().run_in_executor(None, pop_started.wait, 5.0)
+        assert pop_started.is_set(), "_advance_queue() never reached pop_next_queue_item"
+
+        second_task = asyncio.create_task(service.send(session_id, "second turn"))
+        # Give `send()` a moment to make its own running/not-running decision
+        # (and, on the pre-fix code, submit its enqueue write behind the still-
+        # blocked pop on the same single-worker DB thread) before we let the
+        # pop proceed.
+        await asyncio.sleep(0.05)
+        release_pop.set()
+
+        second = await second_task
+
+        # If the race were still open, this message would stay 'pending' forever
+        # with no Turn ever started for it, and this never reaches 2.
+        await _wait_until(
+            lambda: len(service.ctx.server.events("message.completed")) >= 2,
+            timeout=5,
+        )
+        items = await service.queue(session_id)
+        assert items == [], f"stranded in queue: {items!r} (queued={second['queued']!r})"
+        user_texts = [
+            m["content"]["text"]
+            for m in await service.turn_messages(session_id, limit=20)
+            if m["role"] == "user"
+        ]
+        assert user_texts == ["first turn", "second turn"]
     finally:
         await service.shutdown()
 

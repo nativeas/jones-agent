@@ -16,6 +16,19 @@ jobs:
     defaults:
       run:
         working-directory: daemon
+    # `daemon/pyproject.toml`'s `worker` dependency-group (hermes-agent, needed only
+    # to run a *real* worker subprocess — every test here uses a stdlib fake ACP
+    # agent instead, see that group's comment) points `[tool.uv.sources]` at a
+    # machine-local editable checkout that doesn't exist on this runner. It's
+    # excluded from `default-groups` so a plain `uv sync`/`uv run` never needs to
+    # install it — but `uv` still validates/re-resolves the *full* lock (every
+    # group, installed or not) before an unqualified `sync`/`run`, which touches
+    # that path regardless. `--frozen` skips that revalidation and trusts the
+    # committed `uv.lock` as-is; `UV_FROZEN` applies it to every `uv` invocation
+    # below without repeating the flag on each step (round-1 review fix — see the
+    # PR report's "第 1 轮修复记录").
+    env:
+      UV_FROZEN: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Install uv

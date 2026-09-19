@@ -134,7 +134,31 @@ class SessionService:
         await self.ensure_main_session()
 
     async def shutdown(self) -> None:
+        # Close off every still-pending permission wait before tearing workers
+        # down — otherwise `AcpClient`'s background task answering it (kernel/
+        # acp_client.py) is left awaiting a future nobody will ever resolve.
+        self._resolve_pending_permissions(reason="daemon shutdown")
         await self.worker_manager.stop()
+
+    def _resolve_pending_permissions(self, *, session_id: str | None = None, reason: str) -> None:
+        """Close off pending `session/request_permission` waits (all of them, or
+        just one session's) with a `cancelled` outcome.
+
+        A pending permission blocks the *worker's* own progress on our answer,
+        not the other way around — if the worker's read/dispatch loop is itself
+        stuck waiting on this Turn's tool call, nothing (`stop()`, a crash,
+        shutdown) can make forward progress on that Turn until we answer it one
+        way or another (00-foundation.md §8.1/§7). `kernel/acp_client.py`'s read
+        loop no longer blocks on answering this itself (round-1 review fix — see
+        this PR report's "第 1 轮修复记录"), but nothing else ever resolves this
+        future for a session that got stopped or whose worker died mid-request
+        without this.
+        """
+        for entry in list(self._pending_permissions.values()):
+            if session_id is not None and entry.session_id != session_id:
+                continue
+            if not entry.future.done():
+                entry.future.set_result({"outcome": {"outcome": "cancelled"}})
 
     async def ensure_main_session(self) -> str:
         existing = await run_in_db_thread(queries.get_main_session, self.ctx.db)
@@ -296,6 +320,14 @@ class SessionService:
                     "session/cancel notification failed (worker likely already gone)",
                     extra={"detail": {"session_id": session_id, "error": str(exc)}},
                 )
+        # If this Turn's in-flight tool call is sitting on a pending
+        # `session/request_permission` (no one has answered it yet — the user
+        # just clicked "stop" instead of allow/deny), `cancel()` alone can't
+        # unblock it: the worker won't notice the cancellation until *we* answer
+        # its pending request one way or another. Round-1 review fix — without
+        # this, `stop()` during a pending approval never produces `run.terminated`
+        # (see this PR report's "第 1 轮修复记录").
+        self._resolve_pending_permissions(session_id=session_id, reason="stopped by user")
         return {"stopped": True}
 
     async def queue(self, session_id: str) -> list[dict[str, Any]]:
@@ -409,46 +441,89 @@ class SessionService:
         ctx_turn = _TurnContext(turn_id=turn_id, run_id=run_id, session_id=session_id)
         self._active_turns[session_id] = ctx_turn
         self.worker_manager.mark_busy(session_id, True)
+        # RPC v0 §4.2's `turn.started {session_id, turn_id, run_id}` — the only
+        # signal the front end has that a queued Turn actually started running
+        # (the queue-auto-advance path never calls `send()`, so it has nothing
+        # else to watch for this).
+        await self.ctx.server.broadcast(
+            session_id, "turn.started",
+            {"session_id": session_id, "turn_id": turn_id, "run_id": run_id},
+        )
         try:
-            session = await run_in_db_thread(queries.get_session, self.ctx.db, session_id)
-            cwd = self._cwd_for_project(session["project_id"])
             try:
-                worker = await self.worker_manager.ensure_started(session_id, cwd=cwd)
-            except WorkerStartupError as exc:
-                await self._terminate_run(
-                    ctx_turn, kind="error", reason=f"worker startup failed: {exc}"
+                session = await run_in_db_thread(queries.get_session, self.ctx.db, session_id)
+                cwd = self._cwd_for_project(session["project_id"])
+                try:
+                    worker = await self.worker_manager.ensure_started(session_id, cwd=cwd)
+                except WorkerStartupError as exc:
+                    await self._terminate_run(
+                        ctx_turn, kind="error", reason=f"worker startup failed: {exc}"
+                    )
+                    return
+                assert worker.client is not None and worker.acp_session_id is not None  # noqa: S101
+                try:
+                    response = await worker.client.prompt(worker.acp_session_id, text)
+                except (AcpError, AcpProtocolError) as exc:
+                    # The worker may have streamed part of an assistant reply via
+                    # `message.delta` before crashing/disconnecting — that text only
+                    # lives in `ctx_turn` until finalized, so without this the DB
+                    # (and `turn.messages` replay, 00-foundation.md §5/PRD FR06)
+                    # would show an empty assistant message even though the user
+                    # already saw real text stream past.
+                    await self._finalize_streamed_messages(ctx_turn)
+                    await self._terminate_run(
+                        ctx_turn, kind="error", reason=f"ACP prompt failed: {exc}"
+                    )
+                    return
+                await self._finalize_turn_success(ctx_turn, response)
+            except Exception as exc:  # noqa: BLE001 - contract §7: any worker/subprocess
+                # failure must become `run.terminated` or `daemon.error`, never a
+                # silently-dropped task (this coroutine is never awaited by anyone
+                # once scheduled via `asyncio.create_task` in `_start_turn`) — this
+                # is the fail-closed backstop for failure modes the two narrower
+                # `except` blocks above don't name (e.g. `_prepare_hermes_home`'s
+                # filesystem errors surfacing as something other than
+                # `WorkerStartupError`, `_cwd_for_project`'s `RpcError`, a DB write
+                # failure). DEV.md 工程原则 #4 "诚实失败".
+                logger.error(
+                    "_run_turn failed with an unhandled exception",
+                    exc_info=True,
+                    extra={"detail": {"session_id": session_id, "turn_id": turn_id}},
                 )
-                return
-            assert worker.client is not None and worker.acp_session_id is not None  # noqa: S101
-            try:
-                response = await worker.client.prompt(worker.acp_session_id, text)
-            except (AcpError, AcpProtocolError) as exc:
+                await self._finalize_streamed_messages(ctx_turn)
                 await self._terminate_run(
-                    ctx_turn, kind="error", reason=f"ACP prompt failed: {exc}"
+                    ctx_turn, kind="error", reason=f"unexpected error: {exc}"
                 )
-                return
-            await self._finalize_turn_success(ctx_turn, response)
         finally:
-            self._active_turns.pop(session_id, None)
-            self.worker_manager.mark_busy(session_id, False)
             await self._advance_queue(session_id)
 
-    async def _finalize_turn_success(
-        self, ctx_turn: _TurnContext, response: dict[str, Any]
-    ) -> None:
+    async def _finalize_streamed_messages(self, ctx_turn: _TurnContext) -> None:
+        """Persist whatever assistant/thinking text was streamed via `message.delta`
+        so far and broadcast `message.completed` for it. Safe to call more than
+        once or with nothing streamed yet (both message ids stay `None`, so this is
+        a no-op) — every termination path (success, user stop, worker error) must
+        call this before `_terminate_run`/`mark_run_completed`, or the streamed
+        text a user already saw never reaches the `messages` table (00-foundation.md
+        §5's replay source of truth, PRD FR06)."""
         if ctx_turn.assistant_message_id:
             row = await run_in_db_thread(
                 queries.finalize_message, self.ctx.db, ctx_turn.assistant_message_id,
                 kind="text", text=ctx_turn.assistant_text,
             )
             await self.ctx.server.broadcast(ctx_turn.session_id, "message.completed", row)
+            ctx_turn.assistant_message_id = None
         if ctx_turn.thinking_message_id:
             row = await run_in_db_thread(
                 queries.finalize_message, self.ctx.db, ctx_turn.thinking_message_id,
                 kind="thinking", text=ctx_turn.thinking_text,
             )
             await self.ctx.server.broadcast(ctx_turn.session_id, "message.completed", row)
+            ctx_turn.thinking_message_id = None
 
+    async def _finalize_turn_success(
+        self, ctx_turn: _TurnContext, response: dict[str, Any]
+    ) -> None:
+        await self._finalize_streamed_messages(ctx_turn)
         if response.get("stopReason") == "cancelled":
             await self._terminate_run(ctx_turn, kind="user", reason="stopped by user")
             return
@@ -478,17 +553,41 @@ class SessionService:
         # G10/N04) from being the same code path: a restart marks Runs
         # "terminated" via `interrupt_stale_runs`, it never calls this, so queued
         # items simply stay `pending` until a user explicitly re-sends.
-        item = await run_in_db_thread(queries.pop_next_queue_item, self.ctx.db, session_id)
+        #
+        # Everything that decides "is this session still running" must happen
+        # under `self._lock(session_id)` — the same lock `send()` takes to decide
+        # immediate-run vs. enqueue. Without it, a `send()` racing in right as a
+        # Turn finishes can read `_turn_tasks[session_id]` as "not done yet" (the
+        # finishing task hasn't returned from this very function yet), enqueue
+        # behind it, and then find this function already committed to "nothing
+        # left to pop" and returned — nothing will ever call `_advance_queue`
+        # again for that item, so it stays `pending` forever. Round-1 review fix;
+        # see this PR report's "第 1 轮修复记录" for the reproduction.
+        async with self._lock(session_id):
+            self._active_turns.pop(session_id, None)
+            self.worker_manager.mark_busy(session_id, False)
+            item = await run_in_db_thread(queries.pop_next_queue_item, self.ctx.db, session_id)
+            if item is not None:
+                # No explicit "mark this queued Turn running" write here: `_run_turn`
+                # (via `queries.create_run`) already flips `turns.status` to
+                # 'running' as soon as it starts, so a separate call here would
+                # just be the same write twice.
+                self._start_turn(session_id, item["turn_id"], item["text"])
+            else:
+                # Nothing more queued: drop *this* (finishing) task's own
+                # registration now, while still holding the lock, instead of
+                # waiting for its `add_done_callback` cleanup to fire after this
+                # coroutine returns — a `send()` blocked on the same lock must see
+                # "not running" the instant we've committed to "nothing else is
+                # coming", not some fraction of a second later once the task
+                # object itself transitions to done().
+                current = self._turn_tasks.get(session_id)
+                if current is asyncio.current_task():
+                    del self._turn_tasks[session_id]
         items = await run_in_db_thread(queries.list_queue_items, self.ctx.db, session_id)
         await self.ctx.server.broadcast(
             session_id, "queue.changed", {"session_id": session_id, "items": items}
         )
-        if item is not None:
-            # No explicit "mark this queued Turn running" write here: `_run_turn`
-            # (via `queries.create_run`) already flips `turns.status` to 'running'
-            # as soon as it starts, so a separate call here would just be the same
-            # write twice.
-            self._start_turn(session_id, item["turn_id"], item["text"])
 
     # -- ACP event handlers (bound into WorkerManager at construction) ------------------
 
@@ -638,6 +737,11 @@ class SessionService:
             self._pending_permissions.pop(decision_id, None)
 
     async def _on_worker_crash(self, session_id: str, returncode: int | None) -> None:
+        # A crashed worker can never answer a `session/request_permission` it
+        # already sent — close that wait off now rather than leaving `AcpClient`'s
+        # background task for it (kernel/acp_client.py) awaiting a future no one
+        # will ever resolve (round-1 review fix).
+        self._resolve_pending_permissions(session_id=session_id, reason="worker crashed")
         ctx_turn = self._active_turns.get(session_id)
         if ctx_turn is not None:
             # The in-flight `worker.client.prompt()` call in `_run_turn` will itself

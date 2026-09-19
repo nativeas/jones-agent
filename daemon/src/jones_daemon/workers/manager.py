@@ -35,6 +35,13 @@ logger = get_logger("workers")
 # into the worker's own Python environment, not the daemon's).
 PROBE_TOOL_NAME = "jones.__probe__"
 
+# Kept in sync by hand with kernel/plugin/jones_gate/__init__.py's `_on_pre_tool_call`
+# block message (same reason PROBE_TOOL_NAME is duplicated, not imported, above).
+# `_probe_event_verdict` requires this exact string to appear in a "failed" probe
+# event before calling it "blocked" — a `status: failed` alone doesn't prove
+# jones_gate did the blocking; see that function's docstring (round-1 review fix).
+_GATE_BLOCK_MARKER = "jones_gate startup self-check: this tool is reserved and never runs."
+
 _JONES_GATE_SRC = Path(__file__).resolve().parent.parent / "kernel" / "plugin" / "jones_gate"
 
 # PRD 9.2 "空闲超时（默认 10 min）回收".
@@ -136,8 +143,23 @@ def _prepare_hermes_home(hermes_home: Path) -> None:
 
 def _probe_event_verdict(update: dict[str, Any]) -> str | None:
     """Inspect one `session/update` payload for a tool_call/tool_call_update event
-    about the probe tool. Returns "blocked", "completed" (a hard failure — the plugin
-    let it through), or None (not a probe event)."""
+    about the probe tool. Returns "blocked" (failed *with jones_gate's own block
+    marker present* — see below), "completed" (a hard failure — the plugin let it
+    through), "failed_unverified" (failed, but without proof jones_gate did the
+    blocking), or None (not a probe event).
+
+    A `status: failed` event alone does NOT prove `jones_gate` blocked the call —
+    it's indistinguishable from Hermes failing the call because the tool doesn't
+    exist at all, which is exactly what happens when the plugin never loaded
+    (`HERMES_SAFE_MODE`, or `_load_tools()`'s discovery failure being swallowed to
+    a warning, 00-foundation.md §8.2) and the probe tool was therefore never
+    registered in the model's tool schema in the first place — the one scenario
+    this whole self-check exists to catch (00-foundation.md §8.1: "断言收到的是
+    插件产生的拒绝结果而不是工具直接执行的结果"). `jones_gate`'s block message
+    is a fixed, only-the-plugin-can-produce-it string
+    (`kernel/plugin/jones_gate/__init__.py`'s `_on_pre_tool_call`) that, per §7,
+    ends up in the tool call's result — so require it before calling this
+    "blocked" (round-1 review fix)."""
     body = update.get("update") or {}
     if body.get("sessionUpdate") not in ("tool_call", "tool_call_update"):
         return None
@@ -148,7 +170,7 @@ def _probe_event_verdict(update: dict[str, Any]) -> str | None:
         return None
     status = body.get("status")
     if status == "failed":
-        return "blocked"
+        return "blocked" if _GATE_BLOCK_MARKER in haystack else "failed_unverified"
     if status == "completed":
         return "completed"
     return None
@@ -233,7 +255,20 @@ class WorkerManager:
     async def _spawn_and_check(self, session_id: str, *, cwd: str) -> Worker:
         t0 = time.monotonic()
         hermes_home = self._hermes_home_for(session_id)
-        _prepare_hermes_home(hermes_home)
+        try:
+            _prepare_hermes_home(hermes_home)
+        except OSError as exc:
+            # Was previously uncaught here, escaping `_spawn_and_check` as a bare
+            # OSError instead of `WorkerStartupError` — `SessionService._run_turn`'s
+            # `except WorkerStartupError` (the intended path for "this worker
+            # couldn't be delivered") never saw it, so the Run was left 'running'
+            # forever with no `run.terminated` (contract §7 "诚实失败"; round-1
+            # review fix — `_run_turn` now also has a catch-all backstop for
+            # failures like this one, but the honest fix is for this to be the
+            # error type callers already expect).
+            raise WorkerStartupError(
+                f"failed to prepare HERMES_HOME at {hermes_home}: {exc}"
+            ) from exc
         env = _worker_env(hermes_home)
         # Double-check, not trust: §8.1 "启动自检" point 1 — the daemon just built
         # this env itself, but asserting here is what makes "impossible for these to
@@ -334,9 +369,16 @@ class WorkerManager:
                 "jones_gate is not enforcing (HERMES_SAFE_MODE? plugin failed to load?)"
             )
         if "blocked" not in verdicts:
+            detail = (
+                f" — {PROBE_TOOL_NAME} failed, but without jones_gate's own block "
+                "marker; most likely Hermes reporting 'unknown tool' because the "
+                "plugin (and therefore the probe tool registration) never loaded"
+                if "failed_unverified" in verdicts
+                else ""
+            )
             raise WorkerStartupError(
-                f"no blocked {PROBE_TOOL_NAME} tool_call observed during self-check — "
-                "cannot confirm jones_gate is loaded"
+                f"no verified-blocked {PROBE_TOOL_NAME} tool_call observed during "
+                f"self-check — cannot confirm jones_gate is loaded{detail}"
             )
 
     async def _terminate(self, worker: Worker, *, reason: str) -> None:

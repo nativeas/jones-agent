@@ -104,6 +104,25 @@ async def test_startup_self_check_rejects_a_worker_whose_probe_completes(tmp_pat
         await manager.stop()
 
 
+async def test_startup_self_check_rejects_a_failed_probe_without_the_gate_marker(
+    tmp_path, monkeypatch
+):
+    """Round-1 review fix: a `status: failed` probe event isn't by itself proof
+    jones_gate did the blocking — it's exactly what a *missing* plugin (probe
+    tool never registered at all, so Hermes fails the call as unknown) looks
+    like too. The self-check must refuse to deliver this worker, the same as
+    `probe_completes`, not treat "some failure happened" as good enough."""
+    monkeypatch.setenv("FAKE_ACP_MODE", "probe_fails_unverified")
+    manager = _make_manager(tmp_path)
+    await manager.start()
+    try:
+        with pytest.raises(WorkerStartupError, match="verified-blocked"):
+            await manager.ensure_started("s1", cwd="/tmp")
+        assert manager.get("s1") is None
+    finally:
+        await manager.stop()
+
+
 async def test_startup_self_check_rejects_a_worker_that_never_calls_the_probe(
     tmp_path, monkeypatch
 ):
@@ -124,6 +143,28 @@ async def test_startup_self_check_rejects_a_worker_that_hangs_on_initialize(tmp_
     await manager.start()
     try:
         with pytest.raises(WorkerStartupError):
+            await manager.ensure_started("s1", cwd="/tmp")
+    finally:
+        await manager.stop()
+
+
+async def test_prepare_hermes_home_failure_surfaces_as_worker_startup_error(tmp_path, monkeypatch):
+    """Round-1 review fix: `_prepare_hermes_home` ran outside any try/except in
+    `_spawn_and_check` — a filesystem error there (permissions, disk full, a
+    concurrent `rmtree` racing us, ...) used to escape as a bare `OSError`, which
+    `SessionService._run_turn`'s `except WorkerStartupError` never caught, leaving
+    the Run stuck 'running' forever with no `run.terminated` (contract §7 诚实失败).
+    """
+    monkeypatch.setenv("FAKE_ACP_MODE", "normal")
+
+    def _boom(_hermes_home):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr("jones_daemon.workers.manager._prepare_hermes_home", _boom)
+    manager = _make_manager(tmp_path)
+    await manager.start()
+    try:
+        with pytest.raises(WorkerStartupError, match="simulated disk failure"):
             await manager.ensure_started("s1", cwd="/tmp")
     finally:
         await manager.stop()

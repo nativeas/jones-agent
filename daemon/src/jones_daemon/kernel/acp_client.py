@@ -31,6 +31,7 @@ worker gets a protocol-legal answer instead of daemon-side breakage.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -111,6 +112,11 @@ class AcpClient:
         self._on_request_permission = on_request_permission
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[Any]] = {}
+        # `session/request_permission` requests are answered off the read loop
+        # (see `_handle_incoming_request`) — these are those in-flight answer
+        # tasks, tracked only so `close()` can cancel/await them instead of
+        # leaking them past this client's lifetime.
+        self._permission_tasks: set[asyncio.Task[None]] = set()
         self._write_lock = asyncio.Lock()
         self._closed = False
         self._read_task = asyncio.create_task(self._read_loop())
@@ -124,6 +130,12 @@ class AcpClient:
             await self._read_task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
             pass
+        for task in list(self._permission_tasks):
+            task.cancel()
+        for task in list(self._permission_tasks):
+            with contextlib.suppress(asyncio.CancelledError, Exception):  # noqa: BLE001
+                await task
+        self._permission_tasks.clear()
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(AcpProtocolError("connection closed"))
@@ -182,19 +194,20 @@ class AcpClient:
         params = message.get("params") or {}
         req_id = message["id"]
         if method == _METHOD_REQUEST_PERMISSION:
-            try:
-                result = await self._on_request_permission(params)
-            except Exception as exc:  # noqa: BLE001 - must answer the worker, never leave it hanging
-                logger.error(
-                    "on_request_permission handler raised", exc_info=True,
-                    extra={"detail": {"method": method}},
-                )
-                await self._send({
-                    "jsonrpc": "2.0", "id": req_id,
-                    "error": {"code": -32603, "message": f"{type(exc).__name__}: {exc}"},
-                })
-                return
-            await self._send({"jsonrpc": "2.0", "id": req_id, "result": result})
+            # `on_request_permission` (SessionService's `_on_request_permission`)
+            # can legitimately await a human for an unbounded amount of time — it
+            # MUST NOT be awaited inline here. The read loop calls `_handle_message`
+            # for every incoming line one at a time (see `_read_loop`); awaiting a
+            # human-speed response inline would stall reading everything else the
+            # worker sends for as long as the approval is pending, including the
+            # eventual response to our own in-flight `prompt()` call and any
+            # `session/cancel`-driven wind-down the worker tries to report. Round-1
+            # review fix — see this PR report's "第 1 轮修复记录" for the deadlock
+            # (`stop()`/a worker crash during a pending approval never producing
+            # `run.terminated`) this closes.
+            task = asyncio.create_task(self._answer_request_permission(req_id, params))
+            self._permission_tasks.add(task)
+            task.add_done_callback(self._permission_tasks.discard)
             return
         if method in _UNSUPPORTED_CLIENT_METHODS:
             await self._send({
@@ -211,6 +224,27 @@ class AcpClient:
             "jsonrpc": "2.0", "id": req_id,
             "error": {"code": -32601, "message": f"unknown method: {method}"},
         })
+
+    async def _answer_request_permission(self, req_id: Any, params: dict[str, Any]) -> None:
+        try:
+            result = await self._on_request_permission(params)
+        except Exception as exc:  # noqa: BLE001 - must answer the worker, never leave it hanging
+            logger.error(
+                "on_request_permission handler raised", exc_info=True,
+                extra={"detail": {"method": _METHOD_REQUEST_PERMISSION}},
+            )
+            try:
+                await self._send({
+                    "jsonrpc": "2.0", "id": req_id,
+                    "error": {"code": -32603, "message": f"{type(exc).__name__}: {exc}"},
+                })
+            except AcpProtocolError:
+                pass  # connection already closed (e.g. the worker crashed meanwhile)
+            return
+        try:
+            await self._send({"jsonrpc": "2.0", "id": req_id, "result": result})
+        except AcpProtocolError:
+            pass  # connection already closed (e.g. the worker crashed meanwhile)
 
     async def _handle_incoming_notification(self, message: dict[str, Any]) -> None:
         method = message["method"]

@@ -601,7 +601,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
-    { name = "hermes-agent", extra = ["acp"] },
     { name = "keyring" },
 ]
 
@@ -611,11 +610,13 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "ruff" },
 ]
+worker = [
+    { name = "hermes-agent", extra = ["acp"] },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "cryptography", specifier = ">=50.0.0" },
-    { name = "hermes-agent", extras = ["acp"], editable = "../../../../../../../../../../Users/nativeas/.hermes/hermes-agent" },
     { name = "keyring", specifier = ">=25.7.0" },
 ]
 
@@ -625,6 +626,7 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "ruff", specifier = ">=0.7" },
 ]
+worker = [{ name = "hermes-agent", extras = ["acp"], editable = "../../../../../../../../../../Users/nativeas/.hermes/hermes-agent" }]
 
 [[package]]
 name = "keyring"

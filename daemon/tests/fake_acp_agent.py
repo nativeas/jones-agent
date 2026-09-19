@@ -28,6 +28,14 @@ Behavior is selected via the `FAKE_ACP_MODE` env var (default "normal"):
   blocked — simulates `jones_gate` having silently failed to load
   (`HERMES_SAFE_MODE`, see 00-foundation.md §7/§8.1) so the self-check must
   refuse to deliver this worker.
+- "probe_fails_unverified": reports the probe tool call as *failed*, same as
+  "normal", but WITHOUT jones_gate's own block-message marker in `rawOutput` —
+  simulates the plugin never having loaded at all (so Hermes fails the call as
+  an unknown tool, a `status: failed` event that looks identical to a real
+  block unless the daemon checks *why* it failed, round-1 review fix; see
+  `workers/manager.py::_probe_event_verdict`'s docstring). The self-check must
+  refuse to deliver this worker too — "failed" alone is not proof jones_gate
+  did the blocking.
 - "no_probe_call": never emits any tool_call event at all for the probe —
   simulates the self-check prompt itself going unanswered/ignored.
 - "hang_init": never responds to `initialize` — exercises the daemon's
@@ -56,6 +64,10 @@ import time
 
 PROBE_TOOL_NAME = "jones.__probe__"
 MODE = os.environ.get("FAKE_ACP_MODE", "normal")
+# Kept in sync by hand with jones_daemon.workers.manager._GATE_BLOCK_MARKER —
+# see that module's comment for why it's duplicated rather than imported (this
+# file must stay dependency-free of jones_daemon).
+_GATE_BLOCK_MARKER = "jones_gate startup self-check: this tool is reserved and never runs."
 
 _stdout_lock = threading.Lock()
 _cancelled_sessions: set[str] = set()
@@ -96,6 +108,14 @@ def _handle_probe_prompt(session_id: str) -> None:
          "status": "pending", "rawInput": {}},
     )
     final_status = "completed" if MODE == "probe_completes" else "failed"
+    if final_status == "failed":
+        raw_output = (
+            {"error": "unknown tool: jones.__probe__"}
+            if MODE == "probe_fails_unverified"
+            else {"error": _GATE_BLOCK_MARKER}
+        )
+    else:
+        raw_output = {"blocked": False}
     _send_update(
         session_id,
         # Real ACP `tool_call_update` events carry the tool's identifying fields
@@ -103,7 +123,7 @@ def _handle_probe_prompt(session_id: str) -> None:
         # `tool_call` event) — `title` here is what lets a listener resolve
         # "this update is about the probe tool" from the update alone.
         {"sessionUpdate": "tool_call_update", "toolCallId": tool_call_id, "title": PROBE_TOOL_NAME,
-         "status": final_status, "rawOutput": {"blocked": final_status == "failed"}},
+         "status": final_status, "rawOutput": raw_output},
     )
 
 

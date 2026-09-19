@@ -6,29 +6,12 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     # Floor relaxed from >=50.0.1 (B/#7's original `uv add` pin) to >=50.0.0: Hermes
     # exact-pins every direct dependency (its own pyproject.toml's stated supply-chain
-    # policy) at `cryptography==50.0.0`, and A/#10 adds hermes-agent as a real
-    # dependency below — >=50.0.1 is otherwise unresolvable against that exact pin.
+    # policy) at `cryptography==50.0.0`, and the `worker` dependency-group below adds
+    # hermes-agent — >=50.0.1 is otherwise unresolvable against that exact pin.
     # 50.0.0 has every primitive B's vault.py uses (AESGCM has been stable for
     # years); see this PR's report "契约变更" section.
     "cryptography>=50.0.0",
     "keyring>=25.7.0",
-    # Worker subprocesses run `python -m acp_adapter.entry` (Hermes's own ACP
-    # server) in the *daemon's own* interpreter/venv (WorkerManager spawns
-    # `sys.executable -m acp_adapter.entry`), so hermes-agent must be a real
-    # daemon dependency, not just a dev-time convenience. Pinned to the exact
-    # commit 01-w2-interfaces.md §2 names (`ee4452991d17534aa561f31ee55596d082aa94e7`)
-    # via a git direct reference — PyPI's newest published release at the time of
-    # this pin (0.19.0, checked 2026-09-19) is older than that commit's own
-    # `version = "0.21.2"`, i.e. this commit isn't on PyPI yet, so a git reference
-    # is the only reproducible remote pin available (the alternative, a local path
-    # dependency on /Users/nativeas/.hermes/hermes-agent, is explicitly ruled out
-    # by 01-w2-interfaces.md §2 for the *committed* pyproject — "本机...可作为 uv
-    # 的本地 path 依赖做开发验证，但提交的 pyproject 必须是可复现的远端引用").
-    # `[acp]` extra pulls in `agent-client-protocol==0.9.0`, which this repo's own
-    # `kernel/acp_client.py` was hand-written against (its module docstring) but
-    # does not import — the extra is here so the worker subprocess's own `import
-    # acp` (inside acp_adapter) resolves, not because the daemon imports it.
-    "hermes-agent[acp]",
 ]
 
 [dependency-groups]
@@ -37,6 +20,49 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.7",
 ]
+# NOT installed by a plain `uv sync` (uv only installs `dev` by default; see
+# `[tool.uv] default-groups` below, which pins that explicitly rather than relying
+# on uv's own default so this stays true even if uv's default ever changes) — see
+# below for why. Opt in with `uv sync --group worker` (needs the machine to have
+# hermes-agent's checkout at the path in `[tool.uv.sources]` below, or that path
+# updated to point at yours — see that section's comment); CI never opts in, see
+# `[tool.uv] default-groups`'s comment for why a plain `uv sync`/`uv run` alone
+# still isn't the whole fix.
+worker = [
+    # Worker subprocesses run `python -m acp_adapter.entry` (Hermes's own ACP
+    # server) in the *daemon's own* interpreter/venv (WorkerManager spawns
+    # `sys.executable -m acp_adapter.entry`), so a real hermes-agent install is
+    # needed to actually run a worker against a real user — but nothing under
+    # `src/jones_daemon` imports it (`workers/manager.py` only ever shells out to
+    # `sys.executable -m acp_adapter.entry`, never `import acp_adapter`), and
+    # every one of this package's 128 tests injects `worker_cmd=[...,
+    # "fake_acp_agent.py"]` (pure stdlib, see that file) instead of spawning the
+    # real thing — `tests/integration/test_real_hermes_e2e.py` is the one
+    # exception, and it's already double-gated behind `JONES_E2E=1` +
+    # `ANTHROPIC_API_KEY` and skips itself when hermes-agent isn't importable.
+    # Version pinned (not a bare `hermes-agent[acp]`) to at least lock down the
+    # metadata half of 01-w2-interfaces.md §2's "锁到 commit" even though the
+    # resolvable-source half remains unsolved (see the comment on
+    # `[tool.uv.sources]` below) — `ee4452991d17534aa561f31ee55596d082aa94e7`
+    # self-reports `version = "0.21.2"` in its own pyproject.toml.
+    "hermes-agent[acp]==0.21.2",
+]
+
+[tool.uv]
+# Round-1 review fix (see this PR's report "第 1 轮修复记录"). `worker` is
+# excluded from the default groups so `uv sync`/`uv run` only ever *install*
+# `dev` (pytest/ruff, both on PyPI) by default — but that alone is NOT enough
+# for CI: an unqualified `uv sync`/`uv run` still re-resolves the *full* lock
+# (every group, installed or not) first, which touches hermes-agent's
+# `[tool.uv.sources]` path regardless of `default-groups` (confirmed by
+# actually running it against a nonexistent path — same
+# `error: Distribution not found` as before this fix). `--frozen` (or the
+# `UV_FROZEN=1` env var CI sets — see `.github/workflows/ci.yml`'s daemon job)
+# is what actually skips that re-resolution and trusts the committed
+# `uv.lock` as-is; `default-groups` here is what makes a *plain* `uv sync` on
+# a machine that already has (or doesn't need) hermes-agent still only
+# *install* `dev` by default.
+default-groups = ["dev"]
 
 [build-system]
 requires = ["hatchling"]
@@ -45,28 +71,28 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/jones_daemon"]
 
-# Required for the hermes-agent git direct reference above — hatchling refuses to
-# build a package whose declared dependencies include a non-PyPI direct reference
-# unless this is explicitly opted into (it's PEP 508 direct references in general
-# it's cautious about, not git specifically; ours is a pinned commit, not a moving
-# target, so the reproducibility hatchling is protecting against isn't at risk here).
+# hermes-agent (in the `worker` group above, not `dependencies`) is a path
+# dependency, which counts as a "direct reference" to hatchling the same way a git
+# URL would — this stays opted in regardless.
 [tool.hatch.metadata]
 allow-direct-references = true
 
-# See the PR report's "契约变更" section and docs/design/01-w2-interfaces.md §2's
-# updated note for the full story — short version: hermes-agent's own setup.py
-# hard-refuses a normal (non-editable) build ("Building wheels or sdists for
-# hermes-agent is not supported... use an editable install instead" — confirmed
-# by actually running `uv sync` against a plain `hermes-agent[acp] @
-# git+https://...@ee445299...` dependency and hitting that RuntimeError, not a
-# guess), and `uv`'s `[tool.uv.sources]` refuses `git` + `editable` together
-# ("cannot specify both `git` and `editable`", also confirmed by running it) —
-# so a *remote* editable reference isn't expressible at all, only a local path
-# one is. This machine's pinned checkout happens to already be the exact commit
-# 01-w2-interfaces.md §2 names, which is what makes this line reproducible on
-# *this* machine, but it is not a portable remote reference — a real
-# CI/another-contributor's machine needs its own checkout of the same commit at
-# this same path, or this line updated to point at theirs.
+# See the PR report's "契约变更" and "第 1 轮修复记录" sections and
+# docs/design/01-w2-interfaces.md §2/§2.1 for the full story — short version:
+# hermes-agent's own setup.py hard-refuses a normal (non-editable) build
+# ("Building wheels or sdists for hermes-agent is not supported... use an
+# editable install instead" — confirmed by actually running `uv sync` against a
+# plain `hermes-agent[acp] @ git+https://...@ee445299...` dependency and hitting
+# that RuntimeError, not a guess), and `uv`'s `[tool.uv.sources]` refuses `git` +
+# `editable` together ("cannot specify both `git` and `editable`", also confirmed
+# by running it) — so a *remote* editable reference isn't expressible at all,
+# only a local path one is, and PyPI doesn't have this commit either (see the
+# `worker` group's comment). This is still not a portable reference — a
+# contributor who runs `uv sync --group worker` needs their own checkout of the
+# pinned commit at this same path, or this line updated to point at theirs — but
+# unlike round 1, that unsolved cost now only lands on someone who explicitly
+# opts into real-worker development, never on `uv sync`/CI/every other branch's
+# daemon job.
 [tool.uv.sources]
 hermes-agent = { path = "/Users/nativeas/.hermes/hermes-agent", editable = true }
 
