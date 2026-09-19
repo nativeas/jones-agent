@@ -16,24 +16,41 @@ acceptance suite a genuine, currently-passing proof (not a changelog) of each
 gate, while keeping the actual assertions in one place. If a referenced test
 is renamed, deleted, or starts failing, this fails loudly instead of quietly
 going green.
+
+**round-1 review fix (评审 #1/#4)**: `returncode == 0` alone is not that
+guarantee — pytest also exits 0 when every collected test is skipped (or the
+run is a mix of passed/skipped), so a node ID that becomes `JONES_E2E`-gated
+(or skip-guarded for any other reason) after this wrapper was written would
+make this "fail loudly" promise silently false: the acceptance test still goes
+green having proven nothing. `run_existing` now parses pytest's own `-q`
+summary line and additionally requires at least one real `passed` and zero
+`skipped`; a target that skips must be surfaced honestly (its own explicit
+`pytest.mark.skipif`/`pytest.skip` on the *acceptance* test, not a pass-through
+here — see `test_g19_data_migratable.py`), never absorbed into a false "passed".
 """
 
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 DAEMON_ROOT = Path(__file__).resolve().parents[2]  # daemon/
 
+_PASSED_RE = re.compile(r"(\d+) passed")
+_SKIPPED_RE = re.compile(r"(\d+) skipped")
+
 
 def run_existing(*node_ids: str, env: dict[str, str] | None = None, timeout: float = 180) -> None:
     """Run the given pytest node IDs (relative to `daemon/`, e.g.
     `tests/test_gates_hard_deny.py::test_rm_rf_is_denied`) as a subprocess and
     fail this acceptance test with pytest's own output if any of them fail,
-    error, or fail to collect (a renamed/deleted target must fail this test,
-    not silently stop proving anything)."""
+    error, fail to collect, or are skipped (a renamed/deleted/newly-gated
+    target must fail this test, not silently stop proving anything — pytest's
+    `returncode` alone is 0 for an all-skipped run too, so a skip is not
+    "reused coverage", it's zero coverage wearing a green badge)."""
     full_env = dict(os.environ)
     if env:
         full_env.update(env)
@@ -45,7 +62,12 @@ def run_existing(*node_ids: str, env: dict[str, str] | None = None, timeout: flo
         timeout=timeout,
         env=full_env,
     )
-    assert result.returncode == 0, (
-        f"reused acceptance coverage did not pass: {node_ids!r}\n"
+    passed_match = _PASSED_RE.search(result.stdout)
+    passed = int(passed_match.group(1)) if passed_match else 0
+    skipped_match = _SKIPPED_RE.search(result.stdout)
+    ok = result.returncode == 0 and passed > 0 and not skipped_match
+    assert ok, (
+        f"reused acceptance coverage did not really run (passed={passed}, "
+        f"skipped={skipped_match.group(1) if skipped_match else 0}): {node_ids!r}\n"
         f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
     )

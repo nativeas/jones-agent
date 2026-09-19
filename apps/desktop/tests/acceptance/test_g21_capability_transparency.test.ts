@@ -17,7 +17,13 @@ import { describe, it } from 'vitest'
 import { runExisting } from './_reuse'
 
 describe('G21 acceptance (desktop capability transparency)', () => {
-  it('reuses CapabilitySettings.test.tsx drift-warning coverage', () => {
-    runExisting('src/renderer/src/components/__tests__/CapabilitySettings.test.tsx')
-  })
+  // round-1 review fix (评审 #7): see test_g07_replay_ui.test.ts for why this
+  // must match _reuse.ts's own 120_000ms `runExisting` timeout budget.
+  it(
+    'reuses CapabilitySettings.test.tsx drift-warning coverage',
+    () => {
+      runExisting('src/renderer/src/components/__tests__/CapabilitySettings.test.tsx')
+    },
+    120_000
+  )
 })

@@ -16,7 +16,16 @@ import { describe, it } from 'vitest'
 import { runExisting } from './_reuse'
 
 describe('G07 acceptance (desktop replay UI)', () => {
-  it('reuses replayStore.test.ts coverage', () => {
-    runExisting('src/renderer/src/store/__tests__/replayStore.test.ts')
-  })
+  // round-1 review fix (评审 #7): `runExisting` blocks synchronously for up to
+  // its own 120_000ms budget (see _reuse.ts), but vitest's default per-test
+  // timeout is 5000ms and does NOT wait for a synchronous block to finish —
+  // it throws "Test timed out in 5000ms" out from under it. Pass the same
+  // 120s budget here so the two actually agree.
+  it(
+    'reuses replayStore.test.ts coverage',
+    () => {
+      runExisting('src/renderer/src/store/__tests__/replayStore.test.ts')
+    },
+    120_000
+  )
 })

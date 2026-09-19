@@ -4,7 +4,9 @@
 FR01-FR16（P0，v1 必须有）的验收口径原文、对应测试/手工记录链接、状态。
 
 状态取值：**通过**（自动化用例已绿）/ **待 Key**（逻辑已测，缺真实厂商 Key）/
-**待真机**（逻辑已测，缺真机步骤）/ **缺口 Issue#**（发现未满足）。
+**待 JONES_E2E**（逻辑已测，用例本身写好了但被 `JONES_E2E=1` 门控，CI/
+`make check-daemon` 默认不跑，不需要额外 Key）/ **待真机**（逻辑已测，缺真机
+步骤）/ **缺口 Issue#**（发现未满足）。
 
 ## FR01 — 多会话工作台
 
@@ -163,8 +165,17 @@ FR01-FR16（P0，v1 必须有）的验收口径原文、对应测试/手工记�
 test_web_search_results_meet_the_citation_reachability_bar`（字面断言可达率
 ≥ 90%）、`test_web_extract_reads_real_page_content`（真实抓取）。
 
-**状态：通过**（该文件需要真实网络，非 `JONES_E2E` 门控——见文件本身；CI 的
-`daemon` job 默认联网环境下可跑）
+**round-1 review fix（评审 #2/#5）**：之前这里的括注写反了——两条用例都用
+`_needs_jones_e2e = pytest.mark.skipif(not os.environ.get("JONES_E2E"), ...)`
+门控（见该文件 :46/:79/:107），CI 的 `daemon` job 与 `make check-daemon` 都不
+设 `JONES_E2E`，所以这两条从未在 CI/`make check-daemon` 下运行过；实测本
+worktree 同一环境：`uv run pytest -q tests/integration/test_cap_research.py
+-rs` → `3 skipped`（`hermes-agent not importable`，CI 用的 `uv sync` 也不装
+`worker` 组，第二道门同样命中）。
+
+**状态：待 JONES_E2E**（真实网络 + 真实 Hermes worker，`JONES_E2E=1` 门控且
+需要 `uv sync --group worker`，CI 的 `daemon` job 与 `make check-daemon` 默认
+均不跑，见文件本身）
 
 ## FR11 — Cron 定时任务
 
@@ -213,11 +224,17 @@ Electron 全流程，见 G11.md）
 
 `daemon/tests/integration/test_mcp_e2e.py::
 test_stdio_and_http_mcp_tools_are_both_callable_by_a_real_worker`（真实起
-`mcp_echo_stdio.py`/`mcp_echo_http.py` 两种 transport，`JONES_E2E=1`）；
-注册表/白名单/权限闸约束见 G21、N15（`daemon/tests/acceptance/
-test_g21_capability_transparency.py`、`test_n15_no_unconfirmed_mcp_skill.py`）。
+`mcp_echo_stdio.py`/`mcp_echo_http.py` 两种 transport，`JONES_E2E=1` 且需要
+`ANTHROPIC_API_KEY`——见该文件 :28 `pytestmark`）；注册表/白名单/权限闸约束见
+G21、N15（`daemon/tests/acceptance/test_g21_capability_transparency.py`、
+`test_n15_no_unconfirmed_mcp_skill.py`）。
 
-**状态：通过**
+**round-1 review fix（评审 #3/#6）**：之前的"通过"没有披露上面这层双门控——
+CI/`make check-daemon` 下必然 skip，从未真正执行过。按 FR12 媒体生成一档
+（同样是 `JONES_E2E=1` + 真实 Key）的口径改为分档。
+
+**状态：通过**（注册表/白名单约束，G21/N15 不受门控）/ **待 Key**（stdio 与
+HTTP 两种 transport 真实接入，需 `JONES_E2E=1` 且 `ANTHROPIC_API_KEY`）
 
 ## FR14 — 失败诚实与错误面板
 
@@ -280,10 +297,10 @@ test_g21_capability_transparency.py`、`test_n15_no_unconfirmed_mcp_skill.py`）
 | FR07 文件五件套 | 通过 |
 | FR08 终端 | 通过 |
 | FR09 浏览器 | 通过 |
-| FR10 互联网与深度调研 | 通过 |
+| FR10 互联网与深度调研 | 待 JONES_E2E（真实网络 + 真实 worker） |
 | FR11 Cron 定时任务 | 通过（逻辑）/ 待真机（launchd 全流程） |
 | FR12 Skill 加载与内置 Skill | 通过（办公文档）/ 待 Key（媒体生成） |
-| FR13 MCP 接入 | 通过 |
+| FR13 MCP 接入 | 通过（注册表/白名单）/ 待 Key（两种 transport 真实接入） |
 | FR14 失败诚实与错误面板 | 通过 |
 | FR15 常驻守护进程 | 通过（逻辑）/ 待真机（launchd 全流程） |
 | FR16 能力透明页 | 通过 |

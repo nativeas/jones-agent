@@ -14,7 +14,13 @@ import { describe, it } from 'vitest'
 import { runExisting } from './_reuse'
 
 describe('N16 acceptance (no white screen on render error)', () => {
-  it('reuses ErrorBoundary.test.tsx coverage', () => {
-    runExisting('src/renderer/src/components/__tests__/ErrorBoundary.test.tsx')
-  })
+  // round-1 review fix (评审 #7): see test_g07_replay_ui.test.ts for why this
+  // must match _reuse.ts's own 120_000ms `runExisting` timeout budget.
+  it(
+    'reuses ErrorBoundary.test.tsx coverage',
+    () => {
+      runExisting('src/renderer/src/components/__tests__/ErrorBoundary.test.tsx')
+    },
+    120_000
+  )
 })
