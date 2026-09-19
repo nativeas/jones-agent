@@ -109,11 +109,12 @@ class StubSessionService:
         return self.main_session_id
 
     async def create(
-        self, *, project_id: str, agent_id: str, parent_id: str | None, mode: str, title: str | None
+        self, *, project_id: str, agent_id: str, parent_id: str | None, mode: str,
+        title: str | None, system_dispatch: bool = False,
     ) -> dict[str, Any]:
         self.create_calls.append(
             {"project_id": project_id, "agent_id": agent_id, "parent_id": parent_id,
-             "mode": mode, "title": title}
+             "mode": mode, "title": title, "system_dispatch": system_dispatch}
         )
         if self.create_error is not None:
             raise self.create_error
@@ -326,6 +327,10 @@ async def test_run_now_dispatches_immediately_and_reports_success(tmp_path, monk
     assert call["mode"] == "auto"
     assert call["parent_id"] == stub.main_session_id
     assert call["title"] == "my cron"
+    # Issue #20 跨分支裁定: cron dispatch always identifies itself as a system
+    # dispatch, so `SessionService.create()`'s N13 mode-narrowing gate treats it
+    # as pre-authorized rather than agent self-escalation.
+    assert call["system_dispatch"] is True
     assert stub.sent == [("child-1", "do the thing")]
 
     completed = ctx.server.events("message.completed")
@@ -625,19 +630,25 @@ async def test_startup_computes_next_run_at_for_a_never_scheduled_cron(tmp_path,
         await service.stop()
 
 
-# -- real SessionService: documents the PRD 9.1 / 9.6 mode conflict --------------------
+# -- real SessionService: PRD 9.1 / 9.6 mode conflict + its Issue #20 fix -------------
 
 
-async def test_dispatch_against_real_session_service_hits_the_mode_conflict(tmp_path, monkeypatch):
-    """Concrete repro for the conflict documented in `scheduler/service.py`'s
-    module docstring: `ensure_main_session()` always creates the main session as
-    `mode="task"` (sessions/service.py, out of this branch's reach), and
-    `SessionService.create()`'s existing PRD 9.6 guard rejects a `mode="auto"`
-    child of a `mode="task"` parent — exactly what a default (mode="auto") Cron
-    dispatches as its parent-child pair. This is not this branch's bug to fix (it
-    can't touch `sessions/service.py`), but the failure must still come back as an
-    honest, recorded dispatch failure — not a crash — which is what this test
-    actually asserts."""
+async def test_dispatch_of_an_auto_cron_under_a_task_parent_now_succeeds_system_dispatch(
+    tmp_path, monkeypatch
+):
+    """Issue #20 跨分支裁定 (2026-09-19): this used to be a repro for the PRD
+    9.1/9.6 conflict documented in `scheduler/service.py`'s module docstring —
+    `ensure_main_session()` always creates the main session as `mode="task"`,
+    and `SessionService.create()`'s PRD 9.6 guard used to reject a `mode="auto"`
+    child of a `mode="task"` parent, which is exactly what an explicit
+    `mode="auto"` Cron dispatches as its parent-child pair (and what PRD 9.1
+    says a Cron-triggered Run should default to). The controller ruling
+    resolved this: N13's mode-narrowing gate is for agent self-escalation, not
+    for a system dispatch carrying the user's own cron-configured
+    authorization, so `_dispatch_body_claimed` now calls
+    `SessionService.create(..., system_dispatch=True)` and this dispatch
+    succeeds against the real, unmodified `SessionService` — no
+    `cron_dispatch_error`, no fail_count bump."""
     monkeypatch.setenv("JONES_HOME", str(tmp_path))
 
     def _open() -> Any:
@@ -656,36 +667,53 @@ async def test_dispatch_against_real_session_service_hits_the_mode_conflict(tmp_
     session_service = SessionService(ctx)
     await session_service.startup()
     try:
+        main_id = await session_service.ensure_main_session()
+        main = await session_service.get(main_id)
+        assert main["mode"] == "task"  # the real, unmodified default
+
         clock = ManualClock(datetime(2026, 1, 1, 10, 0, tzinfo=UTC))
         service = CronService(ctx, session_service, clock=clock, poll_interval_seconds=0.001)
         row = await service.upsert(
-            project_id=DEFAULT_PROJECT_ID, agent_id=DEFAULT_AGENT_ID, name="conflict repro",
+            project_id=DEFAULT_PROJECT_ID, agent_id=DEFAULT_AGENT_ID, name="auto cron",
             expr="* * * * *", prompt="x", mode="auto",
         )
 
         await service.run_now(row["id"])
 
         after = await run_in_db_thread(queries.get_cron, ctx.db, row["id"])
-        assert after["fail_count"] == 1  # an honest failure, not a silent no-op
+        assert after["fail_count"] == 0  # no more cron_dispatch_error
 
         completed = ctx.server.events("message.completed")
-        assert len(completed) == 1
-        content = completed[0][1]["content"]
-        assert content["meta"]["kind"] == "cron_dispatch_error"
-        assert "mode=auto" in content["text"]
-        assert "mode=task" in content["text"]
+        assert not any(
+            e[1]["content"].get("meta", {}).get("kind") == "cron_dispatch_error"
+            for e in completed
+        )
+
+        children = await run_in_db_thread(
+            lambda: [
+                dict(r)
+                for r in ctx.db.execute(
+                    "SELECT * FROM sessions WHERE parent_id = ?", (main_id,)
+                ).fetchall()
+            ]
+        )
+        assert len(children) == 1
+        assert children[0]["mode"] == "auto"
     finally:
         await session_service.shutdown()
 
 
-async def test_default_mode_avoids_the_9_6_gate_against_real_session_service(tmp_path, monkeypatch):
-    """Round-1 fix (review #1/#13): companion to the test above. `cron.upsert`'s
-    default `mode` changed from `auto` to `task` specifically so the `create()`
-    call a default (no explicit `mode`) cron dispatch makes — `parent_id=<main
-    session, mode=task>`, `mode=cron.mode`int — no longer hits PRD 9.6's guard
-    against the real `SessionService`. This does not touch `sessions/service.py`
-    (out of this branch's reach); it only proves that L's own new default,
-    against the *existing, unmodified* gate, actually clears it."""
+async def test_default_mode_is_auto_and_dispatches_against_real_session_service(
+    tmp_path, monkeypatch
+):
+    """Round-3 (controller 跨分支裁定): companion to the test above, for the
+    *default* (no explicit `mode=`) path — `cron.upsert`'s default is PRD 9.1's
+    `"auto"` again (round-1 had temporarily changed it to `"task"` only because
+    the 9.6 gate rejected every default dispatch; round-3's `system_dispatch`
+    exemption removed that blocker, so the stopgap default is gone too). Pins
+    that a bare `cron.upsert` — no `mode=` at all — both stores `mode="auto"`
+    and dispatches successfully against the real, unmodified-elsewhere
+    `SessionService`."""
     monkeypatch.setenv("JONES_HOME", str(tmp_path))
 
     def _open() -> Any:
@@ -712,15 +740,16 @@ async def test_default_mode_avoids_the_9_6_gate_against_real_session_service(tmp
         service = CronService(ctx, session_service, clock=clock, poll_interval_seconds=0.001)
         row = await service.upsert(
             project_id=DEFAULT_PROJECT_ID, agent_id=DEFAULT_AGENT_ID, name="default mode",
-            expr="* * * * *", prompt="x",  # no `mode=` — exercises the new default
+            expr="* * * * *", prompt="x",  # no `mode=` — exercises the PRD 9.1 default
         )
-        assert row["mode"] == "task"
+        assert row["mode"] == "auto"
 
         await service.run_now(row["id"])
 
         after = await run_in_db_thread(queries.get_cron, ctx.db, row["id"])
-        # No PRD 9.6 rejection: `create()` cleared the gate, so this is not the
-        # `cron_dispatch_error` the `mode="auto"` repro above records.
+        # No PRD 9.6 rejection: `system_dispatch=True` cleared the gate, so this
+        # is not the `cron_dispatch_error` a plain `mode="auto"` dispatch used
+        # to record before round-3.
         assert after["fail_count"] == 0
     finally:
         await session_service.shutdown()

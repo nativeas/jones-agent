@@ -20,7 +20,7 @@
 ## 2. L：Cron（FR11）
 
 - `scheduler/cron_expr.py`：五段 cron 解析 + `next_after(dt)`（自己写，≤150 行，有边界测试；不引第三方）。
-- `scheduler/service.py`：启动时加载 `crons` 表 `enabled=1` 的项，计算 `next_run_at`；**单个** `asyncio` 定时器等待最近一项（不轮询）；到点 → 若已有该 cron 的 Run 在跑则跳过并记 `skipped_overlap`；否则 `SessionService.create(project_id, agent_id, parent_id=<主会话>, mode=cron.mode 默认 task, title=cron 名)` → `send(prompt)`；`tasks` 行 `source=cron`。
+- `scheduler/service.py`：启动时加载 `crons` 表 `enabled=1` 的项，计算 `next_run_at`；**单个** `asyncio` 定时器等待最近一项（不轮询）；到点 → 若已有该 cron 的 Run 在跑则跳过并记 `skipped_overlap`；否则 `SessionService.create(project_id, agent_id, parent_id=<主会话>, mode=cron.mode 默认 auto，system_dispatch=True，见 §2.2, title=cron 名)` → `send(prompt)`；`tasks` 行 `source=cron`。
 - **结果推回主会话**：Run 结束（成功/终止）后向主会话插入一条 `role=system` 消息（摘要 + 子会话链接 + 终止卡片若有），并广播 `message.completed`。
 - **失败计数**：连续失败 3 次 → `enabled=0` + 主会话系统消息「已自动停用」（PRD 12.3 FR11）。
 - **时钟与恢复**：daemon 启动时对错过的触发**不补跑**（PRD 5.8 精神；记录一条 `missed` 日志与主会话提示）；`runtime/` 里记 `next_run_at` 快照（`runtime/cron_schedule.json`，best-effort 镜像——`crons.next_run_at` 才是 `_loop` 实际调度依据的事实源，这份文件写失败只记日志，不影响派发）。
@@ -29,8 +29,14 @@
 
 ### 2.1 第 1 轮评审后追加的契约决策（round-1，2026-09-19）
 
-- **`cron.upsert` 的 `mode` 默认值改为 `task`，不是 PRD 9.1 字面的 `auto`**：`ensure_main_session()`（`sessions/service.py`，不在 L 范围）恒把主会话建成 `mode=task`；`SessionService.create()` 的 PRD 9.6/N13 闸拒绝 `mode=task` 父会话下的 `mode=auto` 子会话。这两条都是既有、正确的 PRD 落地，但同时成立时，PRD 9.1「Cron 触发的 Run 默认以自动模式运行」这句话在当前系统里**无法达成**——默认配置下第一次 `create()` 就会被拒。这是 PRD 内部两条要求的真实冲突，不是本分支能单方面通过设计文档改写 PRD 的地方；在跨分支裁定（`sessions/service.py` 是否要为系统触发开一道豁免，或主会话默认改 `auto`）之前，L 在自己独占的 `scheduler/` 范围内选择**不让默认配置开箱即挂**：`cron.upsert` 不传 `mode` 时用 `task`，能正常派发、正常走审查闸（PRD 9.1 对 `task` 模式的定义——只读放行、改变外部世界的动作逐条走三道闸——本来就适用）。用户仍可显式把某个 cron 设成 `mode=auto`；那种情况下若主会话仍是 `task`，仍会被 9.6 闸拒绝并诚实记为失败，这是已知的、未解决的跨分支缺口（见分支报告），需要控制者在 `sessions/service.py` 侧裁定后再收口，**不是本条决策想掩盖的问题**。
+- **`cron.upsert` 的 `mode` 默认值一度改为 `task`（round-1，已被 round-3 取代，见 §2.2）**：`ensure_main_session()`（`sessions/service.py`，不在 L 范围）恒把主会话建成 `mode=task`；`SessionService.create()` 的 PRD 9.6/N13 闸拒绝 `mode=task` 父会话下的 `mode=auto` 子会话。这两条都是既有、正确的 PRD 落地，但同时成立时，PRD 9.1「Cron 触发的 Run 默认以自动模式运行」这句话在当前系统里**无法达成**——默认配置下第一次 `create()` 就会被拒。这是 PRD 内部两条要求的真实冲突，不是本分支能单方面通过设计文档改写 PRD 的地方；在跨分支裁定之前，L 在自己独占的 `scheduler/` 范围内选择**不让默认配置开箱即挂**：`cron.upsert` 不传 `mode` 时用 `task`。这一段作为 round-1 决策的历史记录保留；§2.2 记录了后续跨分支裁定如何取代它。
 - **cron 表达式按本机系统时区解释，存储仍是 UTC ISO**：`scheduler/cron_expr.py` 的 `next_after` 本身不关心时区（按调用者传入的 `datetime` 的 tzinfo 计算）；`scheduler/service.py::_next_after_local` 是唯一做 UTC↔本地转换的地方——把 `Clock.now()`（UTC）转成本机时区再求下一次匹配，再转回 UTC 存库。理由：这是单机桌面调度器，用户写 `"0 9 * * *"`的直觉预期是"本机每天早 9 点"，不是 UTC 9 点；`00-foundation.md` §4.1 规定的是**存储格式**（UTC ISO），不等于"表达式按 UTC 解释"，此前的实现把这两件事混为一谈。已知限制：本机时区偏移若不是整小时（极少数地区，如 UTC+5:30），跨时区部署会有分钟级别的边界效应；v1 不为此加 `tz` 列，桌面单机场景下按需再收口。
+
+### 2.2 第 3 轮：跨分支裁定收口 mode 冲突（round-3，controller，2026-09-19）
+
+- **裁定**：§2.1 遗留的跨分支缺口——「(a) 主会话默认改 `auto`」「(b) 给系统派发开豁免口」「(c) cron 默认 `mode=task`」——按 (b) 收口。`SessionService.create()`（`sessions/service.py`）新增关键字参数 `system_dispatch: bool = False`：为 `True` 时跳过 PRD 9.6/N13 的父模式收窄校验（`parent.mode=="task" and mode=="auto"` 那一支），仅 `CronService._dispatch_body_claimed` 会传 `True`；RPC `session.create`（`sessions/methods.py`）不读这个字段，外部调用者永远拿到 `False`，不构成权限口子。理由：9.6/N13 的闸是防「Agent 自我提权」，而 cron 的 `mode` 是用户在 `cron.upsert` 时自己显式配置、prior 授权好的，不是 Agent 在会话里现场选的——把两种「谁在决定 mode」的场景用同一道闸拦，本身就是过度收紧。N13 的另一半（工具白名单 ⊆ 父会话）不受影响，继续由 `permissions/gate_config.py` 对活的父链持续强制。
+- **随裁定收口**：`cron.upsert`（`scheduler/service.py`、`scheduler/methods.py`）的 `mode` 默认值改回 PRD 9.1 字面的 `"auto"`——round-1 选 `task` 只是因为当时这条路径过不了 9.6 闸，纯属临时避让；闸本身现在已经对 cron 派发开了口子，没有理由再让默认值绕开 PRD 明文要求的「开箱自动模式」。用户仍可在 cron 定义里显式设 `mode="task"`（PRD 9.1「用户可在 Cron 定义里改为任务模式」）。
+- **验证**：`daemon/tests/test_scheduler_service.py` 用真实、未改动过校验逻辑之外的 `SessionService`（非 stub）分别验证「默认 `mode`（现为 `auto`）对真实 9.6 闸能派发成功」与「显式 `mode=auto` 同样成功」，两者 `fail_count` 都为 0，不再产生 `cron_dispatch_error`。
 
 ## 3. M：内置 Skill（FR12 内置）
 

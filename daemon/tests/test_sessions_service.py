@@ -1124,3 +1124,90 @@ async def test_daemon_status_reports_real_active_sessions_and_worker_counts(tmp_
         assert after["sessions_active"] == 0
     finally:
         await service.shutdown()
+
+
+# -- Issue #20 跨分支裁定: create()'s `system_dispatch` N13 exception ----------------
+
+
+async def test_create_system_dispatch_bypasses_the_N13_mode_narrowing_gate(tmp_path, monkeypatch):
+    """Issue #20 controller ruling (2026-09-19): PRD 9.6/N13's "子会话模式不得比
+    父会话宽" gate targets an Agent self-escalating its own derived sub-session —
+    it is not meant to block a *system* dispatch (CronService) creating a child
+    whose mode the user already configured explicitly in the cron definition
+    (PRD 9.1's "Cron 触发的 Run 默认以自动模式运行"). `system_dispatch=True` skips
+    exactly that one check."""
+    service = await _make_service(tmp_path, monkeypatch)
+    parent_id = await _new_session(service, title="parent")  # mode="task"
+
+    child = await service.create(
+        project_id=DEFAULT_PROJECT_ID, agent_id=DEFAULT_AGENT_ID,
+        parent_id=parent_id, mode="auto", title="cron child", system_dispatch=True,
+    )
+    assert child["mode"] == "auto"
+
+
+async def test_create_without_system_dispatch_still_rejects_auto_child_of_task_parent_N13(
+    tmp_path, monkeypatch
+):
+    """Regression guard: `system_dispatch` defaults to `False`, so an ordinary
+    (agent-initiated-shaped) `create()` call is unaffected — the pre-existing
+    PRD 9.6/N13 gate still rejects a `mode=auto` child of a `mode=task` parent."""
+    from jones_daemon.rpc.errors import INVALID_STATE, RpcError  # noqa: PLC0415
+
+    service = await _make_service(tmp_path, monkeypatch)
+    parent_id = await _new_session(service, title="parent")  # mode="task"
+
+    with pytest.raises(RpcError) as excinfo:
+        await service.create(
+            project_id=DEFAULT_PROJECT_ID, agent_id=DEFAULT_AGENT_ID,
+            parent_id=parent_id, mode="auto", title="agent child",
+        )
+    assert excinfo.value.code == INVALID_STATE
+
+
+async def test_rpc_session_create_never_exposes_system_dispatch_to_external_callers(
+    tmp_path, monkeypatch
+):
+    """Issue #20 controller ruling: `session.create`'s RPC handler must never let
+    an external caller reach `system_dispatch=True` — `sessions/methods.py`
+    simply never reads that key out of `params`, so even a malicious/naive
+    client sending `{"system_dispatch": true}` over the wire is ignored, and a
+    `mode=auto` child of a `mode=task` parent is still rejected exactly like
+    any other ordinary `session.create` call."""
+    from jones_daemon.rpc.errors import INVALID_STATE, RpcError  # noqa: PLC0415
+    from jones_daemon.rpc.server import RpcServer  # noqa: PLC0415
+    from jones_daemon.sessions import methods as sessions_methods  # noqa: PLC0415
+
+    def _open() -> Any:
+        conn = connect(tmp_path / "jones.db")
+        apply_pending(conn)
+        bootstrap_projects_and_agents(conn)
+        return conn
+
+    monkeypatch.setenv("JONES_HOME", str(tmp_path))
+    conn = await run_in_db_thread(_open)
+    from jones_daemon import paths  # noqa: PLC0415
+
+    server = RpcServer(None)
+    ctx = DaemonContext(
+        db=conn, paths=paths, server=server,
+        providers=_StubProviderResolver(), config=NullConfigResolver(),
+    )
+    sessions_methods.register(server, ctx)
+    create = server._methods["session.create"]
+
+    parent = await create(
+        {"project_id": DEFAULT_PROJECT_ID, "agent_id": DEFAULT_AGENT_ID, "mode": "task"},
+        conn=None,
+    )
+
+    with pytest.raises(RpcError) as excinfo:
+        await create(
+            {
+                "project_id": DEFAULT_PROJECT_ID, "agent_id": DEFAULT_AGENT_ID,
+                "parent_id": parent["id"], "mode": "auto",
+                "system_dispatch": True,  # must be ignored, not a real bypass
+            },
+            conn=None,
+        )
+    assert excinfo.value.code == INVALID_STATE

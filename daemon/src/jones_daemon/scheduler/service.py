@@ -18,18 +18,19 @@ of waiting out whatever stale deadline `_loop` was already parked on.
 第 1 轮修复记录（round-1 review fixes, see the PR report's own section for detail
 on each）:
 
-- **Default `mode` is now `"task"`, not `"auto"`** (review #1/#13): PRD 9.6/N13's
-  gate on `SessionService.create()` (out of this branch's reach) rejects a
-  `mode=auto` child of a `mode=task` parent, and `ensure_main_session()` always
-  builds the main session as `mode=task` — so the old `mode=auto` default made
-  every out-of-the-box cron dispatch fail, every time, 100% of the time. This is
-  the "改前提，不打补丁" fix within what this branch actually owns: `cron.upsert`'s
-  default is now `mode="task"` (04-w5-interfaces.md §2 records the decision and the
-  PRD 9.1/9.6 tension it resolves). A cron can still be explicitly set to
-  `mode="auto"` — that still hits the 9.6 gate when the main session is
-  `mode=task` (the overwhelming common case), and is still handled as an honest
-  dispatch failure, exactly as before; that residual gap needs a cross-branch
-  decision on `sessions/service.py` this branch still can't make (see the report).
+- **Default `mode` was changed to `"task"`, not `"auto"`** (review #1/#13):
+  PRD 9.6/N13's gate on `SessionService.create()` (out of this branch's reach
+  at the time) rejects a `mode=auto` child of a `mode=task` parent, and
+  `ensure_main_session()` always builds the main session as `mode=task` — so
+  the old `mode=auto` default made every out-of-the-box cron dispatch fail,
+  every time, 100% of the time. This was the "改前提，不打补丁" fix within
+  what this branch could reach at the time: `cron.upsert`'s default became
+  `mode="task"`, and the residual gap (an explicit `mode="auto"` cron still
+  hitting the 9.6 gate) was left as an open, documented cross-branch item.
+  **Superseded in round-3 below**: the cross-branch decision landed, the
+  default reverts to PRD 9.1's `"auto"`, and this paragraph is kept only as
+  the historical record of round-1's interim choice — see round-3's entry
+  and 04-w5-interfaces.md §2.2 for the current state.
 - **Cron fields are now interpreted in the local system timezone** (review #4):
   `next_after` itself is timezone-agnostic (operates on whatever tzinfo `dt`
   carries — see `cron_expr.py`); this branch was calling it with `Clock.now()`
@@ -109,6 +110,26 @@ on each）:
   3-strikes auto-disables and the reopened overlap-guard hole they caused; see
   `_poll_until_done`'s docstring) only happen once nobody is actually waiting on
   the user's decision anymore.
+
+第 3 轮修复记录（round-3, controller 跨分支裁定, 2026-09-19）：
+
+- **Review #1/#13's residual cross-branch gap is now closed, and `mode`'s
+  default reverts to PRD 9.1's `"auto"`**: round-1 left a documented, open
+  choice among (a) main session defaults to `auto`, (b) a system-dispatch
+  exemption from the 9.6 gate, (c) cron stays `mode=task` by default. The
+  controller ruled (b): `SessionService.create()` gained a `system_dispatch:
+  bool = False` kwarg (not reachable from the `session.create` RPC — only
+  this service's own dispatch path can set it) that skips the parent-mode-
+  narrowing check for exactly this case — a cron's `mode` is the user's own
+  prior, explicit authorization (set in the cron definition, not chosen live
+  by an Agent), which is what that gate is meant to allow through; the Agent
+  tool-allowlist half of N13 is untouched, still enforced continuously by
+  `permissions/gate_config.py`. `_dispatch_body_claimed` now passes
+  `system_dispatch=True`. With the actual blocker gone, `cron.upsert`'s
+  default `mode` reverts to `"auto"` (PRD 9.1's literal text, and the point
+  of FR11's "开箱即用") — round-1's `"task"` default was only ever a stopgap
+  against a gate that no longer applies to this path; see `upsert`'s
+  docstring and 04-w5-interfaces.md §2/§2.2.
 """
 
 from __future__ import annotations
@@ -335,11 +356,14 @@ class CronService:
         name: str,
         expr: str,
         prompt: str,
-        # Round-1 fix (review #1/#13): was `"auto"`. See the module docstring's
-        # "第 1 轮修复记录" entry — `mode=auto` is still accepted when the caller
-        # asks for it explicitly, it's just no longer what a bare `cron.upsert`
-        # silently gets by default.
-        mode: str = "task",
+        # PRD 9.1 "Cron 触发的 Run 默认以自动模式运行". Round-1 (review #1/#13)
+        # temporarily changed this to `"task"` because the real `create()` gate
+        # rejected every default dispatch outright (see the module docstring's
+        # "第 1 轮修复记录"); the 跨分支裁定 landed in round-3 below
+        # (`system_dispatch`) removes that blocker, so the default reverts to
+        # what PRD 9.1 actually specifies. A cron can still be set to
+        # `mode="task"` explicitly (PRD 9.1's "用户可在 Cron 定义里改为任务模式").
+        mode: str = "auto",
         enabled: bool = True,
     ) -> dict[str, Any]:
         if mode not in _VALID_MODES:
@@ -556,6 +580,14 @@ class CronService:
             child = await self.session_service.create(
                 project_id=cron["project_id"], agent_id=cron["agent_id"],
                 parent_id=main_session_id, mode=cron["mode"], title=_humanize_name(cron),
+                # Issue #20 跨分支裁定 (2026-09-19, sessions/service.py::create's
+                # `system_dispatch` docstring): a cron's mode is the user's own
+                # explicit, prior authorization (set in the cron definition, not
+                # chosen live by an Agent) — PRD 9.6/N13's "不得比父宽" gate is
+                # for agent self-escalation, not this. The Agent tool-allowlist
+                # half of N13 is unaffected (enforced independently by
+                # permissions/gate_config.py).
+                system_dispatch=True,
             )
         except RpcError as exc:
             self._in_flight.pop(cron_id, None)

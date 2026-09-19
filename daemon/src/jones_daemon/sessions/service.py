@@ -482,16 +482,37 @@ class SessionService:
         parent_id: str | None = None,
         mode: str = "task",
         title: str | None = None,
+        system_dispatch: bool = False,
     ) -> dict[str, Any]:
+        """`system_dispatch` (Issue #20 跨分支裁定, 2026-09-19): PRD 9.6/N13's
+        "子会话模式不得比父会话宽" gate exists to stop an Agent from
+        self-escalating its own derived sub-sessions — it was never meant to
+        constrain a session a *system* component dispatches on the user's own
+        prior, explicit authorization. Cron is exactly that: a cron's `mode`
+        is configured by the user in the cron definition itself (`cron.upsert`),
+        not chosen live by an Agent, and PRD 9.1 says a Cron-triggered Run
+        defaults to auto mode — so `CronService` (the only caller allowed to
+        pass `system_dispatch=True`, see `scheduler/service.py::
+        _dispatch_body_claimed`) skips the parent-mode-narrowing check below.
+        This does NOT touch the Agent tool-allowlist half of N13 (`子会话的
+        工具白名单 ⊆ 父会话`) — that is enforced continuously by
+        `permissions/gate_config.py` off the live parent chain, independent
+        of this method, and stays in force regardless of `system_dispatch`.
+        The RPC `session.create` handler (`sessions/methods.py`) never reads
+        this kwarg from request params, so an external caller can never set
+        it to True.
+        """
         if mode not in _VALID_MODES:
             raise RpcError(INVALID_PARAMS, f"invalid mode: {mode!r}", {"mode": mode})
         if parent_id is not None:
             parent = await run_in_db_thread(queries.get_session, self.ctx.db, parent_id)
             if parent is None:
                 raise RpcError(NOT_FOUND, "parent session not found", {"parent_id": parent_id})
-            if parent["mode"] == "task" and mode == "auto":
+            if parent["mode"] == "task" and mode == "auto" and not system_dispatch:
                 # PRD 9.6 "权限不放大" / N13: a task-mode parent may not derive an
-                # auto-mode child (tightening is fine, the reverse is not).
+                # auto-mode child (tightening is fine, the reverse is not) — unless
+                # this is a system dispatch (see the `system_dispatch` docstring
+                # above), which carries its own user-configured authorization.
                 raise RpcError(
                     INVALID_STATE,
                     "child session cannot be mode=auto when its parent is mode=task (PRD 9.6, N13)",

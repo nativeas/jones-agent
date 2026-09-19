@@ -129,6 +129,29 @@ def test_grandparent_narrows_too(conn):
     assert config["tool_allowlist"] == ["shell"]
 
 
+def test_system_dispatch_child_with_a_wider_tool_allowlist_is_still_narrowed_N13(conn):
+    """Issue #20 跨分支裁定 (2026-09-19): `SessionService.create(system_dispatch=
+    True)` skips N13's mode-narrowing check (so a Cron can now create a
+    `mode=auto` child of a `mode=task` parent — a combination that used to be
+    impossible to persist), but that exception is scoped to the mode check
+    only. This session shape — `mode=auto` child of a `mode=task` parent —
+    proves the *tool-allowlist* half of N13 doesn't care how the session got
+    created: `gate_config.build` still walks the parent chain and narrows the
+    child's effective tool_allowlist down to the intersection, even though the
+    child Agent's own allowlist is a wider superset of the parent Agent's."""
+    _insert_agent(conn, "parent_agent", ["shell"])
+    _insert_agent(conn, "child_agent", ["shell", "browser", "terminal"])  # superset
+    _insert_session(conn, "parent", agent_id="parent_agent", parent_id=None, mode="task")
+    _insert_session(conn, "child", agent_id="child_agent", parent_id="parent", mode="auto")
+    config = gate_config.build(
+        conn=conn, permissions_result={}, session=_session_row(conn, "child"),
+        user_root=Path("/tmp/jones_home"), project_path=None,
+    )
+    assert config["tool_allowlist"] == ["shell"]
+    assert "browser" not in config["tool_allowlist"]
+    assert "terminal" not in config["tool_allowlist"]
+
+
 def test_permissions_result_as_null_config_resolver_dict_is_handled(conn):
     _insert_agent(conn, "a1", [])
     _insert_session(conn, "s1", agent_id="a1", parent_id=None)
