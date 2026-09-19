@@ -28,7 +28,7 @@ work, not this file's.
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 # Reserved tool name the daemon uses to prove this plugin is loaded (never a real
 # tool a worker would otherwise dispatch). Kept in sync by hand with
@@ -38,8 +38,8 @@ PROBE_TOOL_NAME = "jones.__probe__"
 
 
 def _on_pre_tool_call(
-    tool_name: str = "", args: Optional[dict] = None, tool_call_id: str = "", **kwargs: Any
-) -> Optional[dict]:
+    tool_name: str = "", args: dict | None = None, tool_call_id: str = "", **kwargs: Any
+) -> dict | None:
     if tool_name == PROBE_TOOL_NAME:
         return {
             "action": "block",
@@ -69,5 +69,8 @@ def register(ctx: Any) -> None:
         toolset="jones",
         schema={"type": "object", "properties": {}, "additionalProperties": False},
         handler=_probe_handler,
-        description="Jones daemon startup self-check probe. Always blocked by jones_gate before it can run.",
+        description=(
+            "Jones daemon startup self-check probe. Always blocked by jones_gate "
+            "before it can run."
+        ),
     )

@@ -21,8 +21,43 @@
 --    "was queued". This is an additive schema change under A's own ownership
 --    (queue/turn is squarely #10), called out here per the "改接口先改文档" rule; see
 --    docs/design/01-w2-interfaces.md §2 for the corresponding contract note.
+--
+-- 3. `permission_decisions.decided_by` was declared `NOT NULL` in 001_init.sql, but
+--    00-foundation.md §5's own column description — "decided_by(rule/model/user)" —
+--    is only meaningful once a decision has actually been made; a freshly-created
+--    request (`decision='pending'`, ACP's `session/request_permission` still
+--    in flight, nobody has decided anything yet) has no honest non-NULL value to put
+--    there. This is a genuine bug in 001, not a design choice to route around with a
+--    sentinel string in application code (DEV.md 工程原则 #2: 不打补丁) — confirmed by
+--    actually running the INSERT `sessions/queries.py::insert_permission_decision`
+--    needs to make and watching SQLite raise `NOT NULL constraint failed`. Never
+--    modify an already-applied migration in place (001 may already be applied to a
+--    running dev DB) — fixed here, in A's own 002, via SQLite's standard
+--    rebuild-the-table ALTER pattern. The table is empty at this migration step in
+--    every real deployment (permission_decisions didn't exist as a concept before
+--    #10), so the copy step below is for correctness/symmetry with the general
+--    pattern, not because there's data expected to be present.
 
 ALTER TABLE queue_items ADD COLUMN turn_id TEXT REFERENCES turns(id);
+
+CREATE TABLE permission_decisions_new (
+    id TEXT PRIMARY KEY,
+    step_id TEXT REFERENCES steps(id),
+    gate TEXT NOT NULL,
+    risk TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    decided_by TEXT,
+    request_json TEXT NOT NULL,
+    decided_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+INSERT INTO permission_decisions_new
+    SELECT id, step_id, gate, risk, decision, decided_by, request_json, decided_at, created_at, updated_at
+    FROM permission_decisions;
+DROP TABLE permission_decisions;
+ALTER TABLE permission_decisions_new RENAME TO permission_decisions;
+CREATE INDEX IF NOT EXISTS ix_permission_decisions_step_id ON permission_decisions(step_id);
 
 INSERT OR IGNORE INTO projects (id, path, name, settings_json, created_at, updated_at)
 VALUES (

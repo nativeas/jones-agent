@@ -279,18 +279,28 @@ class WorkerManager:
                 client.new_session(cwd), timeout=self._startup_timeout_s
             )
             worker.acp_session_id = new_session_result["sessionId"]
-            await asyncio.wait_for(self._startup_self_check(worker), timeout=self._startup_timeout_s)
+            await asyncio.wait_for(
+                self._startup_self_check(worker), timeout=self._startup_timeout_s
+            )
         except (TimeoutError, AcpError, AcpProtocolError, KeyError, WorkerStartupError) as exc:
             elapsed = time.monotonic() - t0
             logger.error(
                 "worker startup self-check failed, refusing to deliver this worker",
-                extra={"detail": {"session_id": session_id, "elapsed_s": round(elapsed, 3), "error": str(exc)}},
+                extra={
+                    "detail": {
+                        "session_id": session_id,
+                        "elapsed_s": round(elapsed, 3),
+                        "error": str(exc),
+                    }
+                },
             )
             await self._terminate(worker, reason="startup_check_failed")
             raise WorkerStartupError(f"worker startup self-check failed: {exc}") from exc
 
         worker.session_update_handler = functools.partial(self._on_session_update, session_id)
-        worker.request_permission_handler = functools.partial(self._on_request_permission, session_id)
+        worker.request_permission_handler = functools.partial(
+            self._on_request_permission, session_id
+        )
         worker.last_active = time.monotonic()
         elapsed = time.monotonic() - t0
         self.startup_latencies_s.append(elapsed)
@@ -365,7 +375,12 @@ class WorkerManager:
                     break
                 logger.info(
                     "worker stderr",
-                    extra={"detail": {"session_id": session_id, "line": line.decode(errors="replace").rstrip()}},
+                    extra={
+                        "detail": {
+                            "session_id": session_id,
+                            "line": line.decode(errors="replace").rstrip(),
+                        }
+                    },
                 )
         except asyncio.CancelledError:
             raise

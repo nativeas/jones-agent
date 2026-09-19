@@ -100,7 +100,8 @@ def set_session_mode(conn: sqlite3.Connection, session_id: str, mode: str) -> di
 def latest_turn(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
     return _d(
         conn.execute(
-            "SELECT * FROM turns WHERE session_id = ? ORDER BY created_at DESC LIMIT 1", (session_id,)
+            "SELECT * FROM turns WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
+            (session_id,),
         ).fetchone()
     )
 
@@ -128,15 +129,16 @@ def create_turn_and_user_message(
     status = "queued" if queued else "running"
     try:
         conn.execute(
-            "INSERT INTO turns (id, session_id, user_message_id, run_id, status, created_at, updated_at) "
-            "VALUES (?, ?, ?, NULL, ?, ?, ?)",
+            "INSERT INTO turns (id, session_id, user_message_id, run_id, status, "
+            "created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?, ?)",
             (turn_id, session_id, message_id, status, now, now),
         )
         seq = next_seq(conn, session_id)
+        content = json.dumps({"kind": "text", "text": text})
         conn.execute(
-            "INSERT INTO messages (id, session_id, turn_id, role, content_json, seq, created_at, updated_at) "
-            "VALUES (?, ?, ?, 'user', ?, ?, ?, ?)",
-            (message_id, session_id, turn_id, json.dumps({"kind": "text", "text": text}), seq, now, now),
+            "INSERT INTO messages (id, session_id, turn_id, role, content_json, seq, "
+            "created_at, updated_at) VALUES (?, ?, ?, 'user', ?, ?, ?, ?)",
+            (message_id, session_id, turn_id, content, seq, now, now),
         )
         conn.commit()
     except sqlite3.Error:
@@ -144,18 +146,22 @@ def create_turn_and_user_message(
         raise
 
 
-def insert_assistant_message(conn: sqlite3.Connection, *, message_id: str, session_id: str, turn_id: str, kind: str) -> None:
+def insert_assistant_message(
+    conn: sqlite3.Connection, *, message_id: str, session_id: str, turn_id: str, kind: str
+) -> None:
     now = iso_now()
     seq = next_seq(conn, session_id)
     conn.execute(
-        "INSERT INTO messages (id, session_id, turn_id, role, content_json, seq, created_at, updated_at) "
-        "VALUES (?, ?, ?, 'assistant', ?, ?, ?, ?)",
+        "INSERT INTO messages (id, session_id, turn_id, role, content_json, seq, "
+        "created_at, updated_at) VALUES (?, ?, ?, 'assistant', ?, ?, ?, ?)",
         (message_id, session_id, turn_id, json.dumps({"kind": kind, "text": ""}), seq, now, now),
     )
     conn.commit()
 
 
-def finalize_message(conn: sqlite3.Connection, message_id: str, *, kind: str, text: str) -> dict[str, Any] | None:
+def finalize_message(
+    conn: sqlite3.Connection, message_id: str, *, kind: str, text: str
+) -> dict[str, Any] | None:
     conn.execute(
         "UPDATE messages SET content_json = ?, updated_at = ? WHERE id = ?",
         (json.dumps({"kind": kind, "text": text}), iso_now(), message_id),
@@ -174,7 +180,8 @@ def list_turn_messages(
         )
     else:
         cur = conn.execute(
-            "SELECT * FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?", (session_id, limit)
+            "SELECT * FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?",
+            (session_id, limit),
         )
     rows = _rows(cur)
     rows.reverse()
@@ -184,15 +191,23 @@ def list_turn_messages(
 # -- queue ----------------------------------------------------------------------
 
 
-def enqueue(conn: sqlite3.Connection, *, session_id: str, turn_id: str, text: str, attachments: list[Any] | None) -> None:
+def enqueue(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    turn_id: str,
+    text: str,
+    attachments: list[Any] | None,
+) -> None:
     now = iso_now()
     row = conn.execute(
-        "SELECT COALESCE(MAX(position), 0) + 1 AS n FROM queue_items WHERE session_id = ?", (session_id,)
+        "SELECT COALESCE(MAX(position), 0) + 1 AS n FROM queue_items WHERE session_id = ?",
+        (session_id,),
     ).fetchone()
     position = int(row["n"])
     conn.execute(
-        "INSERT INTO queue_items (id, session_id, text, attachments_json, position, state, turn_id, "
-        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+        "INSERT INTO queue_items (id, session_id, text, attachments_json, position, state, "
+        "turn_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
         (turn_id, session_id, text, json.dumps(attachments or []), position, turn_id, now, now),
     )
     conn.commit()
@@ -201,7 +216,8 @@ def enqueue(conn: sqlite3.Connection, *, session_id: str, turn_id: str, text: st
 def list_queue_items(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
     return _rows(
         conn.execute(
-            "SELECT * FROM queue_items WHERE session_id = ? AND state = 'pending' ORDER BY position",
+            "SELECT * FROM queue_items WHERE session_id = ? AND state = 'pending' "
+            "ORDER BY position",
             (session_id,),
         )
     )
@@ -209,14 +225,16 @@ def list_queue_items(conn: sqlite3.Connection, session_id: str) -> list[dict[str
 
 def pop_next_queue_item(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
     row = conn.execute(
-        "SELECT * FROM queue_items WHERE session_id = ? AND state = 'pending' ORDER BY position LIMIT 1",
+        "SELECT * FROM queue_items WHERE session_id = ? AND state = 'pending' "
+        "ORDER BY position LIMIT 1",
         (session_id,),
     ).fetchone()
     if row is None:
         return None
     item = _d(row)
     conn.execute(
-        "UPDATE queue_items SET state = 'sent', updated_at = ? WHERE id = ?", (iso_now(), row["id"])
+        "UPDATE queue_items SET state = 'sent', updated_at = ? WHERE id = ?",
+        (iso_now(), row["id"]),
     )
     conn.commit()
     return item
@@ -240,8 +258,8 @@ def reorder_queue_items(conn: sqlite3.Connection, *, session_id: str, item_ids: 
     try:
         for position, item_id in enumerate(item_ids, start=1):
             conn.execute(
-                "UPDATE queue_items SET position = ?, updated_at = ? WHERE id = ? AND session_id = ? "
-                "AND state = 'pending'",
+                "UPDATE queue_items SET position = ?, updated_at = ? WHERE id = ? "
+                "AND session_id = ? AND state = 'pending'",
                 (position, iso_now(), item_id, session_id),
             )
         conn.commit()
@@ -292,7 +310,9 @@ def mark_run_completed(conn: sqlite3.Connection, run_id: str, turn_id: str) -> N
         raise
 
 
-def mark_run_terminated(conn: sqlite3.Connection, run_id: str, turn_id: str, *, kind: str, reason: str) -> None:
+def mark_run_terminated(
+    conn: sqlite3.Connection, run_id: str, turn_id: str, *, kind: str, reason: str
+) -> None:
     now = iso_now()
     try:
         conn.execute(
@@ -329,7 +349,8 @@ def interrupt_stale_runs(conn: sqlite3.Connection) -> int:
             (now, now),
         )
         conn.execute(
-            "UPDATE turns SET status = 'terminated', updated_at = ? WHERE status = 'running'", (now,)
+            "UPDATE turns SET status = 'terminated', updated_at = ? WHERE status = 'running'",
+            (now,),
         )
         conn.commit()
         return cur.rowcount
@@ -339,14 +360,22 @@ def interrupt_stale_runs(conn: sqlite3.Connection) -> int:
 
 
 def insert_step(
-    conn: sqlite3.Connection, *, step_id: str, run_id: str, seq: int, tool: str, args: Any, status: str
+    conn: sqlite3.Connection,
+    *,
+    step_id: str,
+    run_id: str,
+    seq: int,
+    tool: str,
+    args: Any,
+    status: str,
 ) -> dict[str, Any] | None:
     now = iso_now()
+    args_json = json.dumps(args if args is not None else {})
     conn.execute(
         "INSERT INTO steps (id, run_id, seq, tool, args_json, result_summary, payload_ref, "
         "duration_ms, permission_id, status, created_at, updated_at) "
         "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)",
-        (step_id, run_id, seq, tool, json.dumps(args if args is not None else {}), status, now, now),
+        (step_id, run_id, seq, tool, args_json, status, now, now),
     )
     conn.commit()
     return get_step(conn, step_id)
@@ -380,7 +409,8 @@ def update_step(
     fields.append("updated_at = ?")
     params.append(iso_now())
     params.append(step_id)
-    conn.execute(f"UPDATE steps SET {', '.join(fields)} WHERE id = ?", params)  # noqa: S608 - fixed column allowlist above, no user input in SQL text
+    # noqa: S608 - fixed column allowlist above, no user input in the SQL text itself
+    conn.execute(f"UPDATE steps SET {', '.join(fields)} WHERE id = ?", params)  # noqa: S608
     conn.commit()
     return get_step(conn, step_id)
 
@@ -393,7 +423,13 @@ def list_run_steps(conn: sqlite3.Connection, run_id: str) -> list[dict[str, Any]
 
 
 def insert_permission_decision(
-    conn: sqlite3.Connection, *, decision_id: str, step_id: str | None, gate: str, risk: str, request: dict[str, Any]
+    conn: sqlite3.Connection,
+    *,
+    decision_id: str,
+    step_id: str | None,
+    gate: str,
+    risk: str,
+    request: dict[str, Any],
 ) -> None:
     now = iso_now()
     conn.execute(
@@ -405,17 +441,23 @@ def insert_permission_decision(
     conn.commit()
     if step_id is not None:
         conn.execute(
-            "UPDATE steps SET permission_id = ?, updated_at = ? WHERE id = ?", (decision_id, now, step_id)
+            "UPDATE steps SET permission_id = ?, updated_at = ? WHERE id = ?",
+            (decision_id, now, step_id),
         )
         conn.commit()
 
 
-def decide_permission(conn: sqlite3.Connection, decision_id: str, *, decision: str, decided_by: str) -> dict[str, Any] | None:
+def decide_permission(
+    conn: sqlite3.Connection, decision_id: str, *, decision: str, decided_by: str
+) -> dict[str, Any] | None:
     now = iso_now()
     conn.execute(
-        "UPDATE permission_decisions SET decision = ?, decided_by = ?, decided_at = ?, updated_at = ? "
-        "WHERE id = ?",
+        "UPDATE permission_decisions SET decision = ?, decided_by = ?, decided_at = ?, "
+        "updated_at = ? WHERE id = ?",
         (decision, decided_by, now, now, decision_id),
     )
     conn.commit()
-    return _d(conn.execute("SELECT * FROM permission_decisions WHERE id = ?", (decision_id,)).fetchone())
+    row = conn.execute(
+        "SELECT * FROM permission_decisions WHERE id = ?", (decision_id,)
+    ).fetchone()
+    return _d(row)

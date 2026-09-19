@@ -15,14 +15,17 @@ import os
 import signal
 import sqlite3
 import sys
-import types
 from typing import TextIO
 
 from jones_daemon import paths
+from jones_daemon.context import DaemonContext, NullConfigResolver
 from jones_daemon.logging import configure_logging, get_logger
 from jones_daemon.providers import methods as providers_methods
+from jones_daemon.providers.resolver import DaemonProviderResolver
 from jones_daemon.rpc.methods import register_builtin_methods
 from jones_daemon.rpc.server import RpcServer
+from jones_daemon.secrets.vault import build_default_vault
+from jones_daemon.sessions import methods as sessions_methods
 from jones_daemon.store import apply_pending, connect, run_in_db_thread
 
 logger = get_logger("main")
@@ -95,12 +98,24 @@ async def _run() -> None:
 
         server = RpcServer(paths.sock_file())
         register_builtin_methods(server)
-        # Temporary stand-in for the shared `DaemonContext` (docs/design/01-w2-interfaces.md §1,
-        # owned by branch A, not yet landed in this worktree) — `providers_methods.register()`
-        # only reads `ctx.db`, so a minimal namespace carrying that one attribute is enough to
-        # wire provider.*/model.list up now rather than leaving them unreachable until §1 lands.
-        # Replace with the real `DaemonContext` once it exists; no other call site changes.
-        providers_methods.register(server, types.SimpleNamespace(db=conn))
+
+        # Real `DaemonContext` (docs/design/01-w2-interfaces.md §1). `providers` is
+        # B/#7's real `DaemonProviderResolver` (landed on main) — no `Null*` stand-in
+        # needed there anymore. `config` stays `NullConfigResolver` until C (#8/#9)
+        # lands `config/resolver.py`; A/B only ever pass it through untouched (see
+        # `NullConfigResolver`'s docstring in context.py), so a Null value here is
+        # honest, not a fabrication.
+        vault = build_default_vault(paths.secrets_dir())
+        ctx = DaemonContext(
+            db=conn,
+            paths=paths,
+            server=server,
+            providers=DaemonProviderResolver(conn, vault),
+            config=NullConfigResolver(),
+        )
+        providers_methods.register(server, ctx)
+        session_service = sessions_methods.register(server, ctx)
+        await session_service.startup()
         await server.start()
         logger.info(
             "daemon listening",
@@ -120,6 +135,7 @@ async def _run() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await serve_task
         await server.stop()
+        await session_service.shutdown()
         # close() is also a synchronous sqlite3 call bound to the connection's
         # home thread (check_same_thread=True) — it must run there too.
         await run_in_db_thread(conn.close)

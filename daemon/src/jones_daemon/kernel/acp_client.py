@@ -142,7 +142,8 @@ class AcpClient:
                     message = json.loads(line)
                 except json.JSONDecodeError:
                     logger.warning(
-                        "worker sent non-JSON line, ignoring", extra={"detail": {"line": line[:200]}}
+                        "worker sent non-JSON line, ignoring",
+                        extra={"detail": {"line": line[:200]}},
                     )
                     continue
                 await self._handle_message(message)
@@ -229,7 +230,9 @@ class AcpClient:
             self._writer.write(line.encode("utf-8"))
             await self._writer.drain()
 
-    async def _call(self, method: str, params: dict[str, Any], *, timeout: float | None = None) -> Any:
+    async def _call(
+        self, method: str, params: dict[str, Any], *, timeout: float | None = None
+    ) -> Any:
         req_id = self._next_id
         self._next_id += 1
         loop = asyncio.get_running_loop()
@@ -257,20 +260,27 @@ class AcpClient:
                 # tools already run inside the worker via Hermes's own
                 # tools/file_tools.py & tools/terminal_tool.py, the daemon doesn't
                 # need Hermes calling back into it for those (00-foundation.md §8.3).
-                "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False},
+                "clientCapabilities": {
+                    "fs": {"readTextFile": False, "writeTextFile": False},
+                    "terminal": False,
+                },
                 "clientInfo": {"name": "jones-daemon", "version": "0.1.0"},
             },
             timeout=_HANDSHAKE_TIMEOUT_S,
         )
 
-    async def new_session(self, cwd: str, mcp_servers: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    async def new_session(
+        self, cwd: str, mcp_servers: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
         return await self._call(
             _METHOD_SESSION_NEW,
             {"cwd": cwd, "mcpServers": mcp_servers or []},
             timeout=_HANDSHAKE_TIMEOUT_S,
         )
 
-    async def prompt(self, session_id: str, text: str, *, message_id: str | None = None) -> dict[str, Any]:
+    async def prompt(
+        self, session_id: str, text: str, *, message_id: str | None = None
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "sessionId": session_id,
             "prompt": [{"type": "text", "text": text}],

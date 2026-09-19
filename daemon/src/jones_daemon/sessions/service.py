@@ -55,7 +55,9 @@ def _extract_text(content: Any) -> str:
     return ""
 
 
-def _select_permission_option(options: list[dict[str, Any]], decision: str, remember: str | None) -> str:
+def _select_permission_option(
+    options: list[dict[str, Any]], decision: str, remember: str | None
+) -> str:
     wanted_kind = {
         ("allow", False): "allow_once",
         ("allow", True): "allow_always",
@@ -70,7 +72,9 @@ def _select_permission_option(options: list[dict[str, Any]], decision: str, reme
         if str(opt.get("kind", "")).startswith(prefix):
             return opt["optionId"]
     raise RpcError(
-        INVALID_STATE, f"worker did not offer a {decision!r} permission option", {"options": options}
+        INVALID_STATE,
+        f"worker did not offer a {decision!r} permission option",
+        {"options": options},
     )
 
 
@@ -322,7 +326,11 @@ class SessionService:
         self, session_id: str, *, before: int | None = None, limit: int = 50
     ) -> list[dict[str, Any]]:
         return await run_in_db_thread(
-            queries.list_turn_messages, self.ctx.db, session_id=session_id, before_seq=before, limit=limit
+            queries.list_turn_messages,
+            self.ctx.db,
+            session_id=session_id,
+            before_seq=before,
+            limit=limit,
         )
 
     async def run_get(self, run_id: str) -> dict[str, Any]:
@@ -361,7 +369,9 @@ class SessionService:
         self, request_id: str, decision: str, remember: str | None = None
     ) -> dict[str, Any]:
         if decision not in ("allow", "deny"):
-            raise RpcError(INVALID_PARAMS, f"invalid decision: {decision!r}", {"decision": decision})
+            raise RpcError(
+                INVALID_PARAMS, f"invalid decision: {decision!r}", {"decision": decision}
+            )
         entry = self._pending_permissions.get(request_id)
         if entry is None:
             raise RpcError(NOT_FOUND, "no pending permission request", {"request_id": request_id})
@@ -389,7 +399,9 @@ class SessionService:
 
     async def _run_turn(self, session_id: str, turn_id: str, text: str) -> None:
         run_id = new_ulid()
-        await run_in_db_thread(queries.create_run, self.ctx.db, run_id=run_id, turn_id=turn_id, session_id=session_id)
+        await run_in_db_thread(
+            queries.create_run, self.ctx.db, run_id=run_id, turn_id=turn_id, session_id=session_id
+        )
         ctx_turn = _TurnContext(turn_id=turn_id, run_id=run_id, session_id=session_id)
         self._active_turns[session_id] = ctx_turn
         self.worker_manager.mark_busy(session_id, True)
@@ -399,13 +411,17 @@ class SessionService:
             try:
                 worker = await self.worker_manager.ensure_started(session_id, cwd=cwd)
             except WorkerStartupError as exc:
-                await self._terminate_run(ctx_turn, kind="error", reason=f"worker startup failed: {exc}")
+                await self._terminate_run(
+                    ctx_turn, kind="error", reason=f"worker startup failed: {exc}"
+                )
                 return
             assert worker.client is not None and worker.acp_session_id is not None  # noqa: S101
             try:
                 response = await worker.client.prompt(worker.acp_session_id, text)
             except (AcpError, AcpProtocolError) as exc:
-                await self._terminate_run(ctx_turn, kind="error", reason=f"ACP prompt failed: {exc}")
+                await self._terminate_run(
+                    ctx_turn, kind="error", reason=f"ACP prompt failed: {exc}"
+                )
                 return
             await self._finalize_turn_success(ctx_turn, response)
         finally:
@@ -413,7 +429,9 @@ class SessionService:
             self.worker_manager.mark_busy(session_id, False)
             await self._advance_queue(session_id)
 
-    async def _finalize_turn_success(self, ctx_turn: _TurnContext, response: dict[str, Any]) -> None:
+    async def _finalize_turn_success(
+        self, ctx_turn: _TurnContext, response: dict[str, Any]
+    ) -> None:
         if ctx_turn.assistant_message_id:
             row = await run_in_db_thread(
                 queries.finalize_message, self.ctx.db, ctx_turn.assistant_message_id,
@@ -430,11 +448,18 @@ class SessionService:
         if response.get("stopReason") == "cancelled":
             await self._terminate_run(ctx_turn, kind="user", reason="stopped by user")
             return
-        await run_in_db_thread(queries.mark_run_completed, self.ctx.db, ctx_turn.run_id, ctx_turn.turn_id)
+        await run_in_db_thread(
+            queries.mark_run_completed, self.ctx.db, ctx_turn.run_id, ctx_turn.turn_id
+        )
 
     async def _terminate_run(self, ctx_turn: _TurnContext, *, kind: str, reason: str) -> None:
         await run_in_db_thread(
-            queries.mark_run_terminated, self.ctx.db, ctx_turn.run_id, ctx_turn.turn_id, kind=kind, reason=reason
+            queries.mark_run_terminated,
+            self.ctx.db,
+            ctx_turn.run_id,
+            ctx_turn.turn_id,
+            kind=kind,
+            reason=reason,
         )
         card = {"kind": kind, "message": reason}
         await self.ctx.server.broadcast(
@@ -486,7 +511,9 @@ class SessionService:
         # column exists for these yet (see module docstring's scope-gap note) —
         # dropping them here is a deliberate, documented gap, not a silent one.
 
-    async def _handle_text_delta(self, ctx_turn: _TurnContext, update: dict[str, Any], *, thinking: bool) -> None:
+    async def _handle_text_delta(
+        self, ctx_turn: _TurnContext, update: dict[str, Any], *, thinking: bool
+    ) -> None:
         text = _extract_text(update.get("content"))
         if not text:
             return
@@ -511,11 +538,19 @@ class SessionService:
             ctx_turn.assistant_text += text
             message_id = ctx_turn.assistant_message_id
         await self.ctx.server.broadcast(
-            ctx_turn.session_id, "message.delta",
-            {"session_id": ctx_turn.session_id, "turn_id": ctx_turn.turn_id, "message_id": message_id, "delta": text},
+            ctx_turn.session_id,
+            "message.delta",
+            {
+                "session_id": ctx_turn.session_id,
+                "turn_id": ctx_turn.turn_id,
+                "message_id": message_id,
+                "delta": text,
+            },
         )
 
-    async def _handle_tool_call_start(self, ctx_turn: _TurnContext, update: dict[str, Any]) -> None:
+    async def _handle_tool_call_start(
+        self, ctx_turn: _TurnContext, update: dict[str, Any]
+    ) -> None:
         tool_call_id = update.get("toolCallId")
         step_id = new_ulid()
         ctx_turn.step_seq += 1
@@ -534,7 +569,9 @@ class SessionService:
         )
         await self.ctx.server.broadcast(ctx_turn.session_id, "step.started", row)
 
-    async def _handle_tool_call_update(self, ctx_turn: _TurnContext, update: dict[str, Any]) -> None:
+    async def _handle_tool_call_update(
+        self, ctx_turn: _TurnContext, update: dict[str, Any]
+    ) -> None:
         tool_call_id = update.get("toolCallId")
         step_id = ctx_turn.tool_call_steps.get(tool_call_id) if tool_call_id else None
         if step_id is None:
@@ -562,15 +599,22 @@ class SessionService:
         if status in ("completed", "failed"):
             await self.ctx.server.broadcast(ctx_turn.session_id, "step.completed", row)
 
-    async def _on_request_permission(self, session_id: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def _on_request_permission(
+        self, session_id: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
         decision_id = new_ulid()
         tool_call = params.get("toolCall") or {}
         tool_call_id = tool_call.get("toolCallId")
         ctx_turn = self._active_turns.get(session_id)
         step_id = ctx_turn.tool_call_steps.get(tool_call_id) if ctx_turn and tool_call_id else None
         await run_in_db_thread(
-            queries.insert_permission_decision, self.ctx.db,
-            decision_id=decision_id, step_id=step_id, gate="user", risk="unclassified", request=params,
+            queries.insert_permission_decision,
+            self.ctx.db,
+            decision_id=decision_id,
+            step_id=step_id,
+            gate="user",
+            risk="unclassified",
+            request=params,
         )
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict[str, Any]] = loop.create_future()
