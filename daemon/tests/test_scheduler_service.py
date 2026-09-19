@@ -1063,6 +1063,61 @@ async def test_stuck_run_times_out_instead_of_polling_forever(tmp_path, monkeypa
     assert after["fail_count"] == 1
 
 
+async def test_pending_approval_does_not_time_out_or_release_the_overlap_guard(
+    tmp_path, monkeypatch
+):
+    """Round-2 fix (review #1): a Run genuinely parked at `gate="user"` waiting
+    on a pending approval must not be judged dead by the same wall-clock ceiling
+    that catches a hung worker (round-1 review #11) — PRD 9.4's "挂起等待用户"
+    is long-lived by design, and `list_pending_user_permissions` proves that
+    state, not silence. `max_run_wait_seconds` is set far shorter than the real
+    time this test lets pass, so without the fix this would already have fired
+    a false "timeout" failure, disabled-count included, and released
+    `_in_flight` — reopening the overlap-guard hole round-1 review #9 closed."""
+    ctx = await _open_ctx(tmp_path, monkeypatch)
+    clock = ManualClock(datetime(2026, 1, 1, 10, 0, tzinfo=UTC))
+    stub = StubSessionService(ctx.db)
+    stub.next_status = "running"  # stays running until the test finishes it
+    service = CronService(
+        ctx, stub, clock=clock, poll_interval_seconds=0.005, max_run_wait_seconds=0.02,
+    )
+    row = await _upsert_every_minute_cron(service)
+
+    await service._dispatch(row)
+    assert stub.create_calls
+    child_id = "child-1"
+    await run_in_db_thread(
+        _insert_pending_user_permission, ctx.db,
+        session_id=child_id, decision_id="perm-1", risk="high",
+    )
+
+    # Real wall-clock time well past `max_run_wait_seconds` — the ceiling would
+    # already have fired here if pending approvals didn't push it back out.
+    await asyncio.sleep(0.1)
+
+    assert row["id"] in service._in_flight  # guard still held — the Run is alive
+    failed = [
+        e for e in ctx.server.events("message.completed")
+        if e[1]["content"]["meta"].get("kind") == "cron_failed"
+    ]
+    assert failed == []  # no false timeout
+    still_enabled = await run_in_db_thread(queries.get_cron, ctx.db, row["id"])
+    assert still_enabled["fail_count"] == 0  # no false strike toward auto-disable
+
+    # The user finally decides — the poll notices the Turn finishing normally.
+    stub.finish(child_id, status="completed")
+    await _drain_background(service)
+
+    assert row["id"] not in service._in_flight
+    completed = [
+        e for e in ctx.server.events("message.completed")
+        if e[1]["content"]["meta"].get("kind") == "cron_completed"
+    ]
+    assert len(completed) == 1
+    after = await run_in_db_thread(queries.get_cron, ctx.db, row["id"])
+    assert after["fail_count"] == 0
+
+
 async def test_stop_cancels_a_background_task_still_running_past_the_wait_timeout(
     tmp_path, monkeypatch
 ):

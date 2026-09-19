@@ -95,6 +95,20 @@ on each）:
   where a still-polling watch task could call into a since-`shutdown()`'d
   `SessionService` or write to an already-`close()`d DB connection after
   `__main__.py`'s shutdown sequence moved on.
+
+第 2 轮修复记录（round-2 review fix）:
+
+- **A pending user approval no longer counts against `max_run_wait_seconds`**
+  (review #1, round 2): round-1's wall-clock ceiling (review #11, above) and
+  round-1's pending-approval relay (review #3, above) combined into a new bug —
+  the ceiling didn't distinguish a genuinely hung Run from one alive and simply
+  parked at `gate="user"` waiting on the same user the relay had just proven was
+  reachable-but-away (PRD 9.4's "挂起等待用户" is long-lived *by design*). Every
+  poll in `_poll_until_done` that still observes at least one pending approval
+  now pushes `deadline` back out — false "timeout" failures (and the false
+  3-strikes auto-disables and the reopened overlap-guard hole they caused; see
+  `_poll_until_done`'s docstring) only happen once nobody is actually waiting on
+  the user's decision anymore.
 """
 
 from __future__ import annotations
@@ -687,11 +701,34 @@ class CronService:
         child session no longer exists — `session.get()` raised `RpcError`),
         `"mismatched_turn"` (the session's newest Turn isn't the one this cron
         dispatched — round-1 fix, review #7), or `"timeout"` (round-1 fix, review
-        #11 — `max_run_wait_seconds` elapsed with no resolution).
+        #11 — `max_run_wait_seconds` elapsed with no resolution *and no pending
+        approval seen*; see round-2 fix below).
 
         Also relays any new `gate="user"` pending permission request on the child
         session back to the main session as it's noticed (round-1 fix, review #3)
         — PRD 9.4 "待审动作：推回主会话提醒".
+
+        Round-2 fix (review #1): `max_run_wait_seconds` is a backstop against a
+        genuinely stuck/hung Run (round-1 review #11), not a budget for "how long
+        may a Run legitimately wait on the user". A Run parked at `gate="user"`
+        on a pending approval is *alive*, not stuck — PRD 9.4's "挂起等待用户"
+        is long-lived by design (a user can be away for hours), and
+        `list_pending_user_permissions` proves that state is the normal, common
+        one for an unattended cron, not an edge case. Treating it as indistinguishable
+        from a hung worker used to (a) post a false "判定为失败" system message
+        for a Run that hadn't actually failed, (b) count that false failure
+        toward the 3-strikes auto-disable (a cron could get disabled purely
+        because nobody was at the keyboard for 3 hours), and (c) release
+        `_in_flight` out from under a Run that was still very much alive,
+        reopening exactly the overlap-guard hole round-1 review #9 closed (a new
+        Run could then be dispatched for the same cron while the first still sat
+        waiting for approval). So: every poll that still observes at least one
+        pending approval pushes `deadline` back out another full
+        `max_run_wait_seconds` — the ceiling only ever fires against genuine
+        silence (no pending approval *and* no Turn progress), never against an
+        honest, visible wait for the user. Once the approval is decided (denied
+        or approved), `pending` goes empty on the next poll and the ordinary
+        ceiling applies again from there.
         """
         deadline = time.monotonic() + self.max_run_wait_seconds
         notified_permissions: set[str] = set()
@@ -699,6 +736,8 @@ class CronService:
             pending = await run_in_db_thread(
                 queries.list_pending_user_permissions, self.ctx.db, child_session_id,
             )
+            if pending:
+                deadline = time.monotonic() + self.max_run_wait_seconds
             for req in pending:
                 if req["decision_id"] in notified_permissions:
                     continue
