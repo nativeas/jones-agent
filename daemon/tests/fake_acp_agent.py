@@ -21,7 +21,10 @@ Behavior is selected via the `FAKE_ACP_MODE` env var (default "normal"):
   deltas; a prompt containing the marker "USE_TOOL" also emits a
   `tool_call`/`tool_call_update` pair for a fake `demo_tool`; a prompt
   containing "NEEDS_PERMISSION" issues a real `session/request_permission`
-  request and waits for the daemon's answer before finishing. Finishes with
+  request and waits for the daemon's answer before finishing; a prompt
+  containing `CUSTOM_PERMISSION_JSON:<json>` does the same with an
+  arbitrary caller-supplied `toolCall`/`options` shape (Issue #11 — see
+  `_handle_custom_permission_prompt`'s docstring). Finishes with
   `stopReason: "cancelled"` if a `session/cancel` notification arrived for
   that session while the prompt was in flight, else `"end_turn"`.
 - "probe_completes": reports the probe tool call as *completed* instead of
@@ -129,6 +132,58 @@ def _handle_probe_prompt(session_id: str) -> None:
 
 _SLEEP_MARKER = re.compile(r"SLEEP_MS:(\d+)")
 
+# Issue #11 (W3 permission gates): lets a test drive an ARBITRARY
+# `session/request_permission` `toolCall.rawInput` shape through a real
+# SessionService round trip, instead of the fixed `{"toolCallId": "perm-1",
+# "title": "risky_tool"}` (no rawInput at all) "NEEDS_PERMISSION" sends —
+# `sessions/service.py::_on_request_permission`'s review-gate classification
+# needs a real tool name/args to test its auto-allow (low risk + auto mode)
+# vs. user-gate branches, and its two different `rawInput` shapes (the
+# generic `jones_gate` escalation encoding vs. the `edit_approval.py` shape —
+# see that function's docstring). Usage: embed
+# `CUSTOM_PERMISSION_JSON:<json>` in the prompt text, where `<json>` is an
+# object with optional `toolCall` (default: `{"toolCallId": "custom-1",
+# "title": "custom_tool"}`), `options` (default: the same four allow/deny
+# options "NEEDS_PERMISSION" offers), and `wait_timeout` (seconds, default
+# 30 — long enough that this fake agent is never what actually causes a
+# timeout the daemon-side `approval_timeout_minutes` test is measuring).
+_CUSTOM_PERMISSION_MARKER = "CUSTOM_PERMISSION_JSON:"
+
+_DEFAULT_PERMISSION_OPTIONS = [
+    {"optionId": "opt-allow-once", "kind": "allow_once"},
+    {"optionId": "opt-allow-always", "kind": "allow_always"},
+    {"optionId": "opt-reject-once", "kind": "reject_once"},
+    {"optionId": "opt-reject-always", "kind": "reject_always"},
+]
+
+
+def _handle_custom_permission_prompt(session_id: str, text: str) -> None:
+    payload_text = text.split(_CUSTOM_PERMISSION_MARKER, 1)[1]
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        payload = {}
+    tool_call = payload.get("toolCall") or {"toolCallId": "custom-1", "title": "custom_tool"}
+    tool_call_id = tool_call.get("toolCallId", "custom-1")
+    options = payload.get("options") or _DEFAULT_PERMISSION_OPTIONS
+    _next_id[0] += 1
+    req_id = _next_id[0]
+    _send(
+        {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "session/request_permission",
+            "params": {"sessionId": session_id, "toolCall": tool_call, "options": options},
+        }
+    )
+    answer = _wait_for_response(req_id, timeout=float(payload.get("wait_timeout", 30.0)))
+    _send_update(
+        session_id,
+        {"sessionUpdate": "tool_call_update", "toolCallId": tool_call_id,
+         "status": "completed" if (answer or {}).get("outcome", {}).get("outcome") == "selected"
+         else "failed", "rawOutput": answer},
+    )
+
 
 def _handle_normal_prompt(session_id: str, text: str) -> None:
     _send_update(
@@ -187,6 +242,8 @@ def _handle_normal_prompt(session_id: str, text: str) -> None:
              "status": "completed" if (answer or {}).get("outcome", {}).get("outcome") == "selected"
              else "failed", "rawOutput": answer},
         )
+    if _CUSTOM_PERMISSION_MARKER in text:
+        _handle_custom_permission_prompt(session_id, text)
 
 
 _pending_responses: dict[int, dict] = {}

@@ -49,10 +49,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from jones_daemon.config.jsonfile import read_json, write_json
 from jones_daemon.context import DaemonContext
 from jones_daemon.kernel.acp_client import AcpError, AcpProtocolError
 from jones_daemon.kernel.ids import new_ulid
+from jones_daemon.kernel.plugin.jones_gate import _review_payload
 from jones_daemon.logging import get_logger
+from jones_daemon.permissions import gate_config, review
 from jones_daemon.projects.service import ProjectService
 from jones_daemon.providers.resolver import ProviderNotConfiguredError
 from jones_daemon.replay import retention as replay_retention
@@ -104,6 +107,47 @@ def _select_permission_option(
     )
 
 
+def _extract_tool_call(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Recover the real tool name + args from an ACP `session/request_permission`
+    payload — Issue #11's review gate needs both, but they can arrive in
+    either of TWO independent shapes (00-foundation.md §7's "两套审批逻辑打架"
+    question; resolved on the plugin side in `kernel/plugin/jones_gate/
+    __init__.py`'s module docstring — "the write_file/patch special case"):
+
+    1. `acp_adapter/edit_approval.py`'s dedicated `write_file`/`patch` path:
+       `rawInput = {"tool": <name>, "arguments": {...}}` — real structured
+       args, no decoding needed.
+    2. `jones_gate`'s own generic escalation (every other tool, via
+       `tools/approval.py::request_tool_approval`): `rawInput = {"command":
+       "<tool_name> (plugin approval rule)", "description": <our encoded
+       message>}` — verified against the installed `hermes-agent` checkout
+       (`acp_adapter/permissions.py::_build_permission_tool_call`) that no
+       real args survive this path on Hermes's side; `description` carries
+       whatever `kernel/plugin/jones_gate/_review_payload.py::encode()`
+       packed into it worker-side (the ONLY place that ever has the real
+       args for tools going through this path).
+
+    Returns `("", {})` for anything that doesn't match either shape (a
+    future Hermes protocol change, or a malformed/truncated payload) — an
+    empty tool name can never match a `_READ_ONLY_LOW`/name-based rule in
+    `permissions/review.py::classify()`, so the caller correctly falls back
+    to a non-`low` risk rather than silently guessing "safe" (DEV.md 工程
+    原则 #4: 诚实失败).
+    """
+    raw_input = (params.get("toolCall") or {}).get("rawInput")
+    if not isinstance(raw_input, dict):
+        return "", {}
+    if "tool" in raw_input and "arguments" in raw_input:
+        tool = raw_input.get("tool")
+        args = raw_input.get("arguments")
+        return (tool if isinstance(tool, str) else "", args if isinstance(args, dict) else {})
+    description = raw_input.get("description")
+    decoded = _review_payload.decode(description) if isinstance(description, str) else None
+    if decoded is not None:
+        return decoded["tool"], decoded["args"]
+    return "", {}
+
+
 @dataclass
 class _TurnContext:
     turn_id: str
@@ -128,6 +172,11 @@ class _PendingPermission:
     session_id: str
     params: dict[str, Any]
     future: asyncio.Future[dict[str, Any]]
+    # Populated by `_on_request_permission` (Issue #11's review gate) so
+    # `permission_pending()` (owned by A/#10, not touched by this branch —
+    # see the PR report's "契约变更" note) has real data available to read
+    # instead of the hardcoded "unclassified" it still returns today.
+    risk: str = "unclassified"
 
 
 class SessionService:
@@ -151,6 +200,12 @@ class SessionService:
         # dangling tasks nobody awaits.
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._retention_task: asyncio.Task[None] | None = None
+        # `permission.decide(remember="session")`'s target (Issue #11,
+        # 02-w3-interfaces.md §1.1's "remember"): in-memory only, gone on
+        # restart (matches PRD 5.8/9.2 — nothing about a restart should
+        # silently widen what's allowed). Read by `_refresh_gate_config`,
+        # written by `_remember_allow`.
+        self._session_remembered_rules: dict[str, list[dict[str, str]]] = {}
 
     def _lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -343,8 +398,81 @@ class SessionService:
                     session_id, "queue.changed", {"session_id": session_id, "items": items}
                 )
                 return {"turn_id": turn_id, "queued": True}
+            # 模式检查一处调用 (02-w3-interfaces.md §1.1): rewrite this
+            # session's rule-gate config before the Turn that's about to run
+            # sees it — see `_refresh_gate_config`'s docstring for why this
+            # is the one place that call belongs.
+            await self._refresh_gate_config(session)
             self._start_turn(session_id, turn_id, text)
             return {"turn_id": turn_id, "queued": False}
+
+    async def _refresh_gate_config(self, session: dict[str, Any]) -> None:
+        """Rewrite `<HERMES_HOME>/jones_gate.json` to match this session's
+        CURRENT mode/permissions/Agent tool whitelist, right before a Turn is
+        about to start running for real (Issue #11, 02-w3-interfaces.md
+        §1.1: "模式切换即时生效...作用于该 Session 后续的 Turn；正在执行中的
+        Run 不受影响", PRD 9.1).
+
+        Deliberately only called from `send()`'s immediate-start branch
+        (never while a Turn is running or being enqueued behind one): the
+        rule gate re-reads this file live via an mtime check on every
+        `pre_tool_call` (`kernel/plugin/jones_gate/_config.py`), so writing a
+        new mode/ruleset here while a Turn is mid-flight would retroactively
+        change gating for that ALREADY-RUNNING Run — exactly what PRD 9.1
+        says must not happen.
+
+        Known scope gap (documented in the PR report, not silently
+        skipped): a mode change that lands entirely while items are queued
+        behind a running Turn only takes effect at the next `send()` call
+        that starts a Turn immediately — not the instant `_advance_queue`
+        (owned by G/#12/Run-replay, not this branch's function to touch)
+        dequeues and starts a queued item. That queued Turn runs with
+        whatever config the last immediate `send()` wrote.
+
+        Safe to call before a worker for this session even exists yet:
+        `permissions/gate_config.write()` creates `HERMES_HOME` if needed,
+        and `workers/manager.py::_prepare_hermes_home` (which may run
+        later, when/if the worker actually spawns) never deletes or
+        overwrites this specific file — it only manages the
+        `plugins/jones_gate/` subdirectory and `config.yaml`.
+        """
+        project_id = session["project_id"]
+        try:
+            cwd = self._cwd_for_project(project_id)
+        except Exception:  # noqa: BLE001 - `_cwd_for_project` is not this
+            # branch's function to touch/narrow the failure modes of (its
+            # only documented one is `RpcError` for a non-default project —
+            # C/#8#9 scope gap — but `_run_turn`'s own catch-all backstop
+            # proves other exceptions are also possible from callers of it,
+            # see test_sessions_service.py's
+            # test_unexpected_exception_in_run_turn_still_terminates_the_run).
+            # `send()` itself must never crash over resolving an OPTIONAL
+            # workspace root for the gate config: degrade `cwd` to unknown
+            # and keep going — the workspace-relative parts of the gate
+            # config (the hard-deny gate's protected project-permissions-
+            # path check, the review gate's write-in/out-of-workspace
+            # classification) fail closed on their own when `cwd`/
+            # `project_permissions_path` are unknown (see
+            # `permissions/gate_config.py` and `permissions/review.py`),
+            # never fail open. `_run_turn`'s own subsequent, separate call
+            # to `_cwd_for_project` (unmodified by this branch) still
+            # surfaces the SAME underlying failure as a real `run.terminated`
+            # a moment later, so nothing is silently lost — see that
+            # function's own `except WorkerStartupError`/catch-all.
+            cwd = None
+
+        extra_rules = self._session_remembered_rules.get(session["id"])
+
+        def _build_and_write() -> None:
+            permissions_result = self.ctx.config.permissions(project_id)
+            config = gate_config.build(
+                conn=self.ctx.db, permissions_result=permissions_result, session=session,
+                user_root=self.ctx.paths.user_root(), project_path=cwd, extra_rules=extra_rules,
+            )
+            hermes_home = gate_config.hermes_home_for(self.ctx.paths.user_root(), session["id"])
+            gate_config.write(hermes_home, config)
+
+        await run_in_db_thread(_build_and_write)
 
     async def stop(self, session_id: str) -> dict[str, Any]:
         session = await run_in_db_thread(queries.get_session, self.ctx.db, session_id)
@@ -514,6 +642,10 @@ class SessionService:
             raise RpcError(
                 INVALID_PARAMS, f"invalid decision: {decision!r}", {"decision": decision}
             )
+        if remember is not None and remember not in ("session", "project"):
+            raise RpcError(
+                INVALID_PARAMS, f"invalid remember: {remember!r}", {"remember": remember}
+            )
         entry = self._pending_permissions.get(request_id)
         if entry is None:
             raise RpcError(NOT_FOUND, "no pending permission request", {"request_id": request_id})
@@ -525,7 +657,68 @@ class SessionService:
             entry.future.set_result({"outcome": {"outcome": "selected", "optionId": option_id}})
         assert row is not None  # noqa: S101 - just written by decide_permission above
         await self.ctx.server.broadcast(entry.session_id, "permission.decided", row)
+        # PRD FR05/02-w3-interfaces.md §1.1 "remember": only ever narrows
+        # (writes an `allow` for this one specific tool/command match — see
+        # `_remember_allow`) and only on an explicit `allow` decision; a
+        # remembered `deny` would be redundant with the rule/hard-deny gates
+        # that would already block it next time, and "remember this denial"
+        # isn't a rule shape 01-w2-interfaces.md §4.1's permissions.json
+        # schema (or this file's in-memory session rules) has a use for.
+        if remember is not None and decision == "allow":
+            await self._remember_allow(entry, remember)
         return row
+
+    async def _remember_allow(self, entry: _PendingPermission, remember: str) -> None:
+        """Persist an `allow` narrowed to this one tool/command match
+        (02-w3-interfaces.md §1.1: "只能是 allow 收窄到具体 match，不得触碰硬
+        禁止" — hard-deny lives in `kernel/plugin/jones_gate/_hard_deny.py`'s
+        code constants, which nothing written here can ever reach, let alone
+        loosen). `remember="session"` -> in-memory, applied by
+        `_refresh_gate_config` starting with this session's next
+        immediately-started Turn (not the current one — see that method's
+        docstring for why applying it retroactively to an in-flight Run
+        isn't attempted). `remember="project"` -> appended into
+        `<project>/.jones/permissions.json`; `config/resolver.py`'s existing
+        merge (PRD 10.1) is what actually enforces "can't loosen a
+        user-level deny" — writing here never bypasses it, the merge simply
+        drops an entry that would.
+        """
+        tool_name, args = _extract_tool_call(entry.params)
+        if not tool_name:
+            logger.warning(
+                "permission.decide remember=%r requested but the tool name could not be "
+                "recovered from this request; not persisting anything",
+                remember, extra={"detail": {"session_id": entry.session_id}},
+            )
+            return
+        command = args.get("command") if tool_name == "terminal" else None
+        match = command if isinstance(command, str) and command else tool_name
+        rule = {"match": match, "action": "allow"}
+        if remember == "session":
+            self._session_remembered_rules.setdefault(entry.session_id, []).append(rule)
+            return
+        session = await run_in_db_thread(queries.get_session, self.ctx.db, entry.session_id)
+        if session is None:
+            return
+        try:
+            project_path = self._cwd_for_project(session["project_id"])
+        except RpcError:
+            logger.warning(
+                "permission.decide remember='project' requested but this session's project "
+                "path can't be resolved yet; not persisting anything",
+                extra={"detail": {"session_id": entry.session_id}},
+            )
+            return
+
+        def _write() -> None:
+            path = self.ctx.paths.project_permissions_path(project_path)
+            data = read_json(path, {"rules": []})
+            rules = [r for r in (data.get("rules") or []) if r.get("match") != match]
+            rules.append(rule)
+            data["rules"] = rules
+            write_json(path, data)
+
+        await run_in_db_thread(_write)
 
     # -- turn execution ---------------------------------------------------------------
 
@@ -924,33 +1117,130 @@ class SessionService:
     async def _on_request_permission(
         self, session_id: str, params: dict[str, Any]
     ) -> dict[str, Any]:
+        """The daemon-side half of FR05's ②③ gates (Issue #11,
+        02-w3-interfaces.md §1.1). Every ACP `session/request_permission`
+        the worker sends — regardless of which of Hermes's two independent
+        approval paths produced it, see `_extract_tool_call`'s docstring —
+        lands here. What happens next depends on the review gate's risk
+        classification of the real tool call (recovered from whichever
+        `rawInput` shape this request carries):
+
+          - low risk AND the session is in `auto` mode -> decide instantly
+            (`decided_by="rule"` — v1's review gate is a deterministic rule,
+            not a model, see `permissions/review.py`'s module docstring),
+            no `permission.requested` broadcast, no pending-approval UI ever
+            shown to the user (PRD 9.1's "自动模式规则闸内不弹" extended to
+            the review gate's own low-risk determination).
+          - everything else (medium/high risk, or `task` mode regardless of
+            risk) -> the pre-existing W2 user-gate flow: write
+            `permission_decisions(pending)`, broadcast `permission.requested`
+            (now carrying the real classified risk instead of
+            `"unclassified"`), and wait for `permission.decide` — bounded by
+            `settings.approval_timeout_minutes` when configured (PRD 9.4:
+            timeout can only ever resolve to `deny`, never an auto-allow).
+        """
         decision_id = new_ulid()
         tool_call = params.get("toolCall") or {}
         tool_call_id = tool_call.get("toolCallId")
         ctx_turn = self._active_turns.get(session_id)
         step_id = ctx_turn.tool_call_steps.get(tool_call_id) if ctx_turn and tool_call_id else None
+
+        session = await run_in_db_thread(queries.get_session, self.ctx.db, session_id)
+        mode = session["mode"] if session is not None else "task"
+        project_id = session["project_id"] if session is not None else None
+        cwd = None
+        if session is not None:
+            try:
+                cwd = self._cwd_for_project(project_id)
+            except Exception:  # noqa: BLE001 - see `_refresh_gate_config`'s
+                # matching `except Exception` for why this degrades (never
+                # raises) rather than narrowing to `RpcError`
+                cwd = None
+
+        tool_name, tool_args = _extract_tool_call(params)
+        risk = review.classify(tool_name, tool_args, cwd=cwd)
+
+        if risk.level == "low" and mode == "auto":
+            await run_in_db_thread(
+                queries.insert_permission_decision,
+                self.ctx.db, decision_id=decision_id, step_id=step_id,
+                gate="review", risk=risk.level, request=params,
+            )
+            row = await run_in_db_thread(
+                queries.decide_permission, self.ctx.db, decision_id,
+                decision="allow", decided_by="rule",
+            )
+            await self.ctx.server.broadcast(session_id, "permission.decided", row)
+            option_id = _select_permission_option(params.get("options") or [], "allow", None)
+            return {"outcome": {"outcome": "selected", "optionId": option_id}}
+
         await run_in_db_thread(
             queries.insert_permission_decision,
             self.ctx.db,
             decision_id=decision_id,
             step_id=step_id,
             gate="user",
-            risk="unclassified",
+            risk=risk.level,
             request=params,
         )
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict[str, Any]] = loop.create_future()
         self._pending_permissions[decision_id] = _PendingPermission(
-            session_id=session_id, params=params, future=fut
+            session_id=session_id, params=params, future=fut, risk=risk.level,
         )
         await self.ctx.server.broadcast(
             session_id, "permission.requested",
             {
                 "request_id": decision_id, "session_id": session_id, "gate": "user",
-                "risk": "unclassified", "tool_call": tool_call, "options": params.get("options"),
+                "risk": risk.level, "tool_call": tool_call, "options": params.get("options"),
             },
         )
+        timeout_minutes = None
+        if session is not None:
+            settings = await run_in_db_thread(self.ctx.config.settings, project_id)
+            timeout_minutes = (settings or {}).get("approval_timeout_minutes")
         try:
+            if timeout_minutes is None:
+                return await fut
+            # NOT `asyncio.wait_for(fut, ...)`: on timeout, `wait_for` CANCELS
+            # the awaitable it was given — cancelling `fut` itself would make
+            # it `done()` (cancelled counts as done) before we ever get a
+            # chance to distinguish "timed out, nothing decided it" from "a
+            # real decision already arrived", and the `return await fut`
+            # below would then raise `CancelledError` instead of returning an
+            # answer, permanently silencing the ACP response (round-1-
+            # equivalent fix, this PR — caught by
+            # tests/test_gates_sessions_integration.py's timeout tests, which
+            # hung/failed against the `wait_for` version). `asyncio.wait`
+            # only reports which set `fut` landed in; it never touches `fut`
+            # itself, so a genuine timeout leaves it exactly as pending as it
+            # was, safe to inspect/resolve below.
+            done, _pending = await asyncio.wait({fut}, timeout=float(timeout_minutes) * 60.0)
+            if fut not in done:
+                # PRD 9.4: "超时可配置，但只能配「拒绝」" — never auto-allow.
+                # `fut` may already carry a real user/`_resolve_pending_
+                # permissions` answer that raced in right as the deadline
+                # hit; only decide-and-answer here if nothing beat us to it.
+                if not fut.done():
+                    option_id = _select_permission_option(
+                        params.get("options") or [], "deny", None
+                    )
+                    fut.set_result({"outcome": {"outcome": "selected", "optionId": option_id}})
+                    row = await run_in_db_thread(
+                        queries.decide_permission, self.ctx.db, decision_id,
+                        decision="deny", decided_by="timeout",
+                    )
+                    await self.ctx.server.broadcast(session_id, "permission.decided", row)
+                    # PRD 9.4/9.3: a timed-out approval terminates the
+                    # Run as an error card ("审批超时"), not merely the one
+                    # denied tool call — best-effort: if this Turn already
+                    # finished by the time we get here (a last-second
+                    # `permission.decide` raced us), there is nothing left
+                    # to terminate.
+                    if ctx_turn is not None and self._active_turns.get(session_id) is ctx_turn:
+                        await self._terminate_run(
+                            ctx_turn, kind="error", reason="approval timed out (审批超时)"
+                        )
             return await fut
         finally:
             self._pending_permissions.pop(decision_id, None)

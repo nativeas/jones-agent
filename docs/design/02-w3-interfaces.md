@@ -39,6 +39,73 @@ daemon ── _on_request_permission ──┐
 - **编辑审批接入点**：`acp_adapter/edit_approval.py`（write_file/patch）也会发 `request_permission`——同一条 daemon 路径处理，参数形状不同要识别。
 - **验收对应**：写 `daemon/tests/test_gates_*.py` 覆盖 G04（三闸各一）、G05（三模式下 rm -rf 全拒）、G06（三模式行为）、N01/N03/N12/N13；用假 ACP agent 驱动。
 
+### 1.2 落地时的契约细化（2026-09-19，实现阶段发现，非设计推测）
+
+- **`jones_gate.json` schema**（daemon 写、插件读，读写两侧各自实现见
+  `permissions/gate_config.py`/`kernel/plugin/jones_gate/_config.py`，互不 import）：
+  ```jsonc
+  {
+    "mode": "chat" | "task" | "auto",
+    "user_root": "<abs path>",              // 硬禁止清单的保护根
+    "project_permissions_path": "<abs path>" | null,
+    "cwd": "<abs path>" | null,              // 审查闸 write_file/patch 判定工作区内外用
+    "rules": [{"match": str, "action": "allow" | "deny"}],
+    "rules_degraded": bool,                  // permissions.json 局部不可读时 true；此时
+                                              // 插件不信任任何 allow 命中，一律升级（见下）
+    "tool_allowlist": [str, ...]              // 空=不限；父会话链非空白名单在写入前已交集narrow（N13）
+  }
+  ```
+  写入时机：仅 `sessions/service.py::send()` 的立即执行分支（一次调用，契约原文"模式检查一处调用"）；
+  排队后由 `_advance_queue`（G/#12 所有）出队执行的 Turn **不**触发刷新——已知缺口，写进了报告，
+  不在本分支touch scope 内解决。
+- **规则闸的 `rules_degraded` 处理**（评审发现，不是设计推测）：`config/resolver.py::Permissions.
+  degraded=True` 时说明 permissions.json 某一层解析失败，合并出的 `rules` 可能"丢了一条本该存在的
+  deny"——插件据此把这一状态下的 `allow` 命中当作"没有规则闸意见"处理（升级到②，绝不直接放行），
+  `deny` 命中仍然生效（宁可多问，不可漏挡）。
+- **`write_file`/`patch` 不走 `pre_tool_call` 的 approve 分支**（本节解决 00-foundation.md §7 留下的
+  "两套审批逻辑打架"未决问题）：源码核对（`acp_adapter/edit_approval.py` + `model_tools.py` 的
+  `_run_pre_dispatch_checks`）发现 `acp_adapter/server.py::_wire_turn_callbacks` 无条件绑定了第二条
+  独立的 ACP `session/request_permission` 通道专管这两个工具（`edit_approval.py`），且这条通道**先验证
+  真实结构化参数** `{"tool", "arguments"}`，晚于 `pre_tool_call` 但先于工具真正执行。若 Jones 的插件
+  也对这两个工具返回 `approve`，用户会被问两遍。裁定：`_on_pre_tool_call` 对 `write_file`/`patch` 只输出
+  `block`（硬禁止/规则闸拒绝/chat 模式）或 `None`（放行到下一关——包括"没有规则闸意见，交给
+  edit_approval.py"这一种情况），**永不**对这两个工具返回 `approve`。代价（写进报告"没做什么"）：
+  `edit_approval.py` 自己的 auto-approve 策略（`should_auto_approve_edit`）不是 Jones 控制的，auto
+  模式+低风险的 write 仍可能在真实 Hermes 里弹一次 Hermes 自己的确认框（daemon 侧仍会瞬间自动应答，
+  用户唯一能看到的只是这一次真实 Hermes 的对话框，不是两次）。
+- **daemon 侧如何拿到真实 tool 名/参数**（spike「审计写入时序」留的开放问题的落地）：源码核对
+  `tools/approval.py::request_tool_approval()` 证实——`pre_tool_call` 的 `approve` 分支转发给它时，
+  daemon 收到的 ACP `toolCall.rawInput` 只有 `{"command": "<tool_name> (plugin approval rule)",
+  "description": <插件 message>}`，**没有真实参数**（`_build_permission_tool_call` 的固定行为）。
+  Jones 的插件因此把审查闸需要的数据（工具名+参数，截断到 4000 字符）编码进它自己的 `message`
+  （`kernel/plugin/jones_gate/_review_payload.py`），daemon 侧 `sessions/service.py::_extract_tool_call`
+  解码回来。`write_file`/`patch` 因为走 `edit_approval.py` 通道（`rawInput={"tool","arguments"}`），
+  天然带真参数，不需要这层编码。两种形状 daemon 都要认，`_extract_tool_call` 的 docstring 是准确来源。
+- **`rule_key` 必须每次唯一**（安全修复，非原计划）：`tools/approval.py` 的 `pattern_key=
+  f"plugin_rule:{rule_key}"` 是 Hermes 自己的会话/永久 allowlist 缓存键；W2 骨架把 `rule_key` 设成裸
+  `tool_name`，意味着对某个工具"允许本次会话"一次，会让**同一会话内任何参数的后续调用**都被 Hermes
+  自己的缓存直接放行，绕过 Jones 完全不知情——这与 Jones 自己的 `remember` 语义（收窄到具体 match）
+  冲突且更宽松，是安全问题不是特性。修法：`rule_key` 改成 `f"{tool_name}:{tool_call_id or uuid4().hex}"`
+  ——保证 Hermes 自己的缓存对 Jones 转发的调用永远不命中；`remember` 完全由 Jones 自己的规则闸
+  （`jones_gate.json` 的 `rules`/`tool_allowlist`）实现，两套记忆机制不再可能打架。
+- **`decided_by` 新增第四个值 `"timeout"`**（00-foundation.md §5 `permission_decisions.decided_by
+  (rule/model/user)` 的列描述在此追加，未改已有文字）：审批超时自动拒绝时如实记 `decided_by="timeout"`，
+  不借用 `"rule"`（规则闸没有参与这次拒绝）或 `"user"`（没有真人）。该列本身是无约束 TEXT，非枚举，不需要
+  迁移。
+- **审计写入②（规则闸本地拒绝）的落库不在本分支范围**：spike「审计写入时序」②描述的
+  `insert_permission_decisions(gate="rule", ...)` 写入点在 `_handle_tool_call_update`（G/#12 独占函数，
+  见 §0 分工表），本分支只保证消息格式稳定：`RULE_GATE_BLOCK_PREFIX = "JONES RULE GATE: "`
+  （`kernel/plugin/jones_gate/__init__.py`），沿用 `docs/spikes/hermes_hook_demo.py` 已有约定，供 G 解析。
+- **已发现但不在本分支范围内修复的 bug（写实测复现，供 G/#12 或后续排查）**：在 `main`（未动过我的任何
+  代码）上可稳定复现——同一 Session 内，一次真实的 ACP `session/request_permission` 往返（无论走
+  `NEEDS_PERMISSION` 还是本分支新加的 `CUSTOM_PERMISSION_JSON`）完成后，**第二次** `session.send()`
+  能正常跑完并广播完成事件，但随后的进程/事件循环收尾（`asyncio.run()` 的 `_cancel_all_tasks`）会
+  挂起、不再返回——用 `daemon/tests/fake_acp_agent.py` + 一个不依赖任何本分支代码的最小复现脚本已验证。
+  报告里给了完整复现步骤；这是 `kernel/acp_client.py`/`workers/manager.py`（A/#10 所有）范围内的问题，
+  本分支的测试套件已经改写成不触发它（见 `test_gates_sessions_integration.py` 里
+  `test_remember_session_persists_an_allow_rule_for_this_session_only` 的说明），CI 因此仍是绿的，
+  但这个 bug 本身没有被这条分支修掉。
+
 ## 2. G：Run 回放（FR06）+ 集成收口
 
 - **回放数据完整性**：`steps.args_json`/`result_summary` 之外，完整 payload（工具全文输出、截图）落 `<user_root>/runs/<run_id>/<step_seq>.<ext>`，`steps.payload_ref` 指向；`runs.prompt_snapshot_ref` 指向该 Run 每次模型调用实际发送的 prompt（ACP `session/update` 里若拿不到完整 prompt，如实记录「Hermes 未暴露」并记录可得部分：system prompt 来源、注入的工具清单、用户消息）。`replay/store.py` 提供 `write_payload(run_id, seq, bytes, ext) -> ref`、`read_payload(ref)`、`purge(run_id)`；保留策略 90 天（`settings.payload_retention_days`），清理在空闲时跑。

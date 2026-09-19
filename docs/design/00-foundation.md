@@ -130,6 +130,10 @@ JSON-RPC 标准码 + 应用码：`1001 not_found`、`1002 invalid_state`（如�
 
 主会话：`sessions.is_main = 1` 全局唯一（部分唯一索引，索引键仅 `is_main`、不带 `project_id`，跨所有 project 只允许一条），随首次启动创建，不可删除。
 
+**追加（W3/#11，2026-09-19）**：`permission_decisions.decided_by` 的取值追加第四个：`timeout`——
+PRD 9.4 审批超时自动拒绝时如实记录，不借用 `rule`（规则闸未参与）或 `user`（无真人）。该列本身是
+无约束 TEXT，非枚举，这条只是补全文档描述，不涉及迁移。详见 `docs/design/02-w3-interfaces.md` §1.2。
+
 ## 6. 路径（PRD 10.2）
 
 `paths.py` 提供 `user_root()`（默认 `~/.jones`，可用 `JONES_HOME` 覆盖，测试用）、`project_root(project_path)` → `<project>/.jones`，以及各子目录访问器；所有目录首次访问时创建。
