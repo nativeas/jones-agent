@@ -59,6 +59,33 @@ class ProviderResolver(Protocol):
 - `providers` 表（已有）记 `has_key/key_hint/default_model`；RPC `provider.*`、`model.list`（各厂商模型清单先用内置静态表 + Ollama 本地 `/api/tags` 动态）。
 - 六家厂商映射到 Hermes 的 provider 配置方式要源码核对（Hermes 主要走 OpenAI-compatible + anthropic extra），写进 `docs/design/01-w2-interfaces.md` 本节末尾（B 允许追加本节）。
 
+### 3.1 六厂商 → Hermes provider 映射（源码核对，2026-09-19，commit `ee4452991d17534aa561f31ee55596d082aa94e7`）
+
+核对方式：直接读 `/Users/nativeas/.hermes/hermes-agent` 这份 checkout 的源码（只读参考，未修改），不是看文档。关键结论：
+Anthropic/OpenAI/DeepSeek/Qwen(DashScope)/Gemini 五家都在 Hermes 内置的 `PROVIDER_REGISTRY`
+（`hermes_cli/auth.py`）里，靠环境变量自动探测凭据——**worker 的 `config.yaml` 不需要写
+`providers.<name>` 块**，只需要 `model.provider` 指到对应的 registry id + 把 Key 放进对应的环境
+变量。只有 Ollama（本地、不在 registry 里）需要一个显式的 `providers.<name>` 自定义条目
+（`hermes_cli/config_providers.py` 的 "v12+ providers 形状"：`{api, key_env, ...}`）。
+
+| Jones 厂商名 | Hermes provider id | 依据（PROVIDER_REGISTRY 行 / alias） | 默认 base_url | Key 环境变量 | worker `config.yaml` 写法 |
+|---|---|---|---|---|---|
+| `anthropic` | `anthropic` | `hermes_cli/auth.py` `_REGISTRY_ROWS`：`("anthropic", "Anthropic", "https://api.anthropic.com", ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"), "ANTHROPIC_BASE_URL")` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` | 仅 `model: {default: <model>, provider: "anthropic"}`；传输层是 `anthropic_messages`（host-mandated，见 `runtime_provider.py::_HOST_MANDATED_API_MODES["api.anthropic.com"]`），不需要显式 `api_mode` |
+| `openai` | `openai-api` | 同上文件：`("openai-api", "OpenAI API", "https://api.openai.com/v1", ("OPENAI_API_KEY",), "OPENAI_BASE_URL")` | `https://api.openai.com/v1` | `OPENAI_API_KEY` | 仅 `model: {default: <model>, provider: "openai-api"}`；官方 OpenAI host 自动走 Responses API（`is_official_openai_host` → `codex_responses`），不需要显式 `api_mode` |
+| `deepseek` | `deepseek` | 同上文件：`("deepseek", "DeepSeek", "https://api.deepseek.com/v1", ("DEEPSEEK_API_KEY",), "DEEPSEEK_BASE_URL")` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` | 仅 `model: {default: <model>, provider: "deepseek"}`（`chat_completions` 默认传输） |
+| `qwen` | `alibaba`（DashScope；`qwen` 是别名） | 同上文件：`("alibaba", "Qwen Cloud", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", ("DASHSCOPE_API_KEY",), "DASHSCOPE_BASE_URL")`；别名见 `hermes_cli/providers.py` `_ALIAS_GROUPS["alibaba"]` 含 `"qwen"` | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` | 仅 `model: {default: <model>, provider: "alibaba"}`。Jones 直接写 `"alibaba"`（canonical id），不依赖 Hermes 的 alias 表长期稳定 |
+| `gemini` | `gemini` | 同上文件：`("gemini", "Google AI Studio", "https://generativelanguage.googleapis.com/v1beta", ("GOOGLE_API_KEY", "GEMINI_API_KEY"), "GEMINI_BASE_URL")` | `https://generativelanguage.googleapis.com/v1beta` | `GOOGLE_API_KEY`（`GEMINI_API_KEY` 是等价别名，registry 里排第二） | 仅 `model: {default: <model>, provider: "gemini"}`；透传 `chat_completions`，Hermes 在 base_url 命中 `generativelanguage.googleapis.com` 且非 `/openai` 结尾时内部转发到原生 Gemini adapter（`agent/gemini_native_adapter.py::is_native_gemini_base_url`），对 Jones 透明 |
+| `ollama` | `ollama`（alias → canonical `custom`） | **不在** `PROVIDER_REGISTRY` 里；`hermes_cli/providers.py` `_ALIAS_GROUPS["custom"] = ("ollama",)`，即 `provider: "ollama"` 会被 Hermes 归一化到通用 OpenAI-compatible `custom` 传输 | `http://localhost:11434/v1`（`hermes_cli/models_local.py` 本地默认根 `http://localhost:11434`，OpenAI-compat 路径追加 `/v1`） | 无（本地默认免 Key）；可选，走 `providers.ollama.key_env` 引用一个 Jones 自定义环境变量（不内联 `api_key`，保持"Key 只在 env 里出现一次"） | **需要** `providers: {ollama: {api: "http://localhost:11434/v1"[, key_env: "JONES_OLLAMA_API_KEY"]}}` **加上** `model: {default: <model>, provider: "ollama"}`（`config_providers.py::_normalize_custom_provider_entry` 认的 v12+ providers 形状） |
+
+实现落点：`daemon/src/jones_daemon/providers/catalog.py`（`VENDORS` 表，逐字段注了上面每一行的出处）+
+`resolver.py`（`_build_binding` 按这张表拼 `ProviderBinding.env` / `.hermes_config`）。
+
+模型清单（`model.list`）：五个 registry 厂商先用内置静态表（`catalog.py` 的 `VendorSpec.models`，
+从这份 checkout 里出现过的真实 model id 摘取的一个小样本种子集，不是全量目录——Hermes 自己的
+`model_tools.py`/`hermes_cli/models.py` 是对着一个实时的 models.dev 目录解析的，这张静态表预计
+会过时，刷新留给 W5"BYOK 六厂商收口"）；Ollama 走本地 `GET http://localhost:11434/api/tags` 实时探测
+（探测不到本地服务时返回空列表，不报错——见 `resolver.py::_ollama_live_models`）。
+
 ## 4. C：Project / Agent / 配置合并（#8 #9）
 
 ```python
