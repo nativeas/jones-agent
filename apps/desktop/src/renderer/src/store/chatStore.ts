@@ -123,9 +123,24 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       // than register listeners or write state that belongs to that newer
       // call now; otherwise every superseded call here leaks a full set of
       // notification subscriptions forever (01-w2-interfaces.md §5 review).
-      transport.call('session.unsubscribe', { id: sessionId }).catch((err) => {
-        console.warn('session.unsubscribe (stale bind) failed', err)
-      })
+      //
+      // Only unsubscribe when the session that superseded us is a *different*
+      // session. If the newer bind is for this same sessionId (React
+      // StrictMode's mount→cleanup→mount double-invoke, or the user flipping
+      // back to the session they just left before its first subscribe
+      // round-trip returned), the newer bind already issued its own
+      // subscribe(sessionId) — which, because it fires after ours but before
+      // this stale continuation resumes, can complete *before* this
+      // unsubscribe reaches the daemon. Sending it anyway would then cancel
+      // the newer bind's brand-new subscription instead of the one we own,
+      // leaving the pane looking bound while no notification ever arrives
+      // again (01-w2-interfaces.md §5 review round 2 — same failure this
+      // generation check exists to prevent, via a different path).
+      if (get().activeSessionId !== sessionId) {
+        transport.call('session.unsubscribe', { id: sessionId }).catch((err) => {
+          console.warn('session.unsubscribe (stale bind) failed', err)
+        })
+      }
       return
     }
     if (!subscribeRes.ok) {

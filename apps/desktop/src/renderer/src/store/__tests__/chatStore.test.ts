@@ -256,4 +256,59 @@ describe('chatStore', () => {
     }
     expect(useChatStore.getState().activeSessionId).toBe('session_b')
   })
+
+  it('bindSession superseded by a re-bind of the SAME session must not unsubscribe it (01-w2-interfaces.md §5 review round 2)', async () => {
+    // React.StrictMode's mount→cleanup→mount (or a fast A→B→A flip in the
+    // left pane back to where it started) re-binds the *same* sessionId
+    // while the first subscribe is still in flight. `unbindSession()` at the
+    // top of the second call already sends one legitimate unsubscribe (it's
+    // tearing down whatever the store currently claims to be bound to,
+    // same-session or not — that part isn't new). The bug was the *stale*
+    // first bind then sending a second, redundant unsubscribe for this same
+    // session after backing out — which can land after the second bind's own
+    // subscribe and cancel it, leaving the pane "bound" but deaf.
+    const pendingSubscribes: Array<() => void> = []
+    const unsubscribeCalls: string[] = []
+    const listenerCounts = new Map<string, number>()
+    const transport: RpcTransport = {
+      call: async <T,>(method: string, params?: Record<string, unknown>): Promise<RpcCallResult<T>> => {
+        if (method === 'session.subscribe') {
+          await new Promise<void>((resolve) => {
+            pendingSubscribes.push(resolve)
+          })
+          return { ok: true }
+        }
+        if (method === 'session.unsubscribe') {
+          unsubscribeCalls.push((params as { id: string }).id)
+          return { ok: true }
+        }
+        return { ok: true, result: [] as T }
+      },
+      on: (method: string) => {
+        listenerCounts.set(method, (listenerCounts.get(method) ?? 0) + 1)
+        return () => {
+          listenerCounts.set(method, (listenerCounts.get(method) ?? 0) - 1)
+        }
+      }
+    }
+
+    // Both calls run synchronously up to their own `await session.subscribe`
+    // before either settles — the second bind's `unbindSession()` cleanup
+    // (which fires its one legitimate unsubscribe) and its own subscribe
+    // call both happen before the first bind's subscribe resolves.
+    const firstBind = useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
+    const secondBind = useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
+    pendingSubscribes[0]!()
+    pendingSubscribes[1]!()
+    await Promise.all([firstBind, secondBind])
+
+    // Exactly one unsubscribe(MAIN_SESSION_ID) — the second bind's own
+    // teardown-on-rebind. The stale first bind must NOT add a second one.
+    expect(unsubscribeCalls.filter((id) => id === MAIN_SESSION_ID)).toHaveLength(1)
+    expect(useChatStore.getState().activeSessionId).toBe(MAIN_SESSION_ID)
+    // Only the winning (second) bind's listeners should be live.
+    for (const count of listenerCounts.values()) {
+      expect(count).toBeLessThanOrEqual(1)
+    }
+  })
 })
