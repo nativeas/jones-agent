@@ -38,7 +38,7 @@ daemon ── _on_request_permission ──┐
 - **审查闸的风险分级**：v1 用**确定性规则**（工具名 + 参数特征：写文件在工作区内/外、终端命令是否含网络外发 `curl|wget|ssh|scp`、浏览器工具按 §9 分级表），不接第二个 LLM 客户端。`review/` 子模块暴露 `classify(tool, args, ctx) -> Risk(low|medium|high, reasons)`；后续要换成模型判断时只换这个函数。**理由写进文档**：PRD 说审查闸是「模型对高危动作二次判断」，v1 用规则先满足 G04/G05/G06 的可测性，模型判断作为 W4+ 增强并在 PRD 中标注。
 - **模式**（`sessions/modes.py`）：`chat` 插件 block 一切工具；`task` 写动作逐条用户闸；`auto` 规则闸 allow 范围内直接执行、审查闸 high 才用户闸。子会话模式不得比父宽（N13：`create(parent_id, mode)` 校验；工具白名单用 `agents/policy.is_tool_allowlist_subset`）。
 - **审批超时**：`settings.approval_timeout_minutes`，到期自动 deny 并按 9.3 错误终止（卡片注明「审批超时」）；无「超时自动批准」。
-- **remember**：`permission.decide.remember = session|project` → 写入会话级内存规则 / 项目级 `permissions.json`（只能是 allow 收窄到具体 match，不得触碰硬禁止）。
+- **remember**：`permission.decide.remember = session|project` → 写入会话级内存规则 / 项目级 `permissions.json`（只能是 allow 收窄到具体 match，不得触碰硬禁止）。**Round 4（控制者裁定 R1，2026-09-19）**：`match` 对 `terminal` 工具不再有前缀/子串语义——规范化（去首尾空白、连续空白折成一个空格，不做任何 shell 解析）后必须与被检查的整条命令文本逐字相等才算命中；`remember` 写出的 `match` 本身就是用户当时批准的那条完整命令文本，天然满足这个约束。非 `terminal` 工具的规则仍是工具名精确相等（未变）。见 §1.2 与 `kernel/plugin/jones_gate/_rules.py` 模块文档。
 - **写库时序**（见 spike 01 §审计写入时序）：`permission_decisions` 在 request 到达 daemon 时写 pending 行；裁决后 UPDATE；step 与 decision 通过 ACP tool_call_id 关联，取不到时用合成 id 并标注。
 - **编辑审批接入点**：`acp_adapter/edit_approval.py`（write_file/patch）也会发 `request_permission`——同一条 daemon 路径处理，参数形状不同要识别。
 - **验收对应**：写 `daemon/tests/test_gates_*.py` 覆盖 G04（三闸各一）、G05（三模式下 rm -rf 全拒）、G06（三模式行为）、N01/N03/N12/N13；用假 ACP agent 驱动。
@@ -128,6 +128,50 @@ daemon ── _on_request_permission ──┐
   （那需要的 RPC 往返/新状态超出了这条分支已经很大的改动面，且今天没有任何代码路径会把模式改成别的
   值，钉死一个不会被改的东西不是这条修复要解决的问题）；如果未来确有代码开始调用 `session/set_mode`，
   这个自检会在那一刻立即变成真正的拒绝，而不是继续静默通过。
+
+### 1.3 Round 4：终端命令匹配前提重写（控制者裁定 R1/R2，2026-09-19，不可推翻）
+
+第 1–3 轮评审各自在一个「按 shell 操作符切分 segment、逐个 argv 判定」的裁决引擎上补了一个洞
+（`&&`/`;`/`|` → 通配 wrapper（`sh -c`/`env`/`xargs`）→ `$(...)`/重定向 → `&`/换行），DEV.md
+工程原则 #2 明确禁止的「patch 打 patch」。控制者裁定改前提，不再补第 5 个洞：
+
+- **允许快路径不再有前缀/子串语义**（R1）：`permissions.json` 里 `terminal` 工具的规则（含
+  `remember` 写出的）统一为「规范化后整串相等」匹配——规范化只做「去首尾空白、连续空白折成一个
+  空格」，不调用任何 shell 分词器。任何操作符拼接（`&`/`;`/`\n`/`$(...)`/重定向……）产生的命令
+  文本都不可能再与一条规则的 `match` 逐字相等，因此不需要枚举操作符列表去防它们——这正是「前缀
+  匹配」与「整串相等」的本质区别：前者需要一份完整的操作符黑名单才安全，后者不需要任何黑名单。
+  非 `terminal` 工具的规则不受影响（工具名精确相等，从未涉及命令文本）。`_is_command_prefix`
+  （及第 1–3 轮围绕它写的全部 segment/substitution 匹配辅助函数）已删除，
+  `kernel/plugin/jones_gate/_rules.py` 现在是这个模块唯一的匹配实现。
+- **`compound` 命令永不走规则闸放行**（R2）：命令文本中出现 `;`/`&`/`|`/`` ` ``/`$(`/换行中的任意
+  一个即标记为 `compound`（纯文本子串扫描，不解析 shell），`decide()` 对 compound 命令永远不返回
+  `"allow"`——即使某条规则的 `match` 恰好逐字等于这个 compound 字符串本身（含 blanket
+  `{"match":"terminal","action":"allow"}` 这种「信任整个工具」的宽边界，第 2 轮曾把它排除在修复
+  范围外，本轮裁定不再豁免：一律 escalate 到 daemon 审查闸）。审查闸对 `terminal` 调用的基线本来
+  就是 `medium`（从不返回 `low`，见 `permissions/review.py::_classify_terminal`），因此
+  "compound 给 medium 起步" 无需新增分支即已满足；`_NETWORK_EGRESS_PROGRAMS` 补充了 `nc`（原来只有
+  `curl`/`wget`/`ssh`/`scp`），使其命中时仍是 `high`。
+- **硬禁止分类器改为 token 流上的过近似扫描**（R2）：`_hard_deny.py` 不再尝试理解「这个 token 属于
+  哪条子命令」——新的 `tokenize()` 是一个引号感知的单遍扫描器，在空白和任一操作符字符
+  `; & | < > ( ) \` \n`（连同换行）处切开（操作符本身丢弃，不作为 token 返回），引号内内容整体保留
+  为一个 token，反斜杠转义按 POSIX 处理；硬禁止判定直接在这个扁平 token 流上找模式（`rm` 后面任意
+  位置出现递归/强制标志、`shred`/`mkfs*`/`diskutil erase*`/trash、`git push --force` 到默认分支、
+  `find ... -delete`），不再需要为 `env`/`nohup`/`timeout`/`xargs`/`find -exec` 这些 wrapper 各写
+  一段「剥离自己参数取剩余 argv」的代码——它们的真实 argv 本来就直接躺在扁平 token 流里。唯一仍需
+  要递归的是 shell 解释器的 `-c`/`-lc`/`-xc`/… 载荷（它作为一个带引号的 token 整体保留，内部的
+  `rm`/`-rf` 要重新 tokenize 一次才能看见），深度上限 3。
+  - **代价，明确写下**（PRD 5.7 允许「宁可误拒」）：不再对 `rm -rf` 的目标做 `cwd` 路径解析——第
+    1–3 轮的临时目录例外（`rm -rf /tmp/x` 不算硬禁止）被删除，任何 `rm` 搭配递归/强制标志一律硬拒，
+    不再尝试证明目标「碰巧」在临时目录下。
+  - `~/.jones`/`<project>/.jones/permissions.json` 的硬禁止收窄为「该路径的 token 且同一 token 流
+    出现写/删动词（`rm`/`mv`/`cp`/`chmod`/… 等固定清单）才拒」——纯读（如 `cat ~/.jones/x`）不再被
+    这一层硬拒；它没有被静默放行：读命令若不含任何操作符就不是 compound，若也没有匹配的
+    `permissions.json` allow 规则，仍然 escalate 到审查闸而非零 IPC 执行。
+- **契约影响**：`kernel/plugin/jones_gate/_hard_deny.py::classify_command` 的签名从
+  `classify_command(command, *, cwd=None)` 改成 `classify_command(command, *, user_root=None,
+  project_permissions_path=None)`（不再需要 `cwd` 做路径解析）；独立的 `command_touches_protected_
+  path` 函数已删除，功能并入 `classify_command`——`__init__.py::_hard_deny_verdict` 现在只调用一次。
+  `is_protected_path`（`write_file`/`patch` 的纯路径参数检查，不涉及 shell）未变。
 
 ## 2. G：Run 回放（FR06）+ 集成收口
 

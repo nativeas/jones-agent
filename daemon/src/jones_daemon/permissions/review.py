@@ -38,8 +38,10 @@ _READ_ONLY_LOW = frozenset(
      "browser_take_screenshot", "browser_wait_for"}
 )
 
-# 02-w3-interfaces.md §1.1: "终端命令是否含网络外发 curl|wget|ssh|scp".
-_NETWORK_EGRESS_PROGRAMS = frozenset({"curl", "wget", "ssh", "scp"})
+# 02-w3-interfaces.md §1.1: "终端命令是否含网络外发 curl|wget|ssh|scp"; round 4
+# (controller ruling R2, 2026-09-19) named `nc` explicitly alongside them
+# ("compound 命令...含 curl|wget|ssh|scp|nc 给 high") — added here.
+_NETWORK_EGRESS_PROGRAMS = frozenset({"curl", "wget", "ssh", "scp", "nc"})
 
 # 00-foundation.md §9.2's user-gate condition ③ for `browser_evaluate`: "求值的
 # 表达式里含网络请求...或存储写入". Deliberately coarse (a substring scan, not a
@@ -176,6 +178,17 @@ def _classify_write(path: Any, *, cwd: str | None) -> Risk:
 
 
 def _classify_terminal(args: dict[str, Any]) -> Risk:
+    # Round 4 (controller ruling R2): a `terminal` call never classifies
+    # below `medium` in this function (see the `return _medium(...)` at the
+    # bottom) — which already IS the "compound 命令...给 medium 起步" floor
+    # the ruling asks for, since a compound command is still just a
+    # `terminal` call by the time it reaches here (the rule gate's own
+    # `compound` check, `kernel/plugin/jones_gate/_rules.py::
+    # is_compound_command`, only ever decides whether ① can fast-path
+    # `allow` — everything that escalates to ② lands in this same function
+    # regardless of compound-ness). No separate compound-aware branch is
+    # needed here for that reason; the network-egress check right below is
+    # what raises it to `high`.
     command = args.get("command")
     if not isinstance(command, str) or not command:
         return _high("terminal call with no command text to analyze")

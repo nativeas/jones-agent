@@ -98,19 +98,15 @@ def _hard_deny_verdict(
     if tool_name == "terminal":
         command = args.get("command")
         if isinstance(command, str) and command:
-            verdict = _hard_deny.classify_command(command, cwd=config.get("cwd"))
-            if verdict.denied:
-                return verdict
-            touches_protected = bool(user_root) and isinstance(
-                user_root, str
-            ) and _hard_deny.command_touches_protected_path(
-                command, user_root=user_root, project_permissions_path=project_permissions_path,
-                cwd=config.get("cwd"),
+            # Round 4 (controller ruling R2): `classify_command` is now the
+            # single entry point — the old separate `command_touches_
+            # protected_path` call is gone, folded into the same flat
+            # token-stream scan (see `_hard_deny.py`'s module docstring).
+            return _hard_deny.classify_command(
+                command,
+                user_root=user_root if isinstance(user_root, str) else None,
+                project_permissions_path=project_permissions_path,
             )
-            if touches_protected:
-                return _hard_deny.Verdict(
-                    True, "this command touches Jones's own data under ~/.jones/ (PRD 10.4, N10)"
-                )
         return _hard_deny.Verdict(False)
     if tool_name in _EDIT_APPROVAL_TOOLS:
         path = args.get("path")

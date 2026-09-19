@@ -6,105 +6,87 @@ docstring in `__init__.py`): this file is physically copied into every
 worker's `HERMES_HOME/plugins/jones_gate/` and runs inside Hermes's own
 Python process, not the daemon's.
 
-Two kinds of hard denial, both **never** influenced by `jones_gate.json` (no
-mode, no permissions.json rule, no Agent whitelist can ever loosen either
-one — that file only ever supplies the *paths* `command`/`args` are checked
-against, never a policy switch):
+## Round 4 rewrite (2026-09-19, controller ruling R2 — "改前提，不打补丁")
 
-1. `classify_command`: a small lexical (shlex-based, not substring-matching —
-   02-w3-interfaces.md §1.1 is explicit that a "命令分类器" is required, not a
-   blacklist of strings) classifier for the terminal tool's `command` arg:
-   `rm -r`/`rm -rf` outside a temp dir, `trash`/empty-recycle-bin, `shred`,
-   `mkfs*`, `diskutil erase*`, `git push --force` to the default branch.
-2. `is_protected_path`: writes/deletes touching `~/.jones/` (any path under
-   it) or a project's `.jones/permissions.json` specifically (PRD 10.4/N10).
+Rounds 1–3 each closed one more shell-syntax hole in a segment-based
+classifier (`argv[0]` of each `&&`/`;`/`|`-delimited "segment", wrapper
+programs unwrapped one at a time, `$(...)`/redirection detected as "unproven"
+inside a segment, then `&`/bare-newline added as segment boundaries too) —
+three rounds of the exact "patch on patch" DEV.md 工程原则 #2 forbids, because
+the premise was wrong: trying to understand *which shell invocation a token
+belongs to* before deciding whether the command is dangerous. A classifier
+built that way can only ever be as complete as the list of shell constructs
+its author thought to unwrap — 4 rounds of review finding a 5th were exactly
+that premise failing, not 4 rounds of sloppy implementation.
 
-A command this module cannot safely parse (unbalanced quotes) is NOT hard-
-denied here — hard-deny is reserved for patterns we can positively identify;
-an unparseable command instead falls through to the review gate, where
-`permissions/review.py::classify()` marks it high-risk for exactly the same
-reason it couldn't be parsed here, which routes it to the user gate in every
-mode. Silently hard-blocking anything we merely fail to understand would be
-its own kind of dishonesty (DEV.md 工程原则 #4 covers failing loud, not
-failing by guessing).
+The new premise: **stop trying to understand command boundaries at all.**
+`tokenize()` below turns the whole command string into ONE flat, quote-aware
+token stream — splitting on whitespace AND on every shell operator character
+(`; & | < > ( ) \\`` and a literal newline, all DISCARDED, never returned as
+tokens of their own — unlike round 1–3's segment splitter, which kept `&&`/
+`;`/`|` as tokens and then grouped around them) — and the checks below look
+for a hard-deny PATTERN anywhere in that flat stream, never asking "is this
+token part of the same shell command as that one". This can never be fooled
+by a joiner this file didn't happen to enumerate (there's no joiner-list to
+be incomplete) — `env`/`nohup`/`timeout`/`xargs`/`find -exec` wrapping `rm
+-rf` all fall out for free (their argv sits directly in the flat stream, no
+per-wrapper unwrapping code needed at all, see `test_gates_hard_deny.py`'s
+`test_xargs_rm_rf_is_denied` for why `xargs rm -rf` needs zero special-casing
+now). The one wrapper that genuinely needs help is a shell interpreter's
+`-c`/`-lc`/`-xc`/… payload, because `tokenize()` correctly keeps a QUOTED
+string as one token (the whole payload), so its own `rm`/`-rf` tokens are
+inside that one token's text, not separate entries in the stream — see
+`_shell_dash_c_payloads` below, the one piece of "recursion" this module
+still does, and it does it by re-running the SAME flat scan on the payload
+text, not by adding a new case to a wrapper-specific unwrap table.
 
-## Shell-wrapper unwrapping (review finding #2, 2026-09-19)
-
-`classify_command`/`command_touches_protected_path` originally only looked at
-each shell segment's OWN argv — `bash -c 'rm -rf /Users/alice'` classified as
-a call to `bash` with two harmless-looking args, never looking inside the
-`-c` payload it actually executes. Combined with a `permissions.json` allow
-rule for `terminal` (a legitimate, intentional config — "allow this whole
-tool" — 02-w3-interfaces.md §1.1's exact-tool-name match shape), that meant
-the one gate PRD 5.7 says "any config" can never loosen had a hole a single
-`sh -c`/`bash -c` wrapper drove straight through it.
-
-`_expand_wrapped_argv` recursively unwraps a bounded set of known wrappers
-before the existing per-argv checks run, so the checks below see the REAL
-command being executed, not just the wrapper invoking it:
-  - `sh`/`bash`/`zsh`/`dash`/`ksh -c "<script>"` — the script argument is
-    itself a full shell command string, re-split into its own segments
-    (`_split_shell_segments`, same function the top-level command already
-    goes through) and each of those recursively unwrapped too (nested
-    wrapping, e.g. `bash -c "env FOO=1 sh -c 'rm -rf /'"`, up to
-    `_MAX_UNWRAP_DEPTH`).
-  - `env`/`nohup`/`timeout <cmd> ...` — these exec a real command with the
-    rest of their own argv, after skipping their own flags/args
-    (`_strip_leading_wrapper_argv`); the remainder is unwrapped the same way
-    (still just one argv, no re-splitting needed — no shell is involved).
-  - `xargs [options] <cmd> [initial-args]` — best-effort: the command
-    xargs would invoke, after xargs's own flags. `xargs`'s real invocation
-    also appends args read from stdin at runtime, which this static analysis
-    can never see — `_rm_verdict` already fails closed on that (an `rm -rf`
-    with no VISIBLE target argument is treated as "unproven safe", see its
-    own docstring), which is exactly the right degradation here too.
-
-A wrapper form this function doesn't recognize, or a `-c` payload that fails
-to parse, is simply not unwrapped — same "don't hard-deny what we can't
-positively identify" rule as everywhere else in this module; it still falls
-through to the review gate for whatever the wrapper's own argv looks like
-verbatim.
-
-## Combined short-option `-c` forms (review finding #1, round 2, 2026-09-19)
-
-The first cut of the shell-interpreter branch above only recognized a
-standalone `-c` token (`argv.index("-c")`) — real-world shell invocations
-routinely combine `-c` with another single-letter flag in one token
-(`bash -lc '...'` for a login shell, `bash -ic '...'` interactive, `sh -xc
-'...'` xtrace, `-ec`, etc.), which is exactly as common as bare `-c` and was
-not recognized at all: the whole payload fell through `except ValueError`
-(no, worse — `argv.index("-c")` just raised `ValueError` because no token
-equals the string `"-c"` exactly) and the function returned `[argv]`
-unexpanded, silently reopening the same hole finding #2 closed for the bare
-form. `_shell_dash_c_index` now matches the standalone `-c` **or** any
-single-dash cluster of letters ending in `c` (`-lc`, `-ic`, `-xc`, `-ec`,
-`-ilc`, …) — `getopt`-style combined short options are unordered, but `c`'s
-own convention is to always be the flag that consumes the next argv as its
-payload, so matching "ends in `c`" (rather than "contains `c`") stays
-conservative about what counts as a `-c` cluster instead of guessing.
+The tradeoff, made explicit rather than left implicit (PRD 5.7 explicitly
+allows it — "宁可误拒，不允许漏挡"): this scanner is a deliberate OVER-
+approximation. It no longer resolves an `rm -rf` target against `cwd` to
+carve out "this happens to point at a temp directory" (round 1–3's
+`_rm_verdict` did) — ANY `rm` token followed anywhere later in the stream by
+a recursive/force flag is denied, full stop, because proving a target is
+"safely temporary" is exactly the kind of per-invocation understanding this
+rewrite stops attempting. Likewise `command_touches_protected_path`'s old
+"any token that resolves under `~/.jones/`, read or write, hard-denies the
+whole command" is gone — the new rule requires a write/delete-verb token to
+also be present in the same stream (see `_protected_path_denied`), a
+deliberate NARROWING the controller's ruling asked for explicitly; a plain
+read (`cat ~/.jones/x`) is no longer hard-denied by this file (it still
+isn't silently allowed either: any command containing an operator character
+is `compound` and never takes the rule gate's allow fast path — see
+`_rules.py::decide` — so a *compound* read attempt still lands on the daemon
+review gate for a human to see; only a bare, non-compound `cat ~/.jones/x`
+with no matching config rule at all reaches this file's judgment alone).
 """
 
 from __future__ import annotations
 
-import shlex
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-_SHELL_OPERATORS = frozenset({"&&", "||", ";", "|", "&"})
-_RECURSIVE_FORCE_RM_FLAGS = frozenset({"-r", "-rf", "-fr", "-R", "-Rf", "-fR"})
+# Characters that end a token AND are discarded (never returned as tokens of
+# their own) — whitespace does the same job but isn't listed here since
+# `str.isspace()` already covers it (including the literal `\n` the ruling
+# calls out by name).
+_OPERATOR_CHARS = frozenset(";&|<>()`")
+
+_MAX_SHELL_C_DEPTH = 3  # controller ruling R2: "深度 ≤ 3"
+_SHELL_INTERPRETERS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
 _TRASH_PROGRAMS = frozenset({"trash", "rmtrash"})
 _DEFAULT_BRANCHES = frozenset({"main", "master"})
 
-# Review finding #2: known shell-wrapper programs whose argv this module
-# recurses into instead of stopping at (see module docstring's "Shell-wrapper
-# unwrapping" section).
-_SHELL_INTERPRETERS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
-_ENV_LIKE_WRAPPERS = frozenset({"env", "nohup", "timeout"})
-_XARGS_VALUE_FLAGS = frozenset(
-    {"-I", "-L", "-n", "-P", "-s", "-d", "--delimiter", "--max-args", "--max-procs", "--replace"}
-)
-_MAX_UNWRAP_DEPTH = 4
+# "同一 token 流出现写/删动词" (controller ruling R2) — programs whose ordinary
+# job is to write or delete something, checked only ever in combination with
+# a token that also names a protected path (see `_protected_path_denied`);
+# deliberately broad (over-inclusive costs one escalation-worthy false
+# positive, never a false negative) but not "every program that could ever
+# conceivably write a file" — that would be every program.
+_WRITE_DELETE_VERBS = frozenset({
+    "rm", "mv", "cp", "dd", "shred", "truncate", "touch", "tee",
+    "chmod", "chown", "sed", "ln", "mkdir", "rmdir", "rsync",
+    "install", "trash", "rmtrash", "git",
+})
 
 
 @dataclass(frozen=True)
@@ -113,409 +95,304 @@ class Verdict:
     reason: str = ""
 
 
-def _temp_roots() -> tuple[Path, ...]:
-    # Real, resolved roots — macOS's `/tmp` is a symlink to `/private/tmp`;
-    # resolving both the root and the candidate path the same way is what
-    # makes the `is_relative_to` check below mean anything.
-    raw = {tempfile.gettempdir(), "/tmp", "/private/tmp", "/var/tmp"}
-    out = []
-    for r in raw:
-        try:
-            out.append(Path(r).resolve(strict=False))
-        except OSError:
-            continue
-    return tuple(out)
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
-
-
-def _resolve_best_effort(raw: str, *, cwd: str | None) -> Path | None:
-    try:
-        p = Path(raw).expanduser()
-        if not p.is_absolute() and cwd:
-            p = Path(cwd).expanduser() / p
-        return p.resolve(strict=False)
-    except (OSError, RuntimeError, ValueError):
-        # `ValueError` (review finding #11, 2026-09-19): `Path.resolve()`
-        # raises it (not `OSError`) for a path containing an embedded NUL
-        # byte (`lstat: embedded null character in path`) — reproduced
-        # against this exact function before this fix. Fails closed the
-        # same way an `OSError` already did (see `is_protected_path`'s
-        # caller: an unresolvable path is treated as protected, an
-        # unresolvable `rm` target is treated as not-provably-temp).
-        return None
-
-
-def _is_temp_path(raw: str, *, cwd: str | None) -> bool:
-    resolved = _resolve_best_effort(raw, cwd=cwd)
-    if resolved is None:
-        # Can't resolve it -> can't prove it's safely inside a temp root ->
-        # fail closed (treat as NOT temp, i.e. this rm target stays hard-denied).
-        return False
-    return any(_is_relative_to(resolved, root) for root in _temp_roots())
-
-
-def _split_on_bare_newlines(command: str) -> list[str]:
-    """Split `command` into pieces at every literal newline that lies
-    OUTSIDE single/double quotes — a minimal, quote-aware scan (single
-    quotes escape nothing; a backslash, inside double quotes or unquoted,
-    escapes only the one character right after it) whose only job is
-    telling a boundary-newline apart from one embedded in a quoted
-    argument. A newline that IS inside an open quote is left untouched
-    in the piece it's part of, so a quoted multi-line argument
-    (`echo "hello\\nworld"`) stays whole and gets tokenized by a single
-    `shlex.split` call downstream exactly as it always has — this
-    function only ever decides WHERE to cut, `shlex` still does the
-    actual tokenizing of each piece, unchanged. An unterminated quote
-    simply never closes for the rest of the string, so every newline
-    after it lands in one final piece — `shlex.split` raising on that
-    piece's unbalanced quote is `_split_shell_segments`'s existing
-    "can't parse it, don't hard-deny it" fallback, not a new failure
-    mode."""
-    pieces: list[str] = []
+def tokenize(command: str) -> list[str] | None:
+    """Quote-aware scanner (controller ruling R2): cuts `command` into tokens
+    at every whitespace character AND at every character in
+    `_OPERATOR_CHARS` — both kinds of delimiter are discarded, never
+    returned as a token — EXCEPT while inside a `'...'`/`"..."` quoted span,
+    where the entire quoted content becomes (part of) one token regardless
+    of what it contains (an operator character or whitespace inside quotes
+    is just data). Backslash escaping is POSIX: outside quotes and inside
+    double quotes, `\\` makes the next character literal (never a delimiter,
+    never quote-processed); inside single quotes nothing is escaped, not
+    even `\\` itself, until the closing `'`. Returns `None` (never raises)
+    for a command with an unterminated quote — the same "can't safely parse
+    it -> don't hard-deny it here, let the review gate's own 'could not
+    parse' high-risk classification handle it" contract every round of this
+    module has kept (see `permissions/review.py::_classify_terminal`)."""
+    tokens: list[str] = []
     current: list[str] = []
+    token_open = False  # True once we've started a token, even an empty one (e.g. `""`)
     quote: str | None = None
-    i = 0
-    n = len(command)
+    i, n = 0, len(command)
     while i < n:
         ch = command[i]
-        if quote is not None:
-            if ch == "\\" and quote == '"' and i + 1 < n:
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            else:
                 current.append(ch)
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < n and command[i + 1] in ('"', "\\", "$", "`", "\n"):
                 current.append(command[i + 1])
                 i += 2
                 continue
-            current.append(ch)
-            if ch == quote:
+            if ch == '"':
                 quote = None
+                i += 1
+                continue
+            current.append(ch)
             i += 1
             continue
         if ch == "\\" and i + 1 < n:
-            current.append(ch)
             current.append(command[i + 1])
+            token_open = True
             i += 2
             continue
         if ch in ("'", '"'):
             quote = ch
-            current.append(ch)
+            token_open = True
             i += 1
             continue
-        if ch == "\n":
-            pieces.append("".join(current))
+        if ch.isspace() or ch in _OPERATOR_CHARS:
+            if token_open or current:
+                tokens.append("".join(current))
             current = []
+            token_open = False
             i += 1
             continue
         current.append(ch)
+        token_open = True
         i += 1
-    pieces.append("".join(current))
-    return pieces
+    if quote is not None:
+        return None  # unterminated quote -> unparseable, see docstring
+    if token_open or current:
+        tokens.append("".join(current))
+    return tokens
 
 
-def _split_shell_segments(command: str) -> list[list[str]] | None:
-    """Split on top-level `&&`/`||`/`;`/`|`/`&`, AND on a bare (unquoted)
-    newline, into one argv per segment.
-
-    `shlex.split` doesn't treat `&&`/`||`/`;`/`|`/`&` as operators on its
-    own — they come back as ordinary word tokens (e.g. `"a && b"` ->
-    `["a", "&&", "b"]`) — so a second pass groups tokens between them.
-    Returns `None` (not raises) on unbalanced quoting, matching the "don't
-    hard-deny what we can't parse" rule in the module docstring.
-
-    ## Newline as a segment boundary (review finding, round 3, 2026-09-19)
-
-    A newline is whitespace to `shlex` — exactly like a space — so
-    `"npm test\\nrm -rf /Users/alice"` tokenized the same as
-    `"npm test rm -rf /Users/alice"`: one single segment `argv[0] == "npm"`,
-    with `rm -rf ...` riding along as extra words nothing here ever looked
-    at. A multi-line command is ordinary terminal syntax (every line after
-    the first runs as its own separate command, same as `;`), not a
-    constructed edge case, and it closed the exact same "narrow allow rule
-    covers an unrelated tail" hole `&&`/`;`/`|` were already closed for
-    (`_rules.py`'s segment-aware `decide()` shares this function) — as well
-    as letting a hard-denied command through this module itself, since
-    `classify_command` only ever inspected `argv[0]` of each *segment*.
-
-    `_split_on_bare_newlines` (above) does the quote-aware cutting; each
-    piece it returns is then tokenized by `shlex.split` exactly as the
-    whole command used to be (a piece with no newline in it at all — the
-    overwhelmingly common case — is byte-identical to the original input,
-    so this is a strict extension, not a rewrite of the common path).
-    """
-    segments: list[list[str]] = []
-    for piece in _split_on_bare_newlines(command):
-        try:
-            tokens = shlex.split(piece, posix=True)
-        except ValueError:
-            return None
-        current: list[str] = []
-        for tok in tokens:
-            if tok in _SHELL_OPERATORS:
-                if current:
-                    segments.append(current)
-                current = []
-            else:
-                current.append(tok)
-        if current:
-            segments.append(current)
-    return segments
+def _prog(tok: str) -> str:
+    """Basename-normalize a single token for a program-name comparison (so a
+    rule matching `rm` still catches `/bin/rm`) — deliberately applied only
+    at the point of a program-name comparison, never to every token in the
+    stream, because doing that to a path ARGUMENT (e.g. `/Users/alice/
+    .jones/x`) would throw away the directory components a protected-path
+    check needs to see."""
+    return Path(tok).name
 
 
-def _strip_leading_wrapper_argv(prog: str, argv: list[str]) -> list[str] | None:
-    """`env`/`nohup`/`timeout`: return the argv of the command they'd
-    actually exec, after skipping their own flags/args. `None` when nothing
-    identifiable follows (e.g. `env` with no command at all)."""
-    rest = argv[1:]
-    if prog == "env":
-        i = 0
-        while i < len(rest):
-            tok = rest[i]
-            if tok.startswith("-"):
-                i += 1
-                continue
-            if "=" in tok:  # a VAR=VALUE assignment, `env`'s own syntax
-                i += 1
-                continue
-            break
-        rest = rest[i:]
-    elif prog == "timeout":
-        i = 0
-        consumed_duration = False
-        while i < len(rest):
-            tok = rest[i]
-            if tok.startswith("-"):
-                i += 1
-                continue
-            if not consumed_duration:
-                i += 1
-                consumed_duration = True
-                continue
-            break
-        rest = rest[i:]
-    # `nohup <cmd> ...` takes no flags of its own before the command.
-    return rest or None
+def _is_recursive_flag(tok: str) -> bool:
+    """"含 -r/-R/-rf/-fr（或 --recursive）" (controller ruling R2) — matched
+    generously: any single-dash cluster of letters containing `r`/`R`
+    (covers `-r`, `-R`, `-rf`, `-fr`, `-vrf`, …), or `--recursive` itself.
+    Over-inclusive on purpose (see module docstring's "sacrifice precision
+    for an over-approximation" tradeoff)."""
+    if tok == "--recursive" or tok.startswith("--recursive="):
+        return True
+    if tok.startswith("--") or not tok.startswith("-") or len(tok) < 2:
+        return False
+    letters = tok[1:]
+    return letters.isalpha() and ("r" in letters or "R" in letters)
 
 
-def _strip_xargs_wrapper(argv: list[str]) -> list[str] | None:
-    """Best-effort: the argv of the command `xargs` would invoke, after its
-    own options. `xargs` also appends args it reads from stdin at runtime —
-    invisible to this static analysis — so the returned argv may be missing
-    trailing arguments the real invocation would have; callers (`_rm_verdict`
-    in particular) already fail closed on a target-less `rm -rf`, which is
-    the correct degradation for that gap, not a hole in it."""
-    rest = argv[1:]
-    i = 0
-    while i < len(rest):
-        tok = rest[i]
-        if tok == "--":
-            i += 1
-            break
-        if not tok.startswith("-"):
-            break
-        if tok in _XARGS_VALUE_FLAGS:
-            i += 2
-        else:
-            i += 1
-    rest = rest[i:]
-    return rest or None
-
-
-def _shell_dash_c_index(argv: list[str]) -> int | None:
-    """Index of a shell `-c`-equivalent flag in `argv`: either the standalone
-    `-c` token, or a single-dash combined short-option cluster ENDING in `c`
-    (`-lc`, `-ic`, `-xc`, `-ec`, …) — see the module docstring's "Combined
-    short-option `-c` forms" section. `--` (a long option, or the end-of-
-    options marker) never matches. Returns `None` when no such flag is
-    present."""
-    for i, tok in enumerate(argv):
-        if tok.startswith("--"):
+def _rm_denied(tokens: list[str]) -> bool:
+    """"出现 rm 且其后任一 token 含 ... → deny" — literally: an `rm` token
+    anywhere in the stream with a recursive/force flag token anywhere AFTER
+    it (not necessarily adjacent, not necessarily "its own" argv — see
+    module docstring for why command-boundary precision is exactly what this
+    rewrite stops attempting). No `cwd`/temp-directory carve-out any more
+    (round 1–3's `_rm_verdict` had one; the controller's ruling doesn't, and
+    proving a target is safely temporary is the kind of per-invocation
+    understanding this module no longer does — PRD 5.7 explicitly permits
+    the resulting over-denial)."""
+    for i, tok in enumerate(tokens):
+        if _prog(tok) != "rm":
             continue
-        if not tok.startswith("-"):
+        if any(_is_recursive_flag(t) for t in tokens[i + 1 :]):
+            return True
+    return False
+
+
+def _find_delete_denied(tokens: list[str]) -> bool:
+    return any(_prog(t) == "find" for t in tokens) and any(t == "-delete" for t in tokens)
+
+
+def _trash_denied(tokens: list[str]) -> bool:
+    return any(_prog(t) in _TRASH_PROGRAMS for t in tokens)
+
+
+def _shred_denied(tokens: list[str]) -> bool:
+    return any(_prog(t) == "shred" for t in tokens)
+
+
+def _mkfs_denied(tokens: list[str]) -> bool:
+    return any(_prog(t).startswith("mkfs") for t in tokens)
+
+
+def _diskutil_erase_denied(tokens: list[str]) -> bool:
+    for i, tok in enumerate(tokens):
+        if _prog(tok) != "diskutil":
             continue
-        letters = tok[1:]
-        if letters and letters.isalpha() and letters[-1] == "c":
-            return i
-    return None
+        if any(t.lower().startswith("erase") for t in tokens[i + 1 :]):
+            return True
+    return False
 
 
-def _expand_wrapped_argv(argv: list[str], depth: int) -> list[list[str]]:
-    """Return `[argv]` plus, for a recognized wrapper, every argv it would
-    actually go on to run (recursively, up to `depth`) — see the module
-    docstring's "Shell-wrapper unwrapping" section. Always includes the
-    original `argv` itself (a wrapper's own name/flags never denied by
-    anything below, but harmless to also check)."""
-    out = [argv]
-    if depth <= 0 or not argv:
-        return out
-    prog = Path(argv[0]).name
-    if prog in _SHELL_INTERPRETERS:
-        c_index = _shell_dash_c_index(argv)
-        if c_index is None:
-            return out
-        if c_index + 1 >= len(argv):
-            return out
-        inner_segments = _split_shell_segments(argv[c_index + 1])
-        if inner_segments is None:
-            return out
-        for seg in inner_segments:
-            if seg:
-                out.extend(_expand_wrapped_argv(seg, depth - 1))
-        return out
-    if prog in _ENV_LIKE_WRAPPERS:
-        rest = _strip_leading_wrapper_argv(prog, argv)
-        if rest:
-            out.extend(_expand_wrapped_argv(rest, depth - 1))
-        return out
-    if prog == "xargs":
-        rest = _strip_xargs_wrapper(argv)
-        if rest:
-            out.extend(_expand_wrapped_argv(rest, depth - 1))
-        return out
-    return out
-
-
-def _rm_verdict(argv: list[str], *, cwd: str | None) -> str | None:
-    prog = Path(argv[0]).name
-    if prog != "rm":
-        return None
-    flags = [a for a in argv[1:] if a.startswith("-")]
-    targets = [a for a in argv[1:] if not a.startswith("-")]
-    recursive_force = any(f in _RECURSIVE_FORCE_RM_FLAGS for f in flags) or any(
-        # combined short flags like `-fr`, `-Rf`, or a bundled `-rf` spelled
-        # with other short flags mixed in (e.g. `-vrf`): recursive AND force
-        # both present in one token.
-        f.startswith("-") and not f.startswith("--") and "r" in f.lower() and "f" in f.lower()
-        for f in flags
-    )
-    if not recursive_force:
-        return None
-    if not targets or any(not _is_temp_path(t, cwd=cwd) for t in targets):
-        return "rm -r/-rf targeting a non-temporary path is never allowed (PRD 5.7)"
-    return None
-
-
-def _git_push_force_verdict(argv: list[str]) -> str | None:
-    if Path(argv[0]).name != "git" or len(argv) < 2 or argv[1] != "push":
-        return None
-    rest = argv[2:]
+def _git_push_force_denied(tokens: list[str]) -> bool:
+    if not any(_prog(t) == "git" for t in tokens) or "push" not in tokens:
+        return False
     force = any(
-        a in ("--force", "-f", "--force-with-lease") or a.startswith("--force-with-lease=")
-        for a in rest
+        t in ("--force", "-f", "--force-with-lease") or t.startswith("--force-with-lease=")
+        for t in tokens
     )
     if not force:
-        return None
-    refs = [a for a in rest if not a.startswith("-")]
+        return False
+    push_idx = tokens.index("push")
+    refs = [t for t in tokens[push_idx + 1 :] if not t.startswith("-")]
     if len(refs) >= 2:
         target = refs[-1].split(":")[-1]
     elif len(refs) == 1 and ":" in refs[0]:
         target = refs[0].split(":")[-1]
-    elif len(refs) == 1:
-        # A single non-flag arg to `git push --force` is the remote, not a
-        # refspec (e.g. `git push --force origin`) -> pushes whatever branch
-        # is currently checked out. Ambiguous, so treated the same as "no
-        # explicit target": conservatively assumed to be the default branch.
-        target = None
     else:
+        # Zero refs, or one bare ref (the remote name, not a refspec) -> the
+        # branch actually pushed is whatever's checked out -> ambiguous ->
+        # conservatively treated as the default branch (unchanged from
+        # round 1's heuristic, only the token-stream plumbing around it).
         target = None
-    if target is None or target in _DEFAULT_BRANCHES:
-        return "git push --force to the default branch is never allowed (PRD 5.7)"
-    return None
+    return target is None or target in _DEFAULT_BRANCHES
 
 
-def classify_command(command: str, *, cwd: str | None = None) -> Verdict:
-    """Classify a terminal `command` string. `cwd` (the worker's working
-    directory, when known) resolves relative `rm` targets; without it a
-    relative target can't be proven temp and is treated conservatively (see
-    `_resolve_best_effort`)."""
-    segments = _split_shell_segments(command)
-    if segments is None:
-        return Verdict(False)  # unparseable -> not hard-denied here, see module docstring
-    for top_argv in segments:
-        if not top_argv:
+def _protected_path_tokens(
+    tokens: list[str], *, user_root: str | None, project_permissions_path: str | None
+) -> list[str]:
+    # `user_root` (`jones_gate.json`'s field of the same name, written by
+    # `paths.user_root()`) is already the resolved absolute path TO `~/.jones`
+    # itself (e.g. `/Users/alice/.jones`), not the home directory it lives
+    # under — so it's used as a needle directly, not `<user_root>/.jones`.
+    needles = ["~/.jones"]
+    if user_root:
+        needles.append(user_root)
+    if project_permissions_path:
+        needles.append(project_permissions_path)
+    return [tok for tok in tokens if any(needle in tok for needle in needles)]
+
+
+def _protected_path_denied(
+    tokens: list[str], *, user_root: str | None, project_permissions_path: str | None
+) -> bool:
+    """"任一 token 含 ~/.jones 或 <project>/.jones/permissions.json 路径且同一
+    token 流出现写/删动词 → deny" (controller ruling R2). A plain substring
+    check on the raw token text — no path resolution, matching this whole
+    module's "no filesystem understanding" premise; `user_root`/
+    `project_permissions_path` are the already-resolved absolute paths
+    `jones_gate.json` carries (see `_config.py`'s schema)."""
+    if not _protected_path_tokens(
+        tokens, user_root=user_root, project_permissions_path=project_permissions_path
+    ):
+        return False
+    return any(_prog(t) in _WRITE_DELETE_VERBS for t in tokens)
+
+
+def _shell_dash_c_payloads(tokens: list[str]) -> list[str]:
+    """Token immediately after a shell interpreter's `-c`-equivalent flag
+    (the standalone `-c`, or a combined single-dash short-option cluster
+    ENDING in `c` — `-lc`/`-ic`/`-xc`/`-ec`/…, `getopt`-style clusters are
+    unordered but `c`'s own convention is always "consumes the next argv as
+    its payload") — this is the ONE recursion this module still performs,
+    see the module docstring for why: `tokenize()` correctly keeps that
+    payload as a single (quoted) token, so its own `rm`/`-rf`/… words never
+    show up as separate entries in the outer flat stream on their own."""
+    payloads = []
+    for i, tok in enumerate(tokens):
+        if _prog(tok) not in _SHELL_INTERPRETERS or i + 1 >= len(tokens):
             continue
-        for argv in _expand_wrapped_argv(top_argv, _MAX_UNWRAP_DEPTH):
-            prog = Path(argv[0]).name
-            reason = _rm_verdict(argv, cwd=cwd)
-            if reason:
-                return Verdict(True, reason)
-            if prog in _TRASH_PROGRAMS:
-                return Verdict(
-                    True, "moving files to Trash / emptying it is never allowed (PRD 5.7)"
-                )
-            if prog == "shred":
-                return Verdict(True, "shred is never allowed (PRD 5.7)")
-            if prog.startswith("mkfs"):
-                return Verdict(True, "mkfs* is never allowed (PRD 5.7)")
-            if prog == "diskutil" and len(argv) > 1 and argv[1].lower().startswith("erase"):
-                return Verdict(True, "diskutil erase* is never allowed (PRD 5.7)")
-            if prog == "find" and any(a == "-delete" for a in argv[1:]):
-                return Verdict(
-                    True, "find -delete performs an irreversible delete and is never allowed "
-                    "(PRD 5.7)"
-                )
-            reason = _git_push_force_verdict(argv)
-            if reason:
-                return Verdict(True, reason)
+        flag = tokens[i + 1]
+        if flag.startswith("--") or not flag.startswith("-"):
+            continue
+        letters = flag[1:]
+        if letters and letters.isalpha() and letters[-1] == "c" and i + 2 < len(tokens):
+            payloads.append(tokens[i + 2])
+    return payloads
+
+
+def _scan(
+    tokens: list[str],
+    *,
+    user_root: str | None,
+    project_permissions_path: str | None,
+    depth: int,
+) -> Verdict:
+    if _rm_denied(tokens):
+        return Verdict(True, "rm -r/-rf (or --recursive) is never allowed (PRD 5.7)")
+    if _find_delete_denied(tokens):
+        return Verdict(
+            True, "find -delete performs an irreversible delete and is never allowed (PRD 5.7)"
+        )
+    if _trash_denied(tokens):
+        return Verdict(True, "moving files to Trash / emptying it is never allowed (PRD 5.7)")
+    if _shred_denied(tokens):
+        return Verdict(True, "shred is never allowed (PRD 5.7)")
+    if _mkfs_denied(tokens):
+        return Verdict(True, "mkfs* is never allowed (PRD 5.7)")
+    if _diskutil_erase_denied(tokens):
+        return Verdict(True, "diskutil erase* is never allowed (PRD 5.7)")
+    if _git_push_force_denied(tokens):
+        return Verdict(True, "git push --force to the default branch is never allowed (PRD 5.7)")
+    if _protected_path_denied(
+        tokens, user_root=user_root, project_permissions_path=project_permissions_path
+    ):
+        return Verdict(
+            True, "this command writes/deletes Jones's own data under ~/.jones/ (PRD 10.4, N10)"
+        )
+    if depth > 0:
+        for payload in _shell_dash_c_payloads(tokens):
+            inner = tokenize(payload)
+            if inner is None:
+                continue
+            verdict = _scan(
+                inner,
+                user_root=user_root,
+                project_permissions_path=project_permissions_path,
+                depth=depth - 1,
+            )
+            if verdict.denied:
+                return verdict
     return Verdict(False)
 
 
-def command_touches_protected_path(
-    command: str, *, user_root: str, project_permissions_path: str | None, cwd: str | None
-) -> bool:
-    """Broad, deliberately over-inclusive heuristic for terminal commands: any
-    token (once a leading `-`/`>`/`>>` is stripped, so `rm -rf ~/.jones` and
-    `cat >~/.jones/x` both match on the operand, not the flag) that resolves
-    under a protected path hard-denies the whole command — including a plain
-    *read* of something under `~/.jones/` (`cat ~/.jones/secrets/vault.enc`),
-    which is broader than the letter of "写删" in 02-w3-interfaces.md §1.1 but
-    is the simpler, safer rule for an opaque shell command where "is this
-    argument actually a write" isn't reliably decidable without a full
-    per-program argument grammar. An unparseable command returns `False`
-    here for the same reason `classify_command` does (see its docstring) —
-    the review gate is the honest fallback for "can't tell", not a silent
-    hard-block."""
-    segments = _split_shell_segments(command)
-    if segments is None:
-        return False
-    for top_argv in segments:
-        for argv in _expand_wrapped_argv(top_argv, _MAX_UNWRAP_DEPTH):
-            for tok in argv:
-                candidate = tok.lstrip("-")
-                for prefix in (">>", ">"):
-                    if candidate.startswith(prefix):
-                        candidate = candidate[len(prefix) :]
-                        break
-                if not candidate:
-                    continue
-                if is_protected_path(
-                    candidate, user_root=user_root,
-                    project_permissions_path=project_permissions_path,
-                ):
-                    return True
-    return False
+def classify_command(
+    command: str, *, user_root: str | None = None, project_permissions_path: str | None = None
+) -> Verdict:
+    """Classify a terminal `command` string — the single entry point that
+    replaces round 1–3's separate `classify_command`/
+    `command_touches_protected_path` pair (they now share one tokenization
+    and one flat scan, see module docstring)."""
+    tokens = tokenize(command)
+    if tokens is None:
+        return Verdict(False)  # unparseable -> not hard-denied here, see tokenize()'s docstring
+    return _scan(
+        tokens,
+        user_root=user_root,
+        project_permissions_path=project_permissions_path,
+        depth=_MAX_SHELL_C_DEPTH,
+    )
 
 
 def is_protected_path(
     raw_path: str, *, user_root: str, project_permissions_path: str | None
 ) -> bool:
-    """Whether `raw_path` (a tool's `path` argument, or a terminal command's
-    target) touches `~/.jones/` (any path under it) or the current project's
-    `.jones/permissions.json` specifically (PRD 10.4, N10). Unresolvable
-    (e.g. `..` escapes that fail to normalize) fails closed -> protected."""
-    resolved = _resolve_best_effort(raw_path, cwd=None)
-    if resolved is None:
+    """Whether `raw_path` (a `write_file`/`patch` tool call's `path` argument
+    — a plain string, no shell involved, so this function is untouched by
+    the round-4 rewrite above) touches `~/.jones/` (any path under it) or
+    the current project's `.jones/permissions.json` specifically (PRD 10.4,
+    N10). Unresolvable (e.g. a `..` escape that fails to normalize, or an
+    embedded NUL byte) fails closed -> protected."""
+    try:
+        resolved = Path(raw_path).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
         return True
     try:
         root = Path(user_root).expanduser().resolve(strict=False)
     except OSError:
         root = None
-    if root is not None and _is_relative_to(resolved, root):
-        return True
+    if root is not None:
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            pass
     if project_permissions_path:
         try:
             protected_file = Path(project_permissions_path).expanduser().resolve(strict=False)
