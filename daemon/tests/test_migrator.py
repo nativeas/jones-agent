@@ -230,6 +230,36 @@ def test_backup_refuses_to_proceed_when_wal_checkpoint_cannot_fully_flush(tmp_pa
         conn.close()
 
 
+def test_apply_pending_refuses_a_database_newer_than_this_build_knows(tmp_path):
+    # 05-w6-interfaces.md §3.3: an older build must not silently no-op through a
+    # database schema_version its own migrations set doesn't reach — it must
+    # refuse to start against it, explicitly.
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    (migrations_dir / "001_init.sql").write_text(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);\n"
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"
+    )
+    db_path = tmp_path / "jones.db"
+    conn = connect(db_path)
+    try:
+        migrator.apply_pending(conn, migrations_dir=migrations_dir)  # -> v1
+        # Simulate a newer build having since migrated this same database further.
+        conn.execute("UPDATE schema_version SET version = 99")
+        conn.commit()
+        backups_before = _backups(tmp_path)
+
+        with pytest.raises(migrator.SchemaTooNewError, match="99"):
+            migrator.apply_pending(conn, migrations_dir=migrations_dir)
+
+        # Refusal happens before touching anything: version unchanged, no
+        # (possibly-incomplete) backup left behind by the refused attempt.
+        assert migrator.current_version(conn) == 99
+        assert _backups(tmp_path) == backups_before
+    finally:
+        conn.close()
+
+
 def test_apply_pending_rolls_back_a_failed_migration_atomically(tmp_path):
     # A migration with more than one DDL statement (the real-world trigger: an
     # ALTER TABLE, which SQLite doesn't support with IF NOT EXISTS) can fail

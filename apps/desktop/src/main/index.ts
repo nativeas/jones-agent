@@ -72,6 +72,22 @@ function findDaemonProjectDir(): string | null {
   return null
 }
 
+// Packaged-mode daemon executable path (design §3.2, §6; Issue #25):
+// electron-builder's `extraResources` (scripts/release/build-mac.sh,
+// packaging/standalone) places the python-build-standalone daemon bundle under
+// `Contents/Resources/daemon/`, with a self-contained entry script at
+// `daemon/bin/jones-daemon` — the same script `service install --program`
+// (daemon/src/jones_daemon/service.py) points a LaunchAgent's
+// `ProgramArguments` at. `process.resourcesPath` is Electron's own accessor
+// for that directory in a packaged build (it resolves somewhere under
+// node_modules/electron in dev, which is why this is gated on
+// `app.isPackaged`, not just `existsSync`).
+function findPackagedDaemonExecutable(): string | null {
+  if (!app.isPackaged) return null
+  const exe = join(process.resourcesPath, 'daemon', 'bin', 'jones-daemon')
+  return existsSync(exe) ? exe : null
+}
+
 function attemptLaunchdKickstart(): Promise<void> {
   if (process.platform !== 'darwin') return Promise.resolve()
   // Async, not spawnSync: this runs on Electron's main process thread, which
@@ -101,7 +117,24 @@ function attemptLaunchdKickstart(): Promise<void> {
 }
 
 function spawnDevDaemon(): void {
-  if (app.isPackaged) return // production installs rely on launchd, not a raw spawn
+  if (app.isPackaged) {
+    // 01-w2-interfaces.md §6 (E's own contract for this exact retry step):
+    // "再失败且处于 dev 模式则直接 spawn `uv run python -m jones_daemon`
+    // （打包模式 spawn `process.resourcesPath/daemon/...`）" — production still
+    // relies on launchd as the primary supervisor (design §3), but this
+    // specific fallback (3rd-attempt-of-3 recovery, after a kickstart against
+    // a LaunchAgent that may never have been installed) is a direct spawn of
+    // the bundled executable, the same shape as the dev-mode branch below,
+    // not a `service install` call.
+    const exe = findPackagedDaemonExecutable()
+    if (!exe) return
+    const child = spawn(exe, [], { env: process.env, stdio: 'ignore', detached: true })
+    child.on('error', () => {
+      // Best-effort, same reasoning as the dev-mode branch below.
+    })
+    child.unref()
+    return
+  }
   const daemonDir = findDaemonProjectDir()
   if (!daemonDir) return
   const child = spawn('uv', ['run', 'python', '-m', 'jones_daemon'], {

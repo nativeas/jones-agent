@@ -1,0 +1,71 @@
+{
+  "date": "2026-09-19",
+  "generated_by": "daemon/tests/perf (pytest)",
+  "machine": {
+    "platform": "macOS-27.0-arm64-arm-64bit",
+    "arch": "arm64",
+    "chip": "Apple M4",
+    "memory_gb": 32.0,
+    "is_prd_reference_machine": false,
+    "prd_reference_machines": [
+      "Apple M1 / 16GB",
+      "Intel i5 12代 / 16GB"
+    ]
+  },
+  "idle_window_s": 2.0,
+  "metrics": [
+    {
+      "name": "daemon_cold_start_ms",
+      "value": 80.3850419997616,
+      "unit": "ms",
+      "threshold": 6000.0,
+      "threshold_source": "PRD 11.1 冷启动（守护进程未运行）≤ 6s",
+      "passed": true,
+      "detail": {}
+    },
+    {
+      "name": "send_to_first_delta_ms",
+      "value": 0.11495900071167853,
+      "unit": "ms",
+      "threshold": 800.0,
+      "threshold_source": "PRD 11.1 首个 Turn 首 token ≤ 模型 RTT + 800ms（此处 RTT≈0，仅测运行时开销）",
+      "passed": true,
+      "detail": {
+        "agent": "fake_acp_agent.py",
+        "worker": "pre-warmed"
+      }
+    },
+    {
+      "name": "idle_rss_mb",
+      "value": 36.40625,
+      "unit": "MB",
+      "threshold": 150.0,
+      "threshold_source": "PRD 11.2 守护进程常驻内存（空闲）≤ 150MB",
+      "passed": true,
+      "detail": {}
+    },
+    {
+      "name": "idle_cpu_delta_s",
+      "value": 0.0,
+      "unit": "s",
+      "threshold": 0.15,
+      "threshold_source": "PRD 11.2 空闲 CPU ≈ 0（无任务时不轮询）",
+      "passed": true,
+      "detail": {
+        "window_s": 2.0
+      }
+    },
+    {
+      "name": "worker_cold_start_fake_agent_ms",
+      "value": 24.72750000015367,
+      "unit": "ms",
+      "threshold": 2000.0,
+      "threshold_source": "PRD 11.1 冷启动 worker ≤ 2s",
+      "passed": true,
+      "detail": {
+        "agent": "fake_acp_agent.py"
+      }
+    }
+  ],
+  "all_passed": true
+}

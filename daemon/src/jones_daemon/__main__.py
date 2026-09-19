@@ -37,6 +37,7 @@ from jones_daemon.service import maybe_handle_cli
 from jones_daemon.sessions import methods as sessions_methods
 from jones_daemon.skills.methods import register as register_skills
 from jones_daemon.store import apply_pending, connect, run_in_db_thread
+from jones_daemon.store.migrator import SchemaTooNewError
 
 logger = get_logger("main")
 
@@ -103,7 +104,19 @@ async def _run() -> None:
             schema_version = apply_pending(db_conn)
             return db_conn, schema_version
 
-        conn, version = await run_in_db_thread(_open_store)
+        try:
+            conn, version = await run_in_db_thread(_open_store)
+        except SchemaTooNewError as exc:
+            # PRD 11.3 "升级不丢数据" / 05-w6-interfaces.md §3.3: an older build
+            # opening a database a newer build already migrated must refuse to
+            # start, explicitly — not silently downgrade or half-start against
+            # tables/columns it doesn't understand. Logged (not just raised) so
+            # this shows up in the structured daemon.err.log a launchd-managed
+            # instance leaves behind, not only in an interactive terminal's
+            # traceback.
+            logger.error("refusing to start: database schema is newer than this build",
+                          extra={"detail": {"error": str(exc)}})
+            raise
         logger.info("store ready", extra={"detail": {"schema_version": version}})
 
         # C (#8 #9): default Project/Agent bootstrap — the logic itself lives in
