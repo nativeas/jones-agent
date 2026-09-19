@@ -127,7 +127,12 @@ class DaemonProviderResolver:
         if not has_key and not VENDORS[vendor].custom_provider:
             raise ProviderNotConfiguredError(f"provider '{vendor}' has no key configured")
 
-        key = self._vault.get(vendor)
+        # Only consult the vault when the db says a key exists — for a custom_provider vendor
+        # (Ollama) with has_key=0 (never configured, or deleted via provider.delete_key), a
+        # leftover/stale vault entry must never be read back and injected into a worker's env.
+        # The out-of-sync check below stays for the other direction: has_key=1 but nothing (or
+        # an empty value) in the vault is still an error, never a silent empty-key launch.
+        key = self._vault.get(vendor) if has_key else None
         if has_key and not key:
             # The providers table and the vault disagree — never proceed on a guess.
             raise ProviderNotConfiguredError(

@@ -148,6 +148,24 @@ def test_ollama_without_a_model_raises_clearly(conn, vault):
         resolver.resolve({"provider": "ollama"})
 
 
+def test_ollama_deleted_key_is_not_reinjected_after_has_key_cleared(conn, vault):
+    # Regression: a leftover vault.enc entry must never be read back once `has_key` is 0 — the
+    # custom_provider (Ollama) branch used to skip the has_key guard entirely and call
+    # `vault.get()` unconditionally, so a deleted key kept being injected into worker env even
+    # though `provider.list` reported it gone (db/vault silently disagreeing, the exact failure
+    # mode `resolve()` is supposed to refuse to do — see the out-of-sync check above).
+    _configure(conn, vault, "ollama", "proxy-token-XYZ9")
+    conn.execute("UPDATE providers SET has_key = 0 WHERE name = 'ollama'")
+    conn.commit()
+
+    resolver = DaemonProviderResolver(conn, vault)
+    binding = resolver.resolve({"provider": "ollama", "model": "llama3"})
+
+    assert binding["env"] == {}
+    assert "key_env" not in binding["hermes_config"]["providers"]["ollama"]
+    assert "proxy-token-XYZ9" not in json.dumps(binding)
+
+
 # --- list_models --------------------------------------------------------------------------
 
 

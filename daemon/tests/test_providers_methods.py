@@ -185,3 +185,22 @@ async def test_full_key_never_appears_in_logs_or_rpc_responses(server, log_captu
     assert base64.b64encode(secret.encode()).decode() not in haystack
     # the hint (last 4 chars) legitimately appears — proves this isn't a vacuous assertion
     assert secret[-4:] in haystack
+
+
+# --- wiring: provider.*/model.list must actually be reachable in the real daemon --------------
+
+
+def test_main_actually_calls_providers_methods_register():
+    # Regression for a review finding: this module's own `register()` being unit-tested (every
+    # test above) says nothing about whether the real daemon entry point ever calls it — before
+    # this test, `__main__.py` never did, so `provider.*`/`model.list` returned METHOD_NOT_FOUND
+    # on every real `python -m jones_daemon` run despite full test coverage here. Assert the call
+    # site exists in `__main__.py`'s source, the same way this repo's own G03/N02 tests grep for
+    # what must (not) appear, so removing the wiring line fails CI instead of failing silently at
+    # runtime.
+    import inspect
+
+    from jones_daemon import __main__ as daemon_main
+
+    source = inspect.getsource(daemon_main)
+    assert "providers_methods.register(" in source

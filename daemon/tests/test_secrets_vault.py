@@ -1,5 +1,7 @@
 import base64
 import os
+import sys
+import types
 
 import pytest
 
@@ -136,3 +138,83 @@ def test_build_default_vault_lands_at_the_documented_path(tmp_path, monkeypatch)
     v = build_default_vault(paths.secrets_dir())
     v.set("anthropic", "key-a")
     assert (paths.user_root() / "secrets" / "vault.enc").exists()
+
+
+# --- data key resolution (macOS Keychain / `keyring` path — the branch the real daemon actually
+# takes; JONES_VAULT_KEY above is the test/CI gate only) -------------------------------------
+
+
+class _FakeKeyringBackend:
+    """Minimal stand-in for the `keyring` package's module-level `get_password`/`set_password`,
+    scoped to one (service, account) pair and backed by a plain dict instead of the real OS
+    keychain. Lets these tests exercise `_resolve_data_key()`'s Keychain branch deterministically
+    — the real Keychain would prompt for access interactively and isn't available in CI at all.
+    """
+
+    def __init__(self, *, fail_get: bool = False, fail_set: bool = False) -> None:
+        self.store: dict[tuple[str, str], str] = {}
+        self._fail_get = fail_get
+        self._fail_set = fail_set
+
+    def get_password(self, service: str, account: str) -> str | None:
+        if self._fail_get:
+            raise RuntimeError("keychain access denied")
+        return self.store.get((service, account))
+
+    def set_password(self, service: str, account: str, password: str) -> None:
+        if self._fail_set:
+            raise RuntimeError("keychain access denied")
+        self.store[(service, account)] = password
+
+
+def _install_fake_keyring(monkeypatch, **kwargs) -> _FakeKeyringBackend:
+    backend = _FakeKeyringBackend(**kwargs)
+    fake_module = types.ModuleType("keyring")
+    fake_module.get_password = backend.get_password  # type: ignore[attr-defined]
+    fake_module.set_password = backend.set_password  # type: ignore[attr-defined]
+    # `_resolve_data_key()` does `import keyring` locally on every call; monkeypatching
+    # sys.modules makes that import resolve to this fake regardless of whether the real
+    # `keyring` package is installed or has a usable backend configured.
+    monkeypatch.setitem(sys.modules, "keyring", fake_module)
+    monkeypatch.delenv("JONES_VAULT_KEY", raising=False)
+    return backend
+
+
+def test_keyring_generates_and_persists_a_key_on_first_access(tmp_path, monkeypatch):
+    backend = _install_fake_keyring(monkeypatch)
+    v = build_default_vault(tmp_path)
+    v.set("anthropic", "key-a")
+    assert v.get("anthropic") == "key-a"
+    stored = backend.store[("jones-agent", "vault-key")]
+    assert len(base64.b64decode(stored, validate=True)) == 32  # AES-256
+
+
+def test_keyring_reuses_the_existing_key_across_vault_instances(tmp_path, monkeypatch):
+    backend = _install_fake_keyring(monkeypatch)
+    Vault(tmp_path / "vault.enc").set("anthropic", "key-a")
+    # A second Vault instance (a fresh process, in effect) must read the same Keychain item back
+    # rather than generating a new one — a new data key could never decrypt the existing vault.enc.
+    v2 = Vault(tmp_path / "vault.enc")
+    assert v2.get("anthropic") == "key-a"
+    assert len(backend.store) == 1  # not regenerated on the second access
+
+
+def test_keyring_read_failure_raises_vault_error(tmp_path, monkeypatch):
+    _install_fake_keyring(monkeypatch, fail_get=True)
+    with pytest.raises(VaultError, match="keyring backend failed to read"):
+        build_default_vault(tmp_path).set("anthropic", "key-a")
+
+
+def test_keyring_write_failure_raises_vault_error(tmp_path, monkeypatch):
+    _install_fake_keyring(monkeypatch, fail_set=True)
+    with pytest.raises(VaultError, match="keyring backend failed to write"):
+        build_default_vault(tmp_path).set("anthropic", "key-a")
+
+
+def test_keyring_package_not_installed_raises_vault_error(tmp_path, monkeypatch):
+    monkeypatch.delenv("JONES_VAULT_KEY", raising=False)
+    # `sys.modules[name] = None` is the documented way to make `import keyring` raise
+    # ModuleNotFoundError (a subclass of ImportError) without it actually being uninstalled.
+    monkeypatch.setitem(sys.modules, "keyring", None)
+    with pytest.raises(VaultError, match="keyring"):
+        build_default_vault(tmp_path).set("anthropic", "key-a")
