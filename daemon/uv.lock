@@ -271,7 +271,7 @@ wheels = [
 [[package]]
 name = "hermes-agent"
 version = "0.21.2"
-source = { editable = "../../../../../../../../../../Users/nativeas/.hermes/hermes-agent" }
+source = { editable = "../../../.hermes/hermes-agent" }
 dependencies = [
     { name = "certifi" },
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'" },
@@ -678,7 +678,7 @@ dev = [
     { name = "ruff", specifier = ">=0.7" },
 ]
 worker = [
-    { name = "hermes-agent", extras = ["acp"], editable = "../../../../../../../../../../Users/nativeas/.hermes/hermes-agent" },
+    { name = "hermes-agent", extras = ["acp"], editable = "../../../.hermes/hermes-agent" },
     { name = "mcp", specifier = "==2.0.0" },
 ]
 

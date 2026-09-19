@@ -19,6 +19,7 @@ from typing import TextIO
 
 from jones_daemon import paths
 from jones_daemon.agents.methods import register as register_agents
+from jones_daemon.capabilities.browser import shutdown_all as shutdown_all_browsers
 from jones_daemon.capabilities.methods import register as register_capabilities
 from jones_daemon.config.methods import register as register_config
 from jones_daemon.config.resolver import DefaultConfigResolver
@@ -153,6 +154,13 @@ async def _run() -> None:
             await serve_task
         await server.stop()
         await session_service.shutdown()
+        # J/#15 (review findings #2/#9): gracefully close the Jones-dedicated
+        # Chrome, if one was ever started, before the daemon exits — SIGTERM
+        # before SIGKILL is load-bearing for login-state persistence
+        # (00-foundation.md §9.1 证据 3), and `shutdown_all()` had no caller at
+        # all until this line. Off the event loop thread since it blocks on
+        # process I/O (up to `DEFAULT_SHUTDOWN_TIMEOUT_S`).
+        await asyncio.to_thread(shutdown_all_browsers)
         # close() is also a synchronous sqlite3 call bound to the connection's
         # home thread (check_same_thread=True) — it must run there too.
         await run_in_db_thread(conn.close)

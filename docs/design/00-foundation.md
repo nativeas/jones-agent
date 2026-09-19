@@ -265,170 +265,306 @@ PRD 9.4 审批超时自动拒绝时如实记录，不借用 `rule`（规则闸�
   "会话是否处于宽松审批模式"应该是 Jones 自己 `sessions` 表的 `mode`/`settings_json`，不要跟 Hermes
   这个字段混用，避免未来 Hermes 给 ACP 补上 `/yolo` 等价物时，两套状态互相踩踏。
 
-## 9. FR09 浏览器能力：daemon 内部契约（spike #4 结论落地，第二轮已重写）
+## 9. FR09 浏览器能力：daemon 内部契约（W4/#15-16 第四轮修订：R-J1/R-J2 控制者裁定收口）
 
-评审要求（jones-agent#4 修复记录）：这份接口草案原来写在 `docs/spikes/04-browser-login-state.md`
-里——按第 1 节的目录所有权表，`docs/spikes/` 只承载「技术验证报告」，不是契约的家；
-现移到这里，spike 报告改为只引用本节。修 PR 见该 spike 报告末尾的「修复记录」。
+**本节第四轮修订提醒（2026-09-19，第二轮评审后的控制者裁定 R-J1/R-J2，不可推翻）**：
+第三轮文本（α 取代 β）本身不变，但 §9.2 的 `allow_private_urls: true` 强制项和
+§9.3 的 `browser_navigate` 分级描述都需要订正——第二轮评审 finding #6/#8/#9
+发现：(1) 这个开关同时关掉了 Hermes 对**跳转后**目标的 SSRF 复查，一次公网 URL
+→ 302 跳转到内网页面即可绕过；(2) 这个开关的作用域不止浏览器，`web_extract`/
+`vision`/`skills_hub` 的 SSRF 防护也被一并关掉。控制者裁定 R-J1：**本分支绝不
+再设置这个开关**。§9.2/§9.3 下面已按这个裁定改写；`browser_worker_config` 的
+`config_yaml` 现在是空字典，`permissions/review.py::_classify_browser_navigate`
+的用户闸升级从「唯一剩下的闸」降级为「防御性冗余层」（Hermes 自己的
+`_url_policy_error` 现在才是主闸，见 §9.2 新增段落）。
 
-> **第二轮修订**：本节第一版否决「复用现成浏览器 MCP Server」的核心论证——
-> 「权限闸没有天然介入点，除非再插一层代理」——是**事实错误**：daemon 本身
-> 就是这个 MCP Server 的 **客户端**，`tools/call` 请求是 daemon 自己代码
-> 发出去的，权限闸只要长在 daemon 发起这次调用之前，天然就卡在了「工具调用
-> 前」，不需要在 daemon 和 MCP Server 之间再插任何代理。控制者据此按工程
-> 原则 1（能复用就复用，不重写已有能力）裁定：FR09 改为**复用现成浏览器
-> MCP Server + Jones 专属常驻 Chrome profile**，Jones 不再自研 `browser.*`
-> 工具集。下面是重新调研 + 实测后的新契约；旧的五个自研工具定义与旧论证
-> 整段删除，不保留占位。
+**本节第三轮修订**：上一版（W3 之前）裁定「复用现成浏览器 MCP Server（Playwright
+MCP）+ Jones 专属常驻 Chrome profile」（β）。`03-w4-interfaces.md` §4 把这份裁定重新
+开放为二选一并要求实测：α「用 **Hermes 原生 `browser_*` 工具集**，配置其 backend 走
+CDP，attach 到 **Jones 拉起的专属 Chrome**」，或维持 β。**本轮裁定：α 胜出，β 整段
+弃用**——理由与实测证据见下；PRD FR09 现有措辞「复用现成浏览器 MCP Server 承载具体
+工具，Jones 不自研 browser.\* 工具集」因此过期，需要控制者同意后由 PRD 的所有者更新
+（本分支不越权改 `docs/PRD.md`，写在这里留痕，见报告「契约变更」）。下面的 §9.1-§9.5
+整段替换旧文；旧的 Playwright MCP 契约、进程模型、分级表全部删除，不保留占位——按
+`03-w4-interfaces.md` §4「不允许两套同时开」，H（#17）的 MCP 接入不得注册任何
+Playwright/浏览器类 MCP Server，Hermes worker 的 `browser` toolset 也不得被禁用
+（它就是本节说的工具，禁用它等于关掉浏览器能力）。
 
-### 9.1 选型：为什么是 Playwright MCP，不是 chrome-devtools-mcp
+### 9.1 为什么是 α：三条独立证据，不是单一论证
 
-两个候选都支持「以指定 `--user-data-dir` 启动/接管 Chrome」，都已用一段
-独立探针脚本（`daemon/spikes/browser_probe.py` 之外，探针代码见本节末尾
-「验证方法」）实测过：冷启动 → 通过 `tools/call` 导航到一个本机测试站的
-`/login`（签发 persistent cookie）→ 读页确认登录成功 → **完整杀掉 MCP
-server 子进程（模拟 daemon 重启，不是只断开连接）** → 重新起一个新的
-MCP server 进程，同一个 profile 目录 → 直接访问受保护页，看登录态是否还在。
+**证据 1——真的少一层（第一性原理）**：源码核对
+（`ee4452991d17534aa561f31ee55596d082aa94e7`）确认 Hermes 自己的
+`toolsets.py::_HERMES_CORE_TOOLS` 已经内置一组浏览器工具（`browser_navigate` /
+`browser_snapshot` / `browser_click` / `browser_type` / `browser_scroll` /
+`browser_back` / `browser_press` / `browser_get_images` / `browser_vision` /
+`browser_console`，schema 见 `tools/browser_tool.py:437` 的 `BROWSER_TOOL_SCHEMAS`；
+外加 `browser_cdp`——原始 CDP 透传逃生舱，`tools/browser_cdp_tool.py`——和
+`browser_dialog`/`browser_vault_*`），跟 `read_file`/`terminal` 等其它核心工具**地位
+完全相同**，随 worker 启动即注册，不需要任何 MCP 接入、不需要 H 的 `mcp_servers`
+config.yaml 写入、不需要额外进程。`tools/browser_tool_cdp.py::_get_cdp_override_raw()`
+读 `BROWSER_CDP_URL` 环境变量（优先）或 `browser.cdp_url` config 项，
+`tools/browser_tool_session.py::_create_session_for_key()` 的优先级是
+「CDP override > hybrid 本地 sidecar > cloud > local」——即 daemon 只需要在 worker 进程
+的 env 里放一个 `BROWSER_CDP_URL`，Hermes 自己的浏览器工具就会 attach 到那个地址，不
+会再走它自己默认的「local Chromium」路径（`_create_local_session`）。这就是 α 比 β
+「更省一层」的字面意思：β 需要 daemon 额外管理一个 `npx @playwright/mcp` 子进程、把它
+接成 MCP Server、再让 Hermes 通过 MCP 客户端调用；α 只需要 daemon 管理 Chrome 本身，
+Hermes 已经知道怎么跟它说话。
 
-| 维度 | Playwright MCP（`@playwright/mcp@0.0.81`） | chrome-devtools-mcp（`chrome-devtools-mcp@1.9.0`） |
-|---|---|---|
-| 跨重启保持登录 | **实测通过**——但有前提，见下 | **实测不稳定**，见下 |
-| 工具粒度 | 26 个工具，语义化到位（`browser_navigate`/`browser_click`/`browser_fill_form`/`browser_snapshot` 直接给可读的 a11y 树），单页场景不需要显式传 pageId | 29 个工具，更偏底层 DevTools 能力（`performance_start_trace`、`lighthouse_audit`、`take_heapsnapshot`），几乎每个工具都要求传 `pageId`（先 `list_pages` 拿 id），对 FR09「导航/读页/点击/填表」这个子集来说是多余的心智负担 |
-| 登录态持久化机制 | 暴露 `browser_close` 工具，调用后立即 checkpoint 当前 context（实测：调用后 cookie 立刻落盘；不调用、直接杀进程，cookie 不落盘） | **没有**等价的「主动 flush 并进入可安全终止状态」工具——`close_page` 明确拒绝关闭最后一个页面（"The last open page cannot be closed"），实测对已有页面 `navigate` 到 `about:blank` 再杀进程、或开新页面后 `close_page` 关掉登录页，cookie 均**未**落盘；cookie 最终能落盘依赖 Chromium 内部的周期性 flush（实测约 30s 后才会自发落盘，不受 MCP 工具调用控制） |
-| 维护活跃度 | Microsoft 官方（Playwright 团队）维护；首发 2025-03，最近一次发布 2026-09-14（4 天前），434 个已发布版本，发布节奏密集 | Google 官方（Chrome DevTools 团队）维护；首发 2025-05，最近一次发布 2026-09-08（10 天前），61 个已发布版本；同样活跃，起步比 Playwright MCP 晚约两个月 |
-| 依赖体积（实测安装后 `node_modules`） | ~18MB（`@playwright/mcp` 108KB + `playwright` 4.9MB + `playwright-core` 13MB，三个包） | ~14MB（单一包，自带打包依赖） |
+**证据 2——闸的接入点更简单、更统一**：β 的旧文本依赖一个特殊论证（daemon 是 MCP
+Server 的 `tools/call` 发起方，闸长在这次调用之前）。α 不需要这个论证：
+`browser_navigate` 等工具是 `_HERMES_CORE_TOOLS` 的普通成员，走的是跟 `read_file`/
+`terminal` 完全相同的 `pre_tool_call` 插件拦截点（00-foundation.md §7/§8 已经确立、F/#11
+已经落地的三道闸机制）——**本轮用真实代码验证过这一点**，见下「实测」。这意味着 H
+（#17）的能力注册表、F（#11）的规则闸/审查闸、G（#12）的 Step 记录，对浏览器工具完全
+不需要特殊分支；唯一需要的分支是 §9.3 的风险分级表（工具名 → 三道闸），这跟 `terminal`
+工具按参数分级是同一种机制，不是新机制。
 
-**结论**：`browser_close` 这个「主动落盘再关闭」的原语，是 Playwright MCP
-相对 chrome-devtools-mcp 唯一但**决定性**的优势——FR09 的 daemon 生命周期
-是「懒加载启动、空闲后可能随时关闭」（见下 9.2），如果关闭时机恰好落在
-Chromium 那个不受控的 ~30s 内部 flush 窗口之前，chrome-devtools-mcp 方案
-会**真实丢失刚建立的登录态**，这不是理论风险，是本轮用同一套本地测试站
-+ 同样的「杀进程模拟重启」手法实测复现的（见「验证方法」的输出）。工具
-粒度、维护活跃度、依赖体积三项两者大体相当，不构成决定性差异。**v1 选
-Playwright MCP**；chrome-devtools-mcp 的 DevTools 级能力（performance
-trace、lighthouse、heap snapshot）留作以后如果需要更深的页面诊断能力时
-的候选，不是这次 FR09 的取舍点。
+**证据 3——登录态持久化更稳健，但有一个必须诚实写下的前提**：Jones 自己启动、自己
+持有的 Chrome 进程，登录态落在这个 profile 目录的 Cookie SQLite 存储上，不依赖进程
+连续性——**但这个磁盘写入不是 `Set-Cookie` 的同步效果**。本轮实测（见「验证方法」）：
+对同一个 profile 反复「设置 persistent cookie → 立即 `SIGKILL`（无优雅关闭）→ 用同一
+profile 重新拉起 Chrome → 访问受保护页」，8 次独立重复里只有 1 次登录态存活——
+Chromium 的 `SQLitePersistentCookieStore` 会攒批写入，`Set-Cookie` 落盘有一个不可忽略
+的窗口，这一点上 α 和 β 面对的是**同一个** Chromium 行为，不是 α 独有的弱点（β 旧文本
+记录的「~30s 自发落盘」窗口就是同一机制的另一次观测）。真正让登录态可靠的是**优雅关闭
+——发 `SIGTERM` 让 Chrome 走自己的正常退出流程，5 次重复全部存活**；`capabilities/
+browser.py::BrowserManager.shutdown()` 因此总是先 `SIGTERM` 再等待，只有超时才回退
+`SIGKILL`（详细数字见报告「判据实测」）。这比 β 依赖「daemon 记得在 kill 前调用一次
+`browser_close` 工具」更简单：α 的优雅关闭是 daemon 自己代码里的一步，不依赖 worker/
+Hermes 配合，也不占用任何工具调用的闸时延。
 
 ### 9.2 契约
 
 ```
-BrowserMcpSession（daemon 内部状态，非 SQLite 表，进程重启即丢——与 Step/Run
-                    的持久化记录不冲突，回放读的是 Step 里记录的动作参数/
-                    结果摘要，不依赖这个活对象）：
-  - profile_dir: <user_root()>/browser/profile   # Jones 专属，非用户 Default profile，路径不变
-  - proc: daemon 用 stdio 子进程方式直接拉起的 MCP server 进程：
-      npx -y @playwright/mcp@<锁定版本> --browser chrome
-          --user-data-dir <profile_dir>
-    **第三轮修复**：`--headless` 在 Playwright MCP 里是一个不接值的布尔开关
-    （出现即代表启用 headless，不出现就是有头——旧版本这里写的
-    `--headless=false` 是把值传给一个不吃值的 flag，Commander 直接报
-    `error: unknown option '--headless=false'` 并以退出码 1 秒退，daemon 会
-    拿到一个刚起来就挂掉的子进程）。有头是 Playwright MCP 的默认行为，daemon
-    生产配置要有头，因此**正确做法是完全不传 `--headless`**，不是传某个
-    「等于 false」的值。实际跑通的完整命令行（`@playwright/mcp@0.0.81`，本机
-    macOS + 系统 Chrome，2026-09-19 实测：进程正常常驻、`initialize`/
-    `browser_navigate`/`browser_close` 全部成功返回，退出码 0）：
-      npx -y @playwright/mcp@0.0.81 --browser chrome --user-data-dir <profile_dir>
-    浏览器可执行文件由 Playwright 按 --browser chrome 这个 channel 名自动发现
-    系统已安装的 Chrome，不需要 daemon 自己维护一份「自动发现 Chrome/Edge
-    路径」的逻辑（旧版本自己发现二进制路径的代码不再需要）。
-  - 有头：用户需要在这个 Jones 专属窗口里手动登录，必须可见；本节的探针脚本
-    （`daemon/spikes/mcp_reuse_probe/test_persist.py`）为了自动化跑得快显式加了
-    `--headless`，daemon 的生产配置必须**不加**这个 flag（保持默认有头），不要
-    照抄探针脚本。
-  - 生命周期：daemon 直接持有并管理这个 MCP server 子进程（stdio pipe，和 FR13
-    里任何一个 stdio MCP Server 的接入方式完全一致），第一次浏览器工具调用时
-    懒加载启动；daemon 决定关闭它（空闲超时或 daemon 自己退出）前，必须先调用
-    一次 `browser_close` 工具（等价于优雅关闭当前 page/context，触发 cookie
-    落盘），再终止子进程——直接 SIGTERM/kill 子进程会有丢失刚登录状态的风险
-    （9.1 表格里的实测结论）。这个「先 close 再 kill」的顺序是本节新增的、
-    不能省略的实现约束。
-  - MCP server 进程的生命周期完全由 daemon 的子进程收拢机制管理（懒加载、
-    优雅关闭、崩溃重启都是 daemon 对自己拉起的这一个 stdio 子进程做的事），
-    不存在「进程管理分裂成两套」的问题——这正是第一版论证搞错的地方。
+BrowserManager（daemon 内部状态，capabilities/browser.py，非 SQLite 表，
+                与 Step/Run 的持久化记录不冲突——回放读的是 Step 里记录的
+                动作参数/结果摘要，不依赖这个活对象）：
+  - profile_dir: <user_root()>/browser/profile   # Jones 专属，非用户 Default profile
+  - proc: daemon 用 subprocess.Popen 直接拉起的 **真实 Chrome/Chromium 进程**（不是
+      Node/npm 包装层）：
+        <chrome_binary> --user-data-dir=<profile_dir> --remote-debugging-port=0
+            --no-first-run --no-default-browser-check
+      生产配置**不加 --headless**（用户需要在这个 Jones 专属窗口里手动登录，必须
+      可见）；测试用 headless=True，见 `BrowserManager.__init__` 的 `headless` 参数,
+      生产代码路径绝不翻这个默认值。
+  - 端口发现：`--remote-debugging-port=0` 让 Chrome 自己选随机端口，写
+      `<profile_dir>/DevToolsActivePort`（`<port>\n<ws_path>\n`）；
+      `ensure_started()` 轮询这个文件（默认 10s 超时，`DEFAULT_LAUNCH_TIMEOUT_S`），
+      找不到就是 `BrowserLaunchError`（诚实失败，不静默）。
+  - 生命周期与崩溃/重启模型（`ensure_started()` 每次都做，不需要 daemon 自己记
+      「上次是怎么关的」）：
+      1. 先看 `<profile_dir>/DevToolsActivePort` 是否存在且端口真的对 CDP 应答
+         （`GET /json/version`）——是则**复用这个活进程**（覆盖「daemon 被杀但
+         Chrome 作为孤儿存活」这种情况：Unix 不会因为父进程死了就杀子进程）。这一步
+         同时避开了 `docs/spikes/04-browser-login-state.md` 记录的单实例锁问题——
+         永远不会对着一个已经被某个活 Chrome 占用的 profile 再拉起第二个进程。
+      2. 端口不在/不应答 → 删除陈旧的 `DevToolsActivePort`、用同一个 `profile_dir`
+         冷启动一个全新 Chrome（覆盖「Chrome 跟 daemon 一起被杀」的情况——登录态
+         取决于 §9.1 证据 3 的优雅关闭前提，不取决于进程是否存活）。
+  - 关闭：`shutdown()` 发 `SIGTERM`、轮询等待退出（默认 5s，`DEFAULT_SHUTDOWN_TIMEOUT_S`），
+      超时才 `SIGKILL`。daemon 正常退出、空闲超时都走这条路径，绝不直接
+      `SIGKILL` 一个还在运行的 Chrome（§9.1 证据 3 的实测结论）。
+  - 单例：`get_browser_manager(user_root)` 按 `<user_root>/browser/profile` 缓存
+      `BrowserManager` 实例——整个 Jones 安装只有一个 Chrome，所有 Session 共享同一个
+      登录态（这是 FR09「登录一次、持续复用」的字面要求，不是 per-session 隔离）。
 
-工具（不再是 Jones 自研，是 Playwright MCP 的原生工具，经 daemon 的权限闸后
-透传给 kernel/worker；工具名与 schema 由 Playwright MCP 定义，daemon 不重新
-包一层同名的 browser.* 壳）：
-  browser_navigate                    # 导航
-  browser_snapshot / browser_evaluate  # 读页（accessibility 树 / JS 求值只读表达式）
-  browser_click / browser_fill_form / browser_type / browser_press_key
-  browser_drag / browser_file_upload / browser_select_option / browser_hover
-  browser_tabs / browser_wait_for / browser_take_screenshot / browser_close
-  （完整列表以接入时锁定的 Playwright MCP 版本的 tools/list 实际返回为准）
+worker 侧接线（`capabilities/browser.py::browser_worker_config(ctx, session) -> dict`，
+`async def`——见下方「为什么是 async」，03-w4-interfaces.md §1 授权 H 的
+`_prepare_hermes_home` 调用这个函数）：
+  - 惰性启动 Jones Chrome（`ensure_started()`，经 `asyncio.to_thread` 跑在 daemon
+      event loop 之外），返回 `{"env": {"BROWSER_CDP_URL": "<http://127.0.0.1:port>"},
+      "config_yaml": {}}`。
+  - **控制者裁定 R-J1（第二轮评审 finding #6/#8/#9 后，2026-09-19，不可推翻）：
+      `config_yaml` 绝不再写 `browser.allow_private_urls: true`。** 第三轮文本
+      曾要求这个开关，理由是 `tools/browser_tool_cloud.py::_is_local_backend()`
+      的 SSRF 防护把「CDP override」一律当成「可能在别的主机上」（文档字符串原话：
+      "A CDP override is never trusted as local"），默认拒绝 `browser_navigate`
+      打到 `127.0.0.1`/私网地址——这个技术判断没变，但第二轮评审核实到这个开关的
+      真实作用域比文本暗示的大得多，且有一个第三轮文本没写的绕过口子：
+      1. **跳转绕过（finding #8，critical）**：`tools/browser_tool.py::
+         _post_redirect_block` 的私网复查同样看这个开关——开着它，一次公网
+         `browser_navigate('http://attacker.example/x')` 跳转到
+         `http://127.0.0.1:<daemon 自己的端口>/` 或内网管理页，跳转后的内容照样
+         回到模型上下文，`_classify_browser_navigate` 只看模型传入的原始 URL，
+         对这条跳转链路完全无感。
+      2. **作用域外溢（finding #9）**：`tools/url_safety.py::
+         _resolve_allow_private_urls` 把 `browser.allow_private_urls` 当作
+         legacy 别名读取（`HERMES_ALLOW_PRIVATE_URLS` → `security.
+         allow_private_urls` → 这个键），进而影响 `tools/web_tools.py`
+         （`web_extract`）、`tools/vision_tools.py`（图片下载）、
+         `tools/skills_hub.py`、`tools/image_source.py`、
+         `tools/kanban_tools.py` 的 SSRF 检查——不是「浏览器专属」开关。
+      源码核对（`tools/browser_tool_cloud.py::_is_local_backend`/`tools/
+      browser_tool.py::_url_policy_error`/`_post_redirect_block`）确认：这个
+      hermes-agent 版本里，「CDP attach 本身」（daemon 塞进 worker env 的
+      `BROWSER_CDP_URL`，`_get_cdp_override_raw()` 读取）和「导航目标 SSRF/
+      scheme 检查」共用同一个开关，没有更窄的、只放行 attach 控制通道的变体
+      ——attach 这条控制通道本身完全不需要这个开关（它走 env var，跟
+      `allow_private_urls` 无关），需要它的只是「导航到私网/`file://`目标」这
+      一件事，而这正是评审要收紧的那一件事。**后果（诚实写下，不是回避）**：
+      不设置这个开关意味着 `browser_navigate` 到 `file://`/`localhost`/私网地址
+      现在被 Hermes 自己的 `_url_policy_error` 直接拒绝（返回错误，不是「转交
+      用户闸后可以被批准放行」）——比「转用户闸」更严格，直到 hermes-agent 上游
+      给这个开关拆出一个只作用于 CDP attach 的窄变体，或 Jones 自己给这份依赖
+      打一个范围更窄的本地 patch（都不在本分支范围内：`hermes-agent` 不是这个
+      仓库拥有的目录）。`permissions/review.py::_classify_browser_navigate` 对
+      这些 URL 仍然分级 `high`（§9.3 新增条款）——现在是防御性冗余层（等那天真
+      的拆出窄变体了，用户闸的可见批准仍然生效），不再是唯一的闸。
+  - **为什么是 `async`（控制者裁定 R-J4）**：第二轮评审 finding #12 指出
+      `ensure_started()` 是阻塞调用（`subprocess.Popen` + HTTP 轮询，~0.76s 常见、
+      10s 最坏），调用方必须自己记得包一层 `asyncio.to_thread` 才不卡住 daemon
+      event loop——`browser_worker_config` 现在直接是 `async def`，内部自己做
+      `asyncio.to_thread(manager.ensure_started)`，调用方不需要（也不应该）自己
+      再包一层。
+  - **并发串行化（第三轮评审 finding #12，round-2 只做完了上一条，没做这一条）**：
+      `asyncio.to_thread` 派发到真实线程池，不是协作式调度——两个 Session 并发
+      走 `browser_worker_config` 时，会有两个真实 OS 线程同时进入
+      `get_browser_manager`/`ensure_started()`。round-2 的版本在这里留了一句
+      过期的文档「daemon 单事件循环天然串行，RPC handler 不会在不同 OS 线程上并发
+      跑同一个 manager」——这句话被同一次改动（把这个函数改成 `async` + `to_thread`）
+      自己证伪了，却一直留到 round-3 评审指出才删掉。`capabilities/browser.py`
+      现在用 `_MANAGERS_LOCK`（保护 `get_browser_manager` 的建表 check-then-set）
+      + `BrowserManager._lock`（保护 `ensure_started()` 整个方法体，含 `_launch()`）
+      两把锁把这条并发路径重新变回串行：两个线程谁先拿到锁谁先跑完
+      `ensure_started()`，另一个要么复用它刚启动的活 Chrome，要么（Chrome 还没起来时）
+      排队等它，不会再出现「各自造一个 manager」「后一个 `_launch()` 删掉前一个的
+      `DevToolsActivePort`」「两个真 Chrome 撞同一个 `--user-data-dir` 单实例锁」
+      这三种竞态（见 `capabilities/browser.py` 两处锁的 docstring）。
+  - **懒启动的触发时机（控制者裁定 R-J4）**：不允许在 worker spawn 时无条件调用
+      这个函数（会给每个 Session 弹一个可见 Chrome 窗口，不管这个 Session 的
+      Agent 有没有启用任何 `browser_*` 工具）。推荐的触发点：`sessions/
+      service.py::_on_request_permission` 已经是「daemon 看到这个 Session 第一次
+      真的要调 `browser_*` 工具」这件事天然发生的地方（规则闸/审查闸都要经过它才
+      能决定放行），H（#17）落地实际接线时应该挂在这里，而不是 worker 启动路径；
+      没有 Chrome 的机器上，`BrowserLaunchError` 必须映射成只针对浏览器工具集的
+      `hidden_reason=browser_unavailable` + 错误卡片，不能让整个 worker/Session
+      失败（本条是 `capabilities/browser.py` 对调用方的契约承诺，实际接线仍然是
+      H 的工作，见 03-w4-interfaces.md §1；本分支没有落地这条接线，见报告
+      「没做什么」）。
+  - `session` 参数目前不参与决策（收到但不使用）——FR09 是「一个 Jones 安装一个
+    Chrome」，不是 per-session 隔离；如果未来产品要求「每个 Session 独立浏览器身份」，
+    需要重新设计这个签名，不能在今天的实现里悄悄按 session 分支。
 
-约束：
-  - 权限闸的拦截点：daemon 是这个 MCP server 的 tools/call 发起方（不是把
-    MCP server 直接暴露给 worker），闸的代码就长在 daemon 组装/发出这次
-    tools/call 请求之前——这是「进程边界」意义上天然存在的介入点，不需要
-    额外代理层，第一版认为「没有天然介入点」是错的。
-  - 权限分级（**第三轮重写**，按控制者裁定）：上一版把 `browser_evaluate`
-    （任意 JS 求值）塞进「规则闸默认放行」档，前提是「仅当求值表达式本身
-    不含有副作用调用时」——这自相矛盾：规则闸是按 PRD FR05 定义的机械
-    工具名/规则匹配层，没有能力判断一段任意 JS 字符串有没有副作用，把这个
-    语义判断压给规则闸等于让它做它做不到的事。按 PRD FR05 的三道闸
-    （规则闸 → 审查闸 → 用户闸）重新分级，用「能不能靠工具名机械判定」
-    区分规则闸与审查闸，用「需要审查闸对参数/页面上下文做语义判断」区分
-    审查闸与用户闸：
-    - **规则闸放行**（只读、按工具名机械匹配即可判定，不经过审查闸）：
-      `browser_navigate`（导航）、`browser_snapshot`（读页 a11y 树）、
-      `browser_take_screenshot`（截图）、`browser_wait_for`（只是等待某个
-      条件出现，不产生任何页面/文件副作用）。
-    - **审查闸**（有副作用或工具名本身不足以判断风险，需要模型看这次调用
-      的参数与页面上下文；这正是审查闸存在的目的——语义判断，不是硬塞进
-      规则闸）：`browser_click`、`browser_fill_form`、`browser_type`、
-      `browser_press_key`、`browser_drag`、`browser_select_option`、
-      `browser_hover`、`browser_file_upload`、`browser_evaluate`、
-      `browser_tabs`（新建/切换/关闭标签页）。下载没有独立工具，是某次
-      `browser_navigate`/`browser_click` 的副作用，按触发它的那次调用定级，
-      不低于审查闸。`browser_close` 由 daemon 生命周期管理自己在关闭子进程
-      前调用（见上），不经过这里的分级；若被 agent 当普通工具主动调用，按
-      审查闸处理。
-    - **用户闸**（审查闸判断满足以下任一条件即标红升级；这个信号只能来自
-      模型对参数/页面上下文的语义判断，不是单独的工具名规则，因为
-      Playwright MCP 没有语义化的「表单提交」工具）：① 表单提交（这次
-      点击/按键实质是提交表单，即将触发导航或向服务器发起写请求）；
-      ② 任何触发外发的动作（把本地内容/文件发送到外部，如上传、发布）；
-      ③ `browser_evaluate` 求值的表达式里含网络请求（`fetch`/
-      `XMLHttpRequest` 等）或存储写入（`localStorage`/`sessionStorage`/
-      `indexedDB`/写 cookie 等）。
-    - **兜底档（控制者裁定，第三轮复审补）**：上面三档没有点名的任何工具
-      ——包括但不限于 `browser_run_code_unsafe`、`browser_network_request`、
-      以及未来新版本 Playwright MCP 新增的工具——**一律用户闸**（fail-closed）。
-      规则闸的默认映射表在 daemon 启动时与 `tools/list` 实际返回比对，出现
-      未映射工具名即记 warning 日志并按用户闸处理，不允许「未知即放行」。
-    - **下载**：v1 不支持浏览器下载。导航或点击若触发下载，daemon 侧对该
-      次调用按用户闸处理（能否在 MCP 启动参数层面直接禁用下载，由 FR09
-      实现 Issue 核实锁定版本的参数后决定），而不是让 `browser_navigate`
-      的规则闸放行与「下载不低于审查闸」互相打架。
-    - 分级由 Jones 规则闸按 MCP 工具名做默认映射（上面前两档是固定映射，
-      第三档由审查闸在放行到它手上的调用里逐次判断触发，不是独立的工具名
-      规则）；用户可以在 `permissions.json` 里针对具体工具名进一步收紧
-      （例如强制把某个工具整体钉死在用户闸，不管审查闸怎么判断），但不能
-      放宽——与 PRD 规则闸「只能收紧」的既有原则一致（对齐 G14）。
-    - PRD 12.3 FR09 验收口径同 PR 更新为这三档。
-  - Step 记录 args_json 时对 `browser_fill_form`/`browser_type` 的输入内容做
-    脱敏（若字段名/上下文疑似密码则不落明文），对齐 N02，这条约束不变。
-  - 不做「自动发现并接管用户当前浏览器窗口」的路径（spike #4 实测：单实例锁会把
-    补开调试端口的第二次启动直接转发并秒退，flag 被忽略，100% 复现，不存在不重启
-    偷偷挂调试口这条路——这条实测结论不受本轮 MCP 选型变化影响，继续成立）；
-    浏览器能力首次使用时，若 Jones 专属 profile 里未登录目标网站，工具应
-    返回明确错误/提示（而不是静默失败），提示用户到 Jones 浏览器窗口里手动
-    登录一次——对齐诚实失败原则。
-
-### 验证方法（本轮新增实测，可复现）
-
-不复用 `daemon/spikes/browser_probe.py`（那是 CDP/profile-copy 路径的探针，
-协议不同）；新增 `daemon/spikes/mcp_reuse_probe/`，纯 stdlib 的独立 MCP stdio
-JSON-RPC 客户端脚本，跑法：
-
-```bash
-python3 daemon/spikes/mcp_reuse_probe/test_persist.py playwright /tmp/jones_pw_profile
-python3 daemon/spikes/mcp_reuse_probe/test_persist.py devtools   /tmp/jones_dt_profile
+工具（不再是外部 MCP Server 的工具，是 Hermes 自己 `_HERMES_CORE_TOOLS` 里的
+`browser_*`；工具名与 schema 由接入时锁定的 hermes-agent 版本
+`ee4452991d17534aa561f31ee55596d082aa94e7` 的 `tools/browser_tool.py` 定义，daemon 不
+重新包一层同名壳）：
+  browser_navigate / browser_snapshot / browser_click / browser_type /
+  browser_scroll / browser_back / browser_press / browser_get_images /
+  browser_vision / browser_console
+  逃生舱与扩展面（风险显著更高，见 §9.3）：
+  browser_cdp（原始 CDP 透传）/ browser_dialog / browser_vault_list /
+  browser_vault_unlock / browser_vault_fill / browser_vault_save_login /
+  browser_vault_enter_code
 ```
 
-需要 `node`/`npx`（联网拉取 `@playwright/mcp`/`chrome-devtools-mcp`，首次运行
-会有 npm 下载耗时）。脚本自带一个只监听 127.0.0.1、随机端口的本地登录态测试站
-（不发外部请求，不涉及真实账号），两个候选各跑一次「登录 → 完整杀进程 → 重启 →
-免登录读受保护页」，Playwright MCP 一支额外验证了「调 `browser_close` 后落盘、
-不调则不落盘」这个关键差异点。详见 `daemon/spikes/mcp_reuse_probe/README.md`。
+**已知功能缺口（诚实写下，不是 α 的隐藏代价）**：Hermes 原生工具集里**没有**
+Playwright MCP 曾提供的 `browser_fill_form`（原子化表单填写）、`browser_select_option`
+（下拉选择）、`browser_drag`（拖拽）、`browser_file_upload`（文件上传）、
+`browser_hover`、`browser_tabs`（多标签页管理）、`browser_take_screenshot`（有
+`browser_get_images`，语义不完全等价）、`browser_wait_for`。多数场景可以用
+`browser_snapshot` 拿到 accessibility 树的 ref，再逐元素 `browser_click`/`browser_type`
+组合出「填表」的效果（PRD FR09「填表」验收用这种组合覆盖，见报告验收对照）；但**没有
+原生的文件上传工具**——`browser_vault_*`（密码库自动填充）不能替代这个缺口。这是一个
+真实的功能缩水，留给 #15 之后的迭代：要么等 Hermes 上游补齐，要么在 Jones 侧对
+`browser_cdp` 逃生舱包一层「文件上传」的语义化审查（不是重写整个工具集，只补这一个
+缺口）——本分支不做这一步（不在 §1 授权范围内新增工具语义，只做浏览器进程管理），
+写进报告「没做什么」。
+
+### 9.3 权限分级（按 Hermes 真实工具名重写；第四轮修订同步 `permissions/
+review.py::classify()` 的真实实现——控制者裁定 R-J2：这份表和那份代码必须
+互相校验，见 `daemon/tests/test_gates_review.py::
+test_section_9_3_table_matches_the_real_classifier`，改一边不改另一边这条测试
+会红）
+
+分级原则不变（PRD FR05 三道闸：机械工具名判定 → 规则闸；需要语义判断 → 审查闸；
+高风险信号 → 用户闸）：
+
+- **规则闸放行**（只读、按工具名机械匹配即可判定）：`browser_snapshot`、
+  `browser_get_images`、`browser_vision`（只读页面理解，不产生副作用）、
+  `browser_console`（`expression=None`/`clear=False` 时是只读读取；带
+  `expression` 求值时降级到审查闸——工具函数签名本身允许两种用法，机械判定按「是否传
+  了 `expression`」区分，不需要语义判断）、**`browser_navigate` 仅在目标 URL 通过
+  下面④的机械安全检查时**（scheme ∈ `{http, https}` 且 host 不是字面
+  private/loopback/link-local/CGNAT 地址，含十进制/八进制/十六进制/短点分等解析
+  等价形式与 IPv4-mapped IPv6——`permissions/review.py::
+  _looks_private_or_loopback`/`_parse_loose_ipv4`，round-2 finding #2/#8）——不
+  满足则见④，不是「browser_navigate 无条件规则闸放行」（第三轮文本这里的表述不
+  完整，第四轮改正）。
+- **审查闸**（有副作用或工具名本身不足以判断风险，需要模型看参数/页面上下文）：
+  `browser_click`、`browser_type`、`browser_scroll`、`browser_back`、`browser_press`、
+  `browser_console`（带 `expression`，且④的网络/存储标记扫描未命中）、`browser_dialog`。
+- **用户闸**（满足以下任一条件即标红升级）：①这次点击/按键实质
+  是提交表单（即将触发导航或向服务器发起写请求）——语义判断来自模型，不是单独的
+  工具名规则，v1 未实现（Hermes 原生工具集里没有语义化的「提交表单」工具，见
+  `classify()` 文档字符串「v1 用规则先满足可测性，模型判断是 W4+ 增强」）；②任何
+  触发外发的动作——同①，语义判断，v1 未实现；③`browser_console` 求值的表达式含
+  网络请求（`fetch`/`XMLHttpRequest`）或存储写入（`localStorage`/`sessionStorage`/
+  `indexedDB`/写 cookie）——**已实现**，`_classify_browser_console` 的字符串标记
+  扫描；④`browser_navigate` 的目标 URL scheme 不是 `http(s)`，或 host 是字面
+  private/loopback/link-local/CGNAT 地址（见上「规则闸放行」的判定细节）——**已
+  实现**，`_classify_browser_navigate`；机械判定，不是语义判断。**控制者裁定
+  R-J1（第二轮评审 finding #6/#8/#9）**：④现在是防御性冗余层，不是唯一的闸——
+  §9.2 已改为不再设置 `browser.allow_private_urls`，这类 URL 首先被 Hermes 自己
+  的 `_url_policy_error` 直接拒绝（比「转用户闸后可批准」更严格），④确保这个拒绝
+  在 auto/task 模式下对用户仍然可见（`permission.requested` 广播），不是静默失败。
+- **恒定用户闸**（工具名本身即代表高风险操作，不经过审查闸的语义判断，直接钉死）：
+  `browser_cdp`（原始 CDP 透传——可以执行 `Network.setCookie`、`Input.dispatchMouseEvent`
+  等绕过所有语义分级的原语，本轮实测用真实 `invoke_tool()` 验证过插件层能够拦住它，
+  见「验证方法」）、`browser_vault_unlock`/`browser_vault_fill`/`browser_vault_save_login`/
+  `browser_vault_enter_code`（触碰密码库）。
+- **兜底档**（上面没点名的任何工具——包括未来新版本 hermes-agent 新增的
+  `browser_*` 工具）：一律用户闸（fail-closed，`classify()` 的 catch-all 返回
+  `medium`——见本文件顶部/`review.py` 文档字符串：「非 `low` 在 `sessions/
+  service.py::_on_request_permission` 的分支里行为等同 `high`」，`medium` 从不
+  自动放行，语义上就是「用户闸」）。**规则闸的默认映射表在 daemon 启动时与
+  worker 实际暴露的工具名比对，出现未映射的 `browser_*` 工具名即记 warning 日志
+  并按用户闸处理，不允许「未知即放行」**（同 §8.1 的启动自检精神）——这一条
+  在代码里尚未实现（没有启动时的工具名比对/warning 逻辑），只有「未知工具名
+  → `classify()` 兜底 medium」这一半；本分支没有补上启动自检那一半，见报告
+  「没做什么」。
+- **下载**：v1 不支持浏览器下载，与旧 β 文本结论一致；`browser_navigate`/`browser_click`
+  触发的下载按触发它的那次调用定级，不低于审查闸。
+- 用户可以在 `permissions.json` 里针对具体 `browser_*` 工具名进一步收紧（例如把
+  `browser_navigate` 也钉死到用户闸），但不能放宽规则闸/恒定用户闸这两档——与 PRD
+  规则闸「只能收紧」的既有原则一致（对齐 G14）。
+- PRD 12.3 FR09 验收口径需要同 PR 更新为这份新分级（本分支不改 PRD，见报告）。
+
+### 9.4 Step 记录与脱敏
+
+不变于旧文本：Step 记录 `args_json` 时对 `browser_type` 的输入内容做脱敏（字段名/
+页面上下文疑似密码则不落明文），对齐 N02。`browser_vault_*` 系列的参数本身可能就是
+凭据引用（不是明文密码），仍按同样规则脱敏处理，不假设工具名本身就是安全的。
+
+### 9.5 不做「接管用户当前浏览器窗口」——结论不变
+
+`docs/spikes/04-browser-login-state.md` 的实测结论（单实例锁会把补开调试端口的第二次
+启动直接转发并秒退）不受本轮 MCP→原生工具集的变化影响，继续成立：浏览器能力首次使用
+时若 Jones 专属 profile 里未登录目标网站，工具应返回明确错误/提示，引导用户到 Jones
+浏览器窗口里手动登录一次——对齐诚实失败原则。
+
+### 验证方法（本轮实测，可复现）
+
+真实源码、真实子进程、真实 Chrome，均可在有 `hermes-agent` checkout（`uv sync --group
+worker`，见 docs/DEV.md）和真实 Chrome/Chromium 的机器上重跑：
+
+- **单元测试**（不需要真 Chrome，CI 可跑）：`daemon/tests/test_cap_browser.py`，用
+  `daemon/tests/fake_chrome.py`（stdlib-only，模拟 `DevToolsActivePort` 写入 + CDP
+  liveness 探针）驱动 `BrowserManager` 的启动/幂等/重连孤儿/陈旧端口文件/SIGTERM→SIGKILL
+  回退/`browser_worker_config` 的完整生命周期。
+- **真实浏览器/真实 Hermes 集成测试**（`JONES_E2E=1` 门控，需要真 Chrome；其中网关测试
+  还需要 `hermes-agent` 可 import）：`daemon/tests/integration/test_cap_browser_e2e.py`：
+  1. `test_login_state_survives_a_graceful_shutdown_and_restart`——登录一次 → 优雅
+     `shutdown()` → 用同一 profile 重新拉起 → 免登录访问受保护页成功（Issue #15 判据）。
+  2. `test_agent_browser_close_does_not_kill_the_shared_chrome`——验证 Hermes 侧
+     `browser_*` 工具（经 `agent-browser` CLI）调用等价于「关闭」的操作不会杀掉 Jones
+     持有的共享 Chrome 进程（α 设计依赖的安全性质）。
+  3. `test_real_hermes_browser_navigate_goes_through_the_gate`——**真实**
+     `hermes_cli.plugins`/`agent.agent_runtime_helpers.invoke_tool()`：一个真实注册的
+     `pre_tool_call` 插件对 `browser_cdp` 返回 `block`（真的在执行前拦截，从未连接
+     CDP）、对 `browser_navigate` 返回 `approve`（真的落到 `model_tools.
+     handle_function_call` → 真实 Hermes 浏览器工具 → 真实 agent-browser 子进程 → 真实
+     CDP → 真实 Chrome 导航），与 `docs/spikes/hermes_hook_demo.py`（spike #1）同一套
+     手法，但把验证范围从「block 生效」扩到「approve 之后真的执行到底」。
+- 报告「判据实测」一节给出 8 次 SIGKILL / 5 次优雅关闭的完整重复实验数据与耗时。

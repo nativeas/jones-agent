@@ -63,9 +63,11 @@ I's ownership — see that module's docstring):
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 # Round 5 (controller ruling R7, 2026-09-19, final): the terminal classifier
 # below must not use `shlex.split` any more — reuse `kernel/plugin/
@@ -80,18 +82,37 @@ from jones_daemon.permissions import defaults
 
 RiskLevel = Literal["low", "medium", "high"]
 
+# Round-1 post-merge-review fixes (2026-09-19, findings #1/#6/#8): this whole
+# browser section used to name Playwright-MCP tools (browser_take_screenshot,
+# browser_fill_form, browser_evaluate, ...) that don't exist in the alpha
+# (Hermes-native browser_*) toolset this branch actually shipped. 00-foundation.md
+# section 9.3 had already been rewritten to the real tool names but this
+# classifier never followed, so every real browser tool except browser_click/
+# browser_type was silently falling through to the medium catch-all at the
+# bottom of classify() instead of the tier section 9.3 actually specifies for
+# it. Rewritten below to match section 9.3 (round-3 rewrite) tool name for
+# tool name.
+
 # Browser tools whose read-only-ness is knowable from the name alone (no args
-# needed) — 00-foundation.md §9.2's rule-gate-eligible subset. `read_file`/
+# needed) — 00-foundation.md §9.2's rule-gate-eligible browser subset. `read_file`/
 # `search_files` used to be in this set too (see git history) — Issue #13/#14
 # (G15) moved them to `_classify_read` below, since "read-only" and "safe to
 # auto-allow regardless of path" turned out not to be the same claim (see that
-# function's docstring). NOTE: these are classified `low` here for cases
-# where a caller routes them through the review gate anyway (e.g. review runs
-# before a rule-gate allow-rule would have short-circuited it) — the rule
-# gate (`kernel/plugin/jones_gate`) already allows these outright per
-# 00-foundation.md §9.2.
-_READ_ONLY_LOW = frozenset(
-    {"browser_navigate", "browser_snapshot", "browser_take_screenshot", "browser_wait_for"}
+# function's docstring), so only the browser read-only tools remain here. NOTE:
+# these are classified `low` here for cases where a caller routes them through
+# the review gate anyway (e.g. review runs before a rule-gate allow-rule would
+# have short-circuited it) — the rule gate (`kernel/plugin/jones_gate`)
+# already allows these outright per 00-foundation.md §9.2.
+_READ_ONLY_LOW = frozenset({"browser_snapshot", "browser_get_images", "browser_vision"})
+
+# section 9.3's "constant user gate" browser tools -- the tool name alone IS
+# the high-risk signal, never downgraded by args, never routed through
+# review-gate judgment. browser_cdp is the raw-CDP escape hatch (can bypass
+# every other semantic tier); the browser_vault_* four touch the credential
+# vault.
+_BROWSER_ALWAYS_HIGH = frozenset(
+    {"browser_cdp", "browser_vault_unlock", "browser_vault_fill",
+     "browser_vault_save_login", "browser_vault_enter_code"}
 )
 
 # 02-w3-interfaces.md §1.1: "终端命令是否含网络外发 curl|wget|ssh|scp"; round 4
@@ -101,22 +122,173 @@ _READ_ONLY_LOW = frozenset(
 # ssh scp nc rsync ftp）在 token 流任意位置出现 → high").
 _NETWORK_EGRESS_PROGRAMS = frozenset({"curl", "wget", "ssh", "scp", "nc", "rsync", "ftp"})
 
-# 00-foundation.md §9.2's user-gate condition ③ for `browser_evaluate`: "求值的
-# 表达式里含网络请求...或存储写入". Deliberately coarse (a substring scan, not a
-# JS parser) — same "v1 用确定性规则" scope as everything else in this module.
+# section 9.3's user-gate condition (3) for browser_console (evaluated WITH an
+# expression -- formerly wired to the nonexistent browser_evaluate tool,
+# findings #1/#8): "the evaluated expression touches a network request...or a
+# storage write". Deliberately coarse (a substring scan, not a JS parser) --
+# same "v1 uses deterministic rules" scope as everything else in this module.
 _JS_NETWORK_OR_STORAGE_MARKERS = (
     "fetch(", "XMLHttpRequest", "localStorage", "sessionStorage", "indexedDB",
     "document.cookie",
 )
 
-# 00-foundation.md §9.2's three-tier table for the browser tools that DO need
-# review-gate judgment (the read-only ones are in `_READ_ONLY_LOW` instead, and
-# `browser_evaluate` gets its own args-aware rule below).
+# section 9.3's review-gate tier for browser tools that have side effects but
+# whose tool name alone isn't a high-risk signal -- v1 has no model-backed
+# semantic judgment (this module's own docstring: "v1 uses deterministic rules
+# first...model judgment is a W4+ enhancement"), so these floor at `medium`;
+# the "is this actually a form submission" escalation section 9.3 describes is
+# explicitly model-judged, not a deterministic rule this function implements.
 _BROWSER_REVIEW_TOOLS = frozenset(
-    {"browser_click", "browser_fill_form", "browser_type", "browser_press_key",
-     "browser_drag", "browser_select_option", "browser_hover", "browser_file_upload",
-     "browser_tabs"}
+    {"browser_click", "browser_type", "browser_scroll", "browser_back", "browser_press",
+     "browser_dialog"}
 )
+
+_SAFE_URL_SCHEMES = frozenset({"http", "https"})
+
+
+# Round-2 review finding #2: CPython's `ipaddress` module does not classify
+# 100.64.0.0/10 (CGNAT -- what Tailscale/most cloud VPCs hand out) as private/
+# loopback/link-local at all (verified: `ip_address("100.64.1.1").is_private`
+# is `False`) -- Hermes's own `tools/url_safety.py::_is_blocked_ip` explicitly
+# special-cases `_CGNAT_NETWORK` for exactly this reason. `_looks_private_or_
+# loopback` below matches that.
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _parse_loose_ipv4(hostname: str) -> ipaddress.IPv4Address | None:
+    """Round-2 review finding #2/#8: Chrome's URL parser (WHATWG URL "IPv4
+    parser") accepts decimal (`2130706433`), octal (`0177.0.0.1`), hex
+    (`0x7f000001`), and short/"dotted" forms (`127.1`) as spellings of an
+    IPv4 address, and resolves all of them navigating with the browser -- but
+    `ipaddress.ip_address()` (used by `_looks_private_or_loopback` below)
+    raises `ValueError` on every one of them (verified empirically), so a
+    literal-only check using it alone falls through to `False` ("not
+    private") for `http://127.1/`, `http://2130706433/`, `http://0177.0.0.1/`
+    and `http://0x7f000001/` -- all four of which Chrome sends straight to
+    `127.0.0.1`. This is a deliberately loose reimplementation of that
+    algorithm (not a full WHATWG conformance target -- just enough to not be
+    fooled by these four well-known obfuscations); returns `None` for
+    anything that isn't a plausible numeric-IPv4 spelling (an ordinary
+    hostname like `example.com` correctly falls through to `None` here)."""
+    parts = hostname.split(".")
+    if not (1 <= len(parts) <= 4) or any(p == "" for p in parts):
+        return None
+    numbers: list[int] = []
+    for part in parts:
+        digits, radix = part, 10
+        if len(part) >= 2 and part[:2].lower() == "0x":
+            digits, radix = part[2:], 16
+        elif len(part) >= 2 and part[0] == "0":
+            digits, radix = part[1:], 8
+        if digits == "" or not all(c in "0123456789abcdefABCDEF" for c in digits):
+            return None
+        try:
+            value = int(digits, radix)
+        except ValueError:
+            return None
+        if value > 0xFFFFFFFF:
+            return None
+        numbers.append(value)
+    if len(numbers) > 1 and any(n > 0xFF for n in numbers[:-1]):
+        return None
+    last = numbers[-1]
+    if len(numbers) > 1 and last >= 256 ** (5 - len(numbers)):
+        return None
+    ipv4 = last
+    for i, n in enumerate(numbers[:-1]):
+        ipv4 += n * (256 ** (3 - i))
+    try:
+        return ipaddress.IPv4Address(ipv4)
+    except ipaddress.AddressValueError:
+        return None
+
+
+def _looks_private_or_loopback(hostname: str | None) -> bool:
+    """Literal-string/IP check only -- no DNS resolution (`classify()` must
+    stay synchronous with no I/O). Catches the common literal spellings
+    (`localhost`, `127.0.0.1`, `10.x`, `192.168.x`, link-local, `::1`,
+    IPv4-mapped `::ffff:127.0.0.1`, CGNAT `100.64.0.0/10`, and the decimal/
+    octal/hex/short obfuscated IPv4 spellings a browser's URL parser
+    normalizes -- round-2 finding #2/#8) and does NOT catch a private
+    hostname that only *resolves* to a private address (would need a network
+    lookup this function deliberately doesn't do; `nip.io`-style DNS rebinding
+    is an accepted, documented gap -- see `browser_worker_config`'s docstring
+    for why Hermes's own real DNS-resolving check is the actual backstop for
+    that class, R-J1)."""
+    if not hostname:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        addr: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(hostname)
+    except ValueError:
+        loose = _parse_loose_ipv4(hostname)
+        if loose is None:
+            return False
+        addr = loose
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if isinstance(addr, ipaddress.IPv4Address) and addr in _CGNAT_NETWORK:
+        return True
+    return addr.is_private or addr.is_loopback or addr.is_link_local
+
+
+def _classify_browser_navigate(args: dict[str, Any]) -> Risk:
+    """Round-1 fix (review finding #6, critical) + round-2 controller ruling
+    R-J1: `capabilities/browser.py::browser_worker_config` does NOT set
+    `browser.allow_private_urls` (round-2 removed that forced config value --
+    see its docstring for why: the flag has no CDP-attach-scoped variant in
+    this hermes-agent version, and also silently lifts SSRF protection for
+    `web_extract`/vision/skills_hub, not just the browser). Without that flag,
+    Hermes's own `tools/browser_tool.py::_url_policy_error` already refuses a
+    non-http(s) scheme (e.g. `file://`) or a private/loopback navigation
+    target on a CDP-override backend -- so this function's `high` escalation
+    for those cases is DEFENSE IN DEPTH, not the only remaining check it was
+    when finding #6 was first written: it makes sure the user gate visibly
+    flags the attempt (auto/task mode would otherwise silently see only
+    Hermes's own internal refusal, with no `permission.requested` at all, if
+    this classifier had stayed at a name-only `low`) even on a future
+    hermes-agent version, or a future Jones-side patch to the vendored
+    dependency, that narrows the flag to only exempt the CDP attach itself and
+    stops blocking navigation targets outright."""
+    url = args.get("url")
+    if not isinstance(url, str) or not url:
+        return _medium("browser_navigate call with no resolvable url to classify")
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in _SAFE_URL_SCHEMES:
+        return _high(
+            f"browser_navigate targets a non-http(s) scheme ({scheme or '(none)'!r}) -- "
+            "controller ruling R-J1: never low/medium for this, regardless of what "
+            "Hermes's own url_safety does with this call"
+        )
+    if _looks_private_or_loopback(parts.hostname):
+        return _high(
+            f"browser_navigate targets a private/loopback host ({parts.hostname!r}) -- "
+            "controller ruling R-J1: never low/medium for this, regardless of what "
+            "Hermes's own url_safety does with this call"
+        )
+    return _low(f"browser_navigate targets a public http(s) url (host={parts.hostname!r})")
+
+
+def _classify_browser_console(args: dict[str, Any]) -> Risk:
+    """section 9.3: browser_console is read-only (low) when neither
+    `expression` nor `clear` was passed (a plain log fetch); passing
+    `expression` evaluates arbitrary JS in the page, which needs the same
+    network/storage marker scan section 9.3 requires (formerly wired to the
+    nonexistent browser_evaluate tool -- findings #1/#8)."""
+    expression = args.get("expression")
+    clear = bool(args.get("clear"))
+    if not expression and not clear:
+        return _low("browser_console with no expression/clear is a read-only log fetch")
+    if not isinstance(expression, str) or not expression:
+        return _medium("browser_console(clear=True) has a side effect (clears console log)")
+    hit = [m for m in _JS_NETWORK_OR_STORAGE_MARKERS if m in expression]
+    if hit:
+        return _high(f"browser_console expression touches network/storage: {', '.join(hit)}")
+    return _medium(
+        "browser_console expression evaluation with no detected network/storage access"
+    )
 
 
 @dataclass(frozen=True)
@@ -657,15 +829,6 @@ def _terminal_recursive_ancestor_of_sensitive_root(
     return None
 
 
-def _classify_browser_evaluate(args: dict[str, Any]) -> Risk:
-    expr = args.get("function") or args.get("expression") or args.get("code") or ""
-    expr = expr if isinstance(expr, str) else ""
-    hit = [m for m in _JS_NETWORK_OR_STORAGE_MARKERS if m in expr]
-    if hit:
-        return _high(f"evaluated expression touches network/storage: {', '.join(hit)}")
-    return _medium("browser_evaluate with no detected network/storage access")
-
-
 def classify(tool_name: str, args: dict[str, Any] | None, *, cwd: str | None = None) -> Risk:
     """Deterministic risk classification for the review gate. `args` may be
     `{}`/incomplete (e.g. a `write_file`/`patch` call whose real structured
@@ -702,11 +865,15 @@ def classify(tool_name: str, args: dict[str, Any] | None, *, cwd: str | None = N
         return _classify_write(args.get("path"), cwd=cwd)
     if tool_name == "terminal":
         return _classify_terminal(args, cwd=cwd)
-    if tool_name == "browser_evaluate":
-        return _classify_browser_evaluate(args)
+    if tool_name == "browser_navigate":
+        return _classify_browser_navigate(args)
+    if tool_name == "browser_console":
+        return _classify_browser_console(args)
+    if tool_name in _BROWSER_ALWAYS_HIGH:
+        return _high(f"{tool_name} is a constant user-gate tool (00-foundation.md §9.3)")
     if tool_name in _BROWSER_REVIEW_TOOLS:
         return _medium(f"{tool_name} has side effects and needs review")
-    # 00-foundation.md §9.2's fail-closed catch-all ("上面三档没有点名的任何工具
+    # 00-foundation.md §9.3's fail-closed catch-all ("上面几档没有点名的任何工具
     # ...一律用户闸") for anything this function doesn't specifically recognize —
     # `medium` (not `low`) so it never auto-bypasses in auto mode.
     return _medium(f"no specific risk rule for tool {tool_name!r}; defaulting to reviewed")
