@@ -570,3 +570,100 @@ body {
   gap: 2px;
   font-size: 12px;
 }
+
+/* --- right pane: 回放 (PRD FR06, 02-w3-interfaces.md §2) --- */
+
+.right-pane__tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid #3333;
+  padding-bottom: 6px;
+}
+
+.right-pane__tab--active {
+  font-weight: 600;
+  text-decoration: underline;
+}
+
+.replay-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.replay-view__toolbar {
+  display: flex;
+  gap: 6px;
+}
+
+.replay-view__toolbar select {
+  flex: 1;
+  min-width: 0;
+}
+
+.replay-view__error {
+  color: #d33;
+}
+
+.replay-view__run-meta {
+  border: 1px solid #3333;
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.replay-view__reason {
+  opacity: 0.8;
+}
+
+.replay-view__section-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.replay-view__nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.replay-view__step {
+  border: 1px solid #3333;
+  border-radius: 6px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.replay-view__step--failed {
+  border-color: #d335;
+}
+
+.replay-view__step-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.replay-view__pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow: auto;
+  background: #8881;
+  border-radius: 4px;
+  padding: 6px;
+  margin: 4px 0 0;
+}
+
+.replay-view__permission {
+  opacity: 0.8;
+}
+
+.replay-view__truncated {
+  opacity: 0.7;
+  font-size: 0.85em;
+  margin-top: 2px;
+}

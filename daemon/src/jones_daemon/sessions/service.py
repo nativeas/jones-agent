@@ -12,29 +12,51 @@ RPC handler. It owns:
     ACP events the worker later reports back.
 
 Known W2 scope gaps (see the PR report): per-mode tool suppression (chat mode should
-refuse to run tools at all — PRD 9.1/N12), Goal/budget-triggered termination (PRD
-9.3's third termination kind — Goals are FR17, not #10), full `payload_ref`
-offload storage for large tool results (`FR06` 回放 completeness), and calling
-`ctx.providers.resolve()` to actually pass a worker's provider/model binding
-(env + `hermes_config`) into `WorkerManager.ensure_started()` (today every
-worker launches with no `model:`/`providers:` block in its `config.yaml` at
-all — `tests/integration/test_real_hermes_e2e.py` works around this by hand)
-are not implemented here; nothing in this file pretends otherwise.
+refuse to run tools at all — PRD 9.1/N12) and Goal/budget-triggered termination (PRD
+9.3's third termination kind — Goals are FR17, not #10) are not implemented here;
+nothing in this file pretends otherwise.
+
+W3/#12 (docs/design/02-w3-interfaces.md §2) closed two adjacent pieces of the W2
+gap list above, scoped narrowly to what FR06 回放 actually needs:
+  - `_handle_tool_call_update` now also writes a Step's full `rawOutput` to
+    `replay/store.py` (`payload_ref`) — `result_summary` stays a truncated text
+    summary for quick UI rendering, the payload file is the full-fidelity replay
+    source.
+  - `_run_turn` now calls `ctx.providers.resolve()` as a fail-fast pre-flight
+    check *before* asking `WorkerManager` to spawn a worker — a Session whose
+    Agent has no usable provider/Key terminates immediately with a
+    `provider_error`-flavored `run.terminated{kind:"error"}` card instead of
+    either silently trying to launch a worker that can't do anything useful, or
+    (worse, on a machine without `hermes-agent`'s `worker` extra installed —
+    every CI runner and most dev machines, see docs/DEV.md) failing with an
+    opaque "worker startup failed" card that looks identical whether the real
+    problem is "no API key" or "hermes-agent isn't installed". This does **not**
+    wire the resolved `ProviderBinding` (env vars, `hermes_config`) into the
+    worker's actual subprocess env/`config.yaml` — that plumbing lives in
+    `WorkerManager.ensure_started`/`_worker_env`/`_prepare_hermes_home`, which
+    02-w3-interfaces.md §0 assigns to F, not G; a worker started after this
+    check passes still launches with no `model:`/`providers:` block, exactly as
+    before. See the PR report's "契约变更" section.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import json
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from jones_daemon.context import DaemonContext
 from jones_daemon.kernel.acp_client import AcpError, AcpProtocolError
 from jones_daemon.kernel.ids import new_ulid
 from jones_daemon.logging import get_logger
+from jones_daemon.projects.service import ProjectService
+from jones_daemon.providers.resolver import ProviderNotConfiguredError
+from jones_daemon.replay import retention as replay_retention
+from jones_daemon.replay import store as replay_store
 from jones_daemon.rpc.errors import INVALID_PARAMS, INVALID_STATE, NOT_FOUND, RpcError
 from jones_daemon.sessions import queries
 from jones_daemon.store import run_in_db_thread
@@ -94,6 +116,11 @@ class _TurnContext:
     tool_call_steps: dict[str, str] = field(default_factory=dict)
     step_seq: int = 0
     step_started_at: dict[str, float] = field(default_factory=dict)
+    # step_id -> its own `seq` — `_write_step_payload` (FR06 回放, 02-w3-interfaces.md
+    # §2) needs the seq *that step* was assigned at start time, not `step_seq`'s
+    # current value (which may have advanced past it by the time a `tool_call_update`
+    # for an earlier, still-in-flight call arrives).
+    step_seq_by_id: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -117,6 +144,13 @@ class SessionService:
         self._turn_tasks: dict[str, asyncio.Task[None]] = {}
         self._pending_permissions: dict[str, _PendingPermission] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
+        # FR06 回放 (02-w3-interfaces.md §2): background Step-payload writes
+        # (`_write_step_payload`) and the retention sweep loop
+        # (`replay/retention.py`) are tracked here so `shutdown()` can wait for
+        # in-flight writes and cancel the sweep cleanly, instead of leaving
+        # dangling tasks nobody awaits.
+        self._background_tasks: set[asyncio.Task[None]] = set()
+        self._retention_task: asyncio.Task[None] | None = None
 
     def _lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -132,6 +166,9 @@ class SessionService:
             )
         await self.worker_manager.start()
         await self.ensure_main_session()
+        # FR06 回放保留策略 (02-w3-interfaces.md §2/§3: "清理在空闲时跑") — a plain
+        # background loop, not tied to any request's critical path.
+        self._retention_task = asyncio.create_task(replay_retention.run_sweep_loop(self.ctx))
 
     async def shutdown(self) -> None:
         # Close off every still-pending permission wait before tearing workers
@@ -139,6 +176,18 @@ class SessionService:
         # acp_client.py) is left awaiting a future nobody will ever resolve.
         self._resolve_pending_permissions(reason="daemon shutdown")
         await self.worker_manager.stop()
+        if self._retention_task is not None:
+            self._retention_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._retention_task
+        # Let already-scheduled Step-payload writes (`_write_step_payload`)
+        # finish rather than abandoning them mid-write — bounded, not indefinite:
+        # a shutdown must still make forward progress even if a write is stuck
+        # (e.g. a full disk). `return_exceptions=True` because a background
+        # write task already logs its own failures (see `_write_step_payload`);
+        # this wait exists to give it time to do so, not to re-raise here.
+        if self._background_tasks:
+            await asyncio.wait(self._background_tasks, timeout=5.0)
 
     def _resolve_pending_permissions(self, *, session_id: str | None = None, reason: str) -> None:
         """Close off pending `session/request_permission` waits (all of them, or
@@ -179,18 +228,16 @@ class SessionService:
         logger.info("created main session", extra={"detail": {"session_id": session_id}})
         return session_id
 
-    def _cwd_for_project(self, project_id: str) -> str:
-        if project_id == DEFAULT_PROJECT_ID:
-            # `proj_default`'s `path` column is a placeholder sentinel (see the 002
-            # migration header) — PRD 7.1/01-w2-interfaces.md §2 says the implicit
-            # default project IS the user's home directory, so use that directly
-            # rather than the sentinel until C (#8/#9) lands real Project rows.
-            return str(Path.home())
-        raise RpcError(
-            INVALID_STATE,
-            "non-default projects aren't implemented until C (#8/#9) lands",
-            {"project_id": project_id},
-        )
+    async def _cwd_for_project(self, project_id: str) -> str:
+        """02-w3-interfaces.md §2 集成收口 #1: C (#8/#9) has since landed real
+        `projects` rows (including `proj_default`'s real, per-machine path via
+        `ProjectService.ensure_default_project()` at daemon startup — see
+        __main__.py) — use `ProjectService.get()` for every project, not just a
+        hardcoded home-directory special case for the default one. `get()` itself
+        already raises `RpcError(NOT_FOUND, ...)` for an unknown id, which is the
+        right error here too (a Session referencing a deleted Project)."""
+        project = await run_in_db_thread(ProjectService(self.ctx.db).get, project_id)
+        return project["path"]
 
     # -- Session CRUD -------------------------------------------------------------
 
@@ -369,14 +416,73 @@ class SessionService:
             limit=limit,
         )
 
+    async def run_list(self, session_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """回放视图"选一个 Run"（02-w3-interfaces.md §2) — `run.list`, a contract
+        addition on top of 00-foundation.md §4.1 (see this file's module
+        docstring / the PR report's "契约变更"): that table never had a way to
+        discover a historical Run id besides the live `turn.started` notification."""
+        return await run_in_db_thread(
+            queries.list_runs_for_session, self.ctx.db, session_id, limit=limit
+        )
+
     async def run_get(self, run_id: str) -> dict[str, Any]:
+        """FR06 回放 (02-w3-interfaces.md §2): the `runs` row already carries every
+        piece of "终止信息" this method needs to return — `terminated_kind`/
+        `terminated_reason` (existing) plus `terminated_step_seq` (this issue,
+        migration 005) — and `prompt_snapshot_ref` is the readable reference the
+        client fetches via `run.payload` (never inlined here: it can be
+        arbitrarily large, same reasoning as Step payloads)."""
         row = await run_in_db_thread(queries.get_run, self.ctx.db, run_id)
         if row is None:
             raise RpcError(NOT_FOUND, "run not found", {"run_id": run_id})
         return row
 
-    async def run_steps(self, run_id: str) -> list[dict[str, Any]]:
-        return await run_in_db_thread(queries.list_run_steps, self.ctx.db, run_id)
+    async def run_steps(
+        self, run_id: str, *, after_seq: int | None = None, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """FR06 回放分页 (02-w3-interfaces.md §2): `after_seq`/`limit` page forward
+        through a Run's Steps in `seq` order — the same order the replay UI's
+        前进/后退 stepping walks, so "next page" and "step forward past what's
+        loaded" are the same request shape."""
+        return await run_in_db_thread(
+            queries.list_run_steps, self.ctx.db, run_id, after_seq=after_seq, limit=limit
+        )
+
+    async def run_payload(
+        self, ref: str, *, offset: int = 0, limit: int | None = None
+    ) -> dict[str, Any]:
+        """FR06 回放, 02-w3-interfaces.md §2: `run.payload {ref}` — full-fidelity
+        Step output / prompt snapshot, fetched on demand (never pushed proactively
+        — "回放时按需加载", PRD 10.3). `>1MB` chunking is `offset`/`limit`, not a
+        separate method — see `replay/store.py::CHUNK_THRESHOLD_BYTES`.
+
+        `ref` must resolve to a real file under `<user_root>/runs/` — see
+        `replay/store.py::_resolve_ref` for why that's checked even though every
+        `ref` this method is ever called with should already have come from a
+        `steps.payload_ref`/`runs.prompt_snapshot_ref` column (defense in depth,
+        not a first line of defense)."""
+        user_root = self.ctx.paths.user_root()
+        try:
+            size = await asyncio.to_thread(replay_store.payload_size, user_root, ref)
+            data = await asyncio.to_thread(
+                replay_store.read_payload, user_root, ref, offset=offset, limit=limit
+            )
+        except replay_store.PayloadRefError as exc:
+            raise RpcError(NOT_FOUND, str(exc), {"ref": ref}) from exc
+        return {
+            "ref": ref,
+            "offset": offset,
+            "size": size,
+            "data_base64": base64.b64encode(data).decode("ascii"),
+            "eof": offset + len(data) >= size,
+        }
+
+    def active_turn_session_ids(self) -> list[str]:
+        """`daemon.status`'s `sessions_active` (02-w3-interfaces.md §2 集成收口 #2,
+        `rpc/methods.py::register_daemon_status`) — a plain accessor over
+        `_active_turns`, the same dict `stop()`/`_advance_queue()` already treat
+        as "this Session currently has a Turn running"."""
+        return list(self._active_turns.keys())
 
     # -- permissions ----------------------------------------------------------------
 
@@ -438,6 +544,40 @@ class SessionService:
         await run_in_db_thread(
             queries.create_run, self.ctx.db, run_id=run_id, turn_id=turn_id, session_id=session_id
         )
+        # FR06 回放, 02-w3-interfaces.md §2: `runs.prompt_snapshot_ref` — ACP
+        # doesn't expose the fully assembled prompt actually sent to the model
+        # (00-foundation.md §7), so this records, honestly, only what's available
+        # at Run-start: the user's own message plus enough identifiers to look up
+        # the rest (Agent/mode) — not a fabricated "here's the system prompt".
+        # Best-effort: a failure to write this must not abort the Turn itself
+        # (fail loud via the log, not fail the whole Run over a replay nicety).
+        try:
+            snapshot_ref = await asyncio.to_thread(
+                replay_store.write_prompt_snapshot,
+                self.ctx.paths.user_root(),
+                run_id,
+                {
+                    "note": (
+                        "Hermes ACP does not expose the fully assembled prompt sent to "
+                        "the model (docs/design/00-foundation.md §7); recording what is "
+                        "available."
+                    ),
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "run_id": run_id,
+                    "user_message": text,
+                    "captured_at": queries.iso_now(),
+                },
+            )
+            await run_in_db_thread(
+                queries.set_prompt_snapshot_ref, self.ctx.db, run_id, snapshot_ref
+            )
+        except OSError:
+            logger.error(
+                "failed to write prompt snapshot for a Run",
+                exc_info=True,
+                extra={"detail": {"run_id": run_id}},
+            )
         ctx_turn = _TurnContext(turn_id=turn_id, run_id=run_id, session_id=session_id)
         self._active_turns[session_id] = ctx_turn
         self.worker_manager.mark_busy(session_id, True)
@@ -452,7 +592,27 @@ class SessionService:
         try:
             try:
                 session = await run_in_db_thread(queries.get_session, self.ctx.db, session_id)
-                cwd = self._cwd_for_project(session["project_id"])
+                cwd = await self._cwd_for_project(session["project_id"])
+                # 集成收口 (02-w3-interfaces.md §2 item 4's `pnpm e2e` needs this to
+                # be a real, distinguishable failure mode, not just documentation):
+                # fail fast on a Session whose Agent has no usable provider/Key
+                # *before* ever spawning a worker subprocess — otherwise "no key
+                # configured" and "hermes-agent isn't installed on this machine"
+                # (see docs/DEV.md — the common case for every CI runner and most
+                # dev checkouts) both surface as the same opaque "worker startup
+                # failed" card. Does not wire the resolved `ProviderBinding` into
+                # the worker itself — see this file's module docstring.
+                model_pref = await run_in_db_thread(
+                    queries.get_agent_model_pref, self.ctx.db, session["agent_id"]
+                )
+                try:
+                    await run_in_db_thread(self.ctx.providers.resolve, model_pref)
+                except (RpcError, ProviderNotConfiguredError) as exc:
+                    message = exc.message if isinstance(exc, RpcError) else str(exc)
+                    await self._terminate_run(
+                        ctx_turn, kind="error", reason=f"provider_error: {message}"
+                    )
+                    return
                 try:
                     worker = await self.worker_manager.ensure_started(session_id, cwd=cwd)
                 except WorkerStartupError as exc:
@@ -532,6 +692,10 @@ class SessionService:
         )
 
     async def _terminate_run(self, ctx_turn: _TurnContext, *, kind: str, reason: str) -> None:
+        # FR06 回放 "终止记录" (02-w3-interfaces.md §2): `ctx_turn.step_seq` is the
+        # seq of the last Step started on this Run (0 if none ever started) —
+        # exactly "终止时的 step_seq", so replay can show which Step was in
+        # flight (or that none had started yet) when the Run ended.
         await run_in_db_thread(
             queries.mark_run_terminated,
             self.ctx.db,
@@ -539,6 +703,7 @@ class SessionService:
             ctx_turn.turn_id,
             kind=kind,
             reason=reason,
+            terminated_step_seq=ctx_turn.step_seq or None,
         )
         card = {"kind": kind, "message": reason}
         await self.ctx.server.broadcast(
@@ -657,6 +822,7 @@ class SessionService:
         tool_call_id = update.get("toolCallId")
         step_id = new_ulid()
         ctx_turn.step_seq += 1
+        ctx_turn.step_seq_by_id[step_id] = ctx_turn.step_seq
         if tool_call_id:
             ctx_turn.tool_call_steps[tool_call_id] = step_id
             ctx_turn.step_started_at[step_id] = time.monotonic()
@@ -690,17 +856,70 @@ class SessionService:
         if started is not None and status in ("completed", "failed"):
             duration_ms = int((time.monotonic() - started) * 1000)
         result_summary = None
+        dumped_output: str | None = None
         if raw_output is not None:
-            # Truncated text summary, not full payload storage — `payload_ref`
-            # (full-fidelity replay storage, FR06) is out of #10's scope; see the
-            # module docstring's scope-gap note.
-            result_summary = json.dumps(raw_output, default=str, ensure_ascii=False)[:4000]
+            # Serialize `raw_output` exactly once. Round-1 review fix: this used
+            # to be dumped twice — once here (truncated to 4000 chars for
+            # `result_summary`) and again, independently, inside
+            # `_write_step_payload` — and the second dump ran on *this* event
+            # loop thread, before ever reaching `asyncio.to_thread` (CPython's C
+            # json encoder holds the GIL throughout, so moving it into a thread
+            # later doesn't give the loop a chance to run anything else while it
+            # dumps). For a large tool `rawOutput` that roughly doubled the CPU
+            # the ACP read loop pays per `tool_call_update` — exactly the cost
+            # 02-w3-interfaces.md §3's "回放 payload 写入异步、不阻塞 ACP 读循环"
+            # is about. `dumped_output` (the one dump) feeds both the truncated
+            # summary and the full-fidelity payload below.
+            dumped_output = json.dumps(raw_output, default=str, ensure_ascii=False)
+            result_summary = dumped_output[:4000]
         row = await run_in_db_thread(
             queries.update_step, self.ctx.db, step_id,
             status=status, result_summary=result_summary, duration_ms=duration_ms,
         )
         if status in ("completed", "failed"):
             await self.ctx.server.broadcast(ctx_turn.session_id, "step.completed", row)
+        if dumped_output is not None and status in ("completed", "failed"):
+            # Scheduled, not awaited: `_on_session_update` runs inline on
+            # `AcpClient._read_loop`'s await chain (kernel/acp_client.py awaits
+            # `on_session_update` for every incoming line before reading the
+            # next) — blocking here on disk I/O would stall the ACP read loop
+            # itself (02-w3-interfaces.md §3 "回放 payload 写入异步、不阻塞 ACP
+            # 读循环"). `_write_step_payload` logs and swallows its own failures
+            # (DEV.md 工程原则 #4) since nothing awaits this task's result.
+            seq = ctx_turn.step_seq_by_id.get(step_id, ctx_turn.step_seq)
+            task = asyncio.create_task(
+                self._write_step_payload(ctx_turn.run_id, step_id, seq, dumped_output)
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+    async def _write_step_payload(
+        self, run_id: str, step_id: str, seq: int, dumped_output: str
+    ) -> None:
+        """FR06 回放 full-fidelity Step payload (02-w3-interfaces.md §2) —
+        background write scheduled by `_handle_tool_call_update`, see its
+        docstring comment for why this must never be awaited inline there.
+
+        Takes the already-`json.dumps`-ed text (not the raw object) — see that
+        same comment for why this must not re-serialize it a second time."""
+        try:
+            data = dumped_output.encode("utf-8")
+            ref = await asyncio.to_thread(
+                replay_store.write_payload, self.ctx.paths.user_root(), run_id, seq, data, "json"
+            )
+            await run_in_db_thread(
+                queries.update_step, self.ctx.db, step_id,
+                status=None, result_summary=None, duration_ms=None, payload_ref=ref,
+            )
+        except Exception:  # noqa: BLE001 - a background write must never vanish
+            # silently (DEV.md 工程原则 #4) — nothing else awaits this task or
+            # otherwise observes its outcome, so this `except` is the only place
+            # a failure here can possibly be reported.
+            logger.error(
+                "failed to write full Step payload for replay",
+                exc_info=True,
+                extra={"detail": {"run_id": run_id, "step_id": step_id, "seq": seq}},
+            )
 
     async def _on_request_permission(
         self, session_id: str, params: dict[str, Any]

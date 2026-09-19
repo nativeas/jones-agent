@@ -9,10 +9,13 @@ import os
 import resource
 import sys
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from jones_daemon import __version__
 from jones_daemon.rpc.server import Connection, RpcServer
+
+if TYPE_CHECKING:
+    from jones_daemon.sessions.service import SessionService
 
 _START_TIME = time.monotonic()
 
@@ -56,3 +59,30 @@ async def daemon_status(params: dict[str, Any], conn: Connection) -> dict[str, A
 def register_builtin_methods(server: RpcServer) -> None:
     server.register("daemon.ping", daemon_ping)
     server.register("daemon.status", daemon_status)
+
+
+def register_daemon_status(server: RpcServer, session_service: SessionService) -> None:
+    """02-w3-interfaces.md §2 集成收口 #2: replace the honest-zero placeholder
+    `daemon_status` above with real `sessions_active`/`workers` counts, once a
+    `SessionService` (and the `WorkerManager` it owns) actually exist.
+
+    A separate function, not a parameter threaded through `register_builtin_methods`,
+    because `__main__.py` registers the builtins *before* constructing
+    `SessionService` (every other module's `register(server, ctx)` runs after) —
+    `RpcServer.register()` is a plain dict assignment (`rpc/server.py`), so calling
+    this afterward with the same method name is a normal, supported overwrite, not
+    a hack. Takes `session_service` directly (not `ctx`) per design's "通过 ctx 注入
+    的引用，不用全局变量" — the reference itself is what matters, `ctx` doesn't
+    carry a `SessionService` field and adding one isn't this file's call.
+    """
+
+    async def daemon_status_live(params: dict[str, Any], conn: Connection) -> dict[str, Any]:
+        return {
+            # A Session counts as "active" while it has a Turn actually running —
+            # the same set `SessionService.stop()`/`_advance_queue()` check.
+            "sessions_active": len(session_service.active_turn_session_ids()),
+            "workers": session_service.worker_manager.worker_count(),
+            "memory_mb": _memory_mb(),
+        }
+
+    server.register("daemon.status", daemon_status_live)

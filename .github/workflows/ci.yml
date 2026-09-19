@@ -75,3 +75,21 @@ jobs:
         # off-screen (`show: false`) BrowserWindow launches without a virtual
         # display — no xvfb-equivalent needed here.
         run: pnpm smoke
+      # 02-w3-interfaces.md §2 集成收口 #4: `pnpm e2e` spawns a REAL daemon
+      # (scripts/e2e.mjs imports the real out/main/index.js and lets its own
+      # ensureDaemonRunning() spawn `uv run python -m jones_daemon`) — this job
+      # needs uv + Python 3.12 for that, same as the `daemon` job above (see its
+      # comment for why UV_FROZEN=1 is required on every `uv` invocation: the
+      # `worker` dependency group's `[tool.uv.sources]` points at a machine-local
+      # hermes-agent checkout this runner doesn't have, and only `--frozen`
+      # avoids re-resolving that group at all).
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.10"
+      - name: Install Python 3.12
+        run: uv python install 3.12
+      - name: e2e (real daemon + real Electron, no provider Key configured)
+        env:
+          UV_FROZEN: "1"
+        run: pnpm e2e

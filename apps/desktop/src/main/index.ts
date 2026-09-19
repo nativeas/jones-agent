@@ -2,9 +2,10 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import os from 'node:os'
 import { spawn } from 'node:child_process'
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain } from 'electron'
 import { RpcClient, RpcError } from './rpcClient'
 import { ensureDaemonRunning as runDaemonLifecycle, startHeartbeat } from './daemonLifecycle'
+import { RPC_V0_METHODS } from '../shared/rpcMethods'
 
 // Same override the daemon's paths.py honors, so `JONES_HOME=... electron-vite dev`
 // points both processes at the same sandbox during development/tests.
@@ -20,10 +21,14 @@ const rpcClient = new RpcClient(daemonSocketPath())
 // exposed to untrusted content: model output, tool results, rendered markdown)
 // could invoke *any* daemon method, including provider.set_key, permission.decide
 // and session.send, bypassing the permission gate entirely (design §1: "main ...
-// contextBridge 白名单"). The daemon itself currently only implements this
-// subset (rpc/methods.py `register_builtin_methods`) — extend both together as
-// later issues add methods from design §4.1.
-const ALLOWED_RPC_METHODS: ReadonlySet<string> = new Set(['daemon.ping', 'daemon.status'])
+// contextBridge 白名单"). 02-w3-interfaces.md §2 集成收口 #3: this is now the
+// complete RPC v0 surface (`../shared/rpcMethods.ts`, kept in sync with
+// 00-foundation.md §4.1 by `src/shared/__tests__/rpcMethods.test.ts`) rather than
+// the two-method placeholder from before that issue — a method not yet
+// implemented server-side just answers `method_not_found`, the same as any
+// other unregistered method, so listing the whole contract here up front means
+// later issues implementing e.g. `cron.*` don't need to touch this file again.
+const ALLOWED_RPC_METHODS: ReadonlySet<string> = new Set(RPC_V0_METHODS)
 
 // Matches `service.DEFAULT_LABEL` in daemon/src/jones_daemon/service.py — the label
 // `python -m jones_daemon service install` registers with launchd (design §6).
@@ -185,6 +190,22 @@ ipcMain.handle('rpc:call', async (_event, method: string, params?: Record<string
   } catch (err) {
     return { ok: false as const, message: err instanceof Error ? err.message : String(err) }
   }
+})
+
+// 02-w3-interfaces.md §2 集成收口 #5: the Project 设置页 needs a real folder
+// picker (FR02 "选目录即建 Project") — a native OS dialog is main-process-only
+// (Node/Electron API, not something contextBridge can expose directly), so this
+// is its own narrow IPC handler rather than being routed through `rpc:call`
+// (which is specifically the daemon RPC bridge, not a general main-process
+// capability channel — conflating the two would make the ALLOWED_RPC_METHODS
+// whitelist above lie about what it actually bounds).
+ipcMain.handle('dialog:pickDirectory', async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender) ?? undefined
+  const result = win
+    ? await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] })
+    : await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
+  if (result.canceled || result.filePaths.length === 0) return { canceled: true as const }
+  return { canceled: false as const, path: result.filePaths[0] }
 })
 
 let stopHeartbeat: (() => void) | null = null
