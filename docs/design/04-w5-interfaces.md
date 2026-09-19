@@ -20,12 +20,17 @@
 ## 2. L：Cron（FR11）
 
 - `scheduler/cron_expr.py`：五段 cron 解析 + `next_after(dt)`（自己写，≤150 行，有边界测试；不引第三方）。
-- `scheduler/service.py`：启动时加载 `crons` 表 `enabled=1` 的项，计算 `next_run_at`；**单个** `asyncio` 定时器等待最近一项（不轮询）；到点 → 若已有该 cron 的 Run 在跑则跳过并记 `skipped_overlap`；否则 `SessionService.create(project_id, agent_id, parent_id=<主会话>, mode=cron.mode 默认 auto, title=cron 名)` → `send(prompt)`；`tasks` 行 `source=cron`。
+- `scheduler/service.py`：启动时加载 `crons` 表 `enabled=1` 的项，计算 `next_run_at`；**单个** `asyncio` 定时器等待最近一项（不轮询）；到点 → 若已有该 cron 的 Run 在跑则跳过并记 `skipped_overlap`；否则 `SessionService.create(project_id, agent_id, parent_id=<主会话>, mode=cron.mode 默认 task, title=cron 名)` → `send(prompt)`；`tasks` 行 `source=cron`。
 - **结果推回主会话**：Run 结束（成功/终止）后向主会话插入一条 `role=system` 消息（摘要 + 子会话链接 + 终止卡片若有），并广播 `message.completed`。
 - **失败计数**：连续失败 3 次 → `enabled=0` + 主会话系统消息「已自动停用」（PRD 12.3 FR11）。
-- **时钟与恢复**：daemon 启动时对错过的触发**不补跑**（PRD 5.8 精神；记录一条 `missed` 日志与主会话提示）；`runtime/` 里记 `next_run_at` 快照。
+- **时钟与恢复**：daemon 启动时对错过的触发**不补跑**（PRD 5.8 精神；记录一条 `missed` 日志与主会话提示）；`runtime/` 里记 `next_run_at` 快照（`runtime/cron_schedule.json`，best-effort 镜像——`crons.next_run_at` 才是 `_loop` 实际调度依据的事实源，这份文件写失败只记日志，不影响派发）。
 - RPC `cron.list/upsert/delete/run_now` 已在 v0；`run_now` 走同一派发路径。
 - 测试：可注入时钟；分钟精度；重叠跳过；三次失败停用；Electron 无关（纯 daemon 测试即可证明）。
+
+### 2.1 第 1 轮评审后追加的契约决策（round-1，2026-09-19）
+
+- **`cron.upsert` 的 `mode` 默认值改为 `task`，不是 PRD 9.1 字面的 `auto`**：`ensure_main_session()`（`sessions/service.py`，不在 L 范围）恒把主会话建成 `mode=task`；`SessionService.create()` 的 PRD 9.6/N13 闸拒绝 `mode=task` 父会话下的 `mode=auto` 子会话。这两条都是既有、正确的 PRD 落地，但同时成立时，PRD 9.1「Cron 触发的 Run 默认以自动模式运行」这句话在当前系统里**无法达成**——默认配置下第一次 `create()` 就会被拒。这是 PRD 内部两条要求的真实冲突，不是本分支能单方面通过设计文档改写 PRD 的地方；在跨分支裁定（`sessions/service.py` 是否要为系统触发开一道豁免，或主会话默认改 `auto`）之前，L 在自己独占的 `scheduler/` 范围内选择**不让默认配置开箱即挂**：`cron.upsert` 不传 `mode` 时用 `task`，能正常派发、正常走审查闸（PRD 9.1 对 `task` 模式的定义——只读放行、改变外部世界的动作逐条走三道闸——本来就适用）。用户仍可显式把某个 cron 设成 `mode=auto`；那种情况下若主会话仍是 `task`，仍会被 9.6 闸拒绝并诚实记为失败，这是已知的、未解决的跨分支缺口（见分支报告），需要控制者在 `sessions/service.py` 侧裁定后再收口，**不是本条决策想掩盖的问题**。
+- **cron 表达式按本机系统时区解释，存储仍是 UTC ISO**：`scheduler/cron_expr.py` 的 `next_after` 本身不关心时区（按调用者传入的 `datetime` 的 tzinfo 计算）；`scheduler/service.py::_next_after_local` 是唯一做 UTC↔本地转换的地方——把 `Clock.now()`（UTC）转成本机时区再求下一次匹配，再转回 UTC 存库。理由：这是单机桌面调度器，用户写 `"0 9 * * *"`的直觉预期是"本机每天早 9 点"，不是 UTC 9 点；`00-foundation.md` §4.1 规定的是**存储格式**（UTC ISO），不等于"表达式按 UTC 解释"，此前的实现把这两件事混为一谈。已知限制：本机时区偏移若不是整小时（极少数地区，如 UTC+5:30），跨时区部署会有分钟级别的边界效应；v1 不为此加 `tz` 列，桌面单机场景下按需再收口。
 
 ## 3. M：内置 Skill（FR12 内置）
 
