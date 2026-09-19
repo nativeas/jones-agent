@@ -83,14 +83,17 @@ export const useChatStore = create<ChatState>()((set, get) => ({
             session_id: state.activeSessionId ?? '',
             turn_id: '',
             role: 'assistant',
-            content: text,
+            content: { kind: 'text', text },
             seq: timeline.length,
             streaming: true
           }
           timeline = [...timeline, { kind: 'message', message: placeholder }]
         } else {
           const entry = timeline[idx] as { kind: 'message'; message: Message }
-          const updated = { ...entry.message, content: entry.message.content + text }
+          const updated = {
+            ...entry.message,
+            content: { ...entry.message.content, text: entry.message.content.text + text }
+          }
           timeline = timeline.slice()
           timeline[idx] = { kind: 'message', message: updated }
         }
@@ -204,9 +207,9 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         if (params.session_id !== sessionId) return
         set({ queue: params.items })
       }),
-      // permission.requested's PermissionRequest is assumed to carry session_id
-      // directly (see chatStore module doc / report: real shape TBD by A's
-      // Session/Worker module, not yet built as of this branch).
+      // permission.requested carries session_id directly — confirmed against
+      // `sessions/service.py`'s real broadcast (domain/types.ts's
+      // `PermissionRequest` doc comment has the full shape audit).
       transport.on('permission.requested', (raw) => {
         const request = raw as PermissionRequest
         if (request.session_id !== sessionId) return
@@ -215,7 +218,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       transport.on('permission.decided', (raw) => {
         const decision = raw as { request_id: string }
         set((state) => ({
-          pendingPermissions: state.pendingPermissions.filter((p) => p.id !== decision.request_id)
+          pendingPermissions: state.pendingPermissions.filter((p) => p.request_id !== decision.request_id)
         }))
       })
     ]
@@ -308,7 +311,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         session_id: activeSessionId,
         turn_id: res.result.turn_id,
         role: 'user',
-        content: trimmed,
+        content: { kind: 'text', text: trimmed },
         seq: get().timeline.length
       }
       set((state) => ({ timeline: upsertTimeline(state.timeline, { kind: 'message', message }) }))
@@ -321,7 +324,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     for (let i = timeline.length - 1; i >= 0; i -= 1) {
       const entry = timeline[i]
       if (entry?.kind === 'message' && entry.message.role === 'user') {
-        return get().send(entry.message.content)
+        return get().send(entry.message.content.text)
       }
     }
     return null
@@ -370,6 +373,8 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       set({ error: res.message ?? '审批提交失败' })
       return
     }
-    set((state) => ({ pendingPermissions: state.pendingPermissions.filter((p) => p.id !== requestId) }))
+    set((state) => ({
+      pendingPermissions: state.pendingPermissions.filter((p) => p.request_id !== requestId)
+    }))
   }
 }))

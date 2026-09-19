@@ -32,6 +32,7 @@ from jones_daemon.rpc.server import RpcServer
 from jones_daemon.secrets.vault import build_default_vault
 from jones_daemon.service import maybe_handle_cli
 from jones_daemon.sessions import methods as sessions_methods
+from jones_daemon.skills.methods import register as register_skills
 from jones_daemon.store import apply_pending, connect, run_in_db_thread
 
 logger = get_logger("main")
@@ -126,6 +127,7 @@ async def _run() -> None:
         register_config(server, ctx)
         register_projects(server, ctx)
         register_agents(server, ctx)
+        register_skills(server, ctx)
         session_service = sessions_methods.register(server, ctx)
         register_daemon_status(server, session_service)  # 02-w3-interfaces.md §2 集成收口 #2
         await session_service.startup()

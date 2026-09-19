@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 
 export type AppView = 'sessions' | 'settings'
-export type SettingsTab = 'provider' | 'agent' | 'project'
+export type SettingsTab = 'provider' | 'agent' | 'project' | 'capabilities'
 
 /** Top-level view/tab the shell is on. Deliberately separate from
  * `layoutStore` (pane open/closed is a persisted per-viewer preference;

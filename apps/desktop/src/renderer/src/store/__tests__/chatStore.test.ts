@@ -51,7 +51,7 @@ describe('chatStore', () => {
     const assistantMsg = state.timeline.find((e) => e.kind === 'message' && e.message.role === 'assistant')
     expect(assistantMsg).toBeDefined()
     if (assistantMsg?.kind === 'message') {
-      expect(assistantMsg.message.content.length).toBeGreaterThan(0)
+      expect(assistantMsg.message.content.text.length).toBeGreaterThan(0)
       expect(assistantMsg.message.streaming).toBe(false)
     }
     const step = state.timeline.find((e) => e.kind === 'step')
@@ -109,7 +109,7 @@ describe('chatStore', () => {
 
     await useChatStore.getState().send('/permission 危险动作')
     expect(useChatStore.getState().pendingPermissions).toHaveLength(1)
-    const requestId = useChatStore.getState().pendingPermissions[0]!.id
+    const requestId = useChatStore.getState().pendingPermissions[0]!.request_id
 
     await useChatStore.getState().decidePermission(requestId, 'allow')
 
@@ -130,7 +130,7 @@ describe('chatStore', () => {
     const state = useChatStore.getState()
     const userMessages = state.timeline.filter((e) => e.kind === 'message' && e.message.role === 'user')
     expect(userMessages).toHaveLength(2)
-    if (userMessages[1]?.kind === 'message') expect(userMessages[1].message.content).toBe('/error 网络中断')
+    if (userMessages[1]?.kind === 'message') expect(userMessages[1].message.content.text).toBe('/error 网络中断')
   })
 
   it('retryLastMessage() is a no-op when the timeline has no user message yet', async () => {
