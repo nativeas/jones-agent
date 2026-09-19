@@ -661,3 +661,9 @@ body {
 .replay-view__permission {
   opacity: 0.8;
 }
+
+.replay-view__truncated {
+  opacity: 0.7;
+  font-size: 0.85em;
+  margin-top: 2px;
+}

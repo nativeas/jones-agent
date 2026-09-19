@@ -63,6 +63,10 @@ daemon ── _on_request_permission ──┐
 - **`sessions/queries.py`/`sessions/methods.py` 不在 §0 表格任何一边的共享改动清单里**（表格只写了 `sessions/service.py` 的函数级划分），但两条分支都必须触碰它们才能实现各自的 RPC 方法；F 与 G 本轮加的函数完全不重叠（G：`update_step` 加 `payload_ref` 形参、`list_run_steps` 加分页、`mark_run_terminated` 加 `terminated_step_seq`、以及 `set_prompt_snapshot_ref`/`list_runs_with_payload_before`/`clear_run_payload_refs`/`get_agent_model_pref`/`list_runs_for_session` 全部新增；`run.list`/`run.payload` 注册 + `run.steps` 分页参数透传），未见冲突，按 DEV.md「先改文档后落地」的精神补记于此。
 - **`settings.payload_retention_days` 未写进 `config/resolver.py::DEFAULT_SETTINGS`**：那份默认值表是 C（#8/#9）的专属文件，本分支未触碰；`replay/retention.py::_retention_days` 直接对 `ctx.config.settings(None).get("payload_retention_days", 90)` 取值——`ConfigResolver.settings()` 本就是对磁盘 JSON 文件的无 schema 合并，用户在 `settings.json` 里手写这个 key 一样生效，只是不会出现在"即使两级都没有 settings.json 也保证存在"的默认值里。建议 C 在后续 PR 里把这个 key 补进 `DEFAULT_SETTINGS`，本分支不越界代为改动。
 
+### 2.2 第 1 轮评审修复带来的契约变更（2026-09-19）
+
+- **`run.steps` 响应新增 `permission_decision`/`permission_decided_by`**（PRD 12.1 G07）：原响应只有 `permission_id`——`permission_decisions` 表的主键，不是 allow/deny 结果本身——且没有任何 RPC 路径能把这个 id 换成实际裁决。`sessions/queries.py::list_run_steps` 现在 LEFT JOIN `permission_decisions ON permission_decisions.id = steps.permission_id`，把 `decision`（`pending`/`allow`/`deny`）与 `decided_by` 直接带在每个 Step 行上；未触发权限闸的 Step 两个新字段保持 NULL。纯新增字段，向后兼容，不改 `permission_id` 本身的含义。
+
 ## 3. 全体
 
 - 性能：规则闸零 IPC；审查闸纯计算 < 1ms；用户闸等待不占 worker CPU；回放 payload 写入异步、不阻塞 ACP 读循环。报告里给数字。

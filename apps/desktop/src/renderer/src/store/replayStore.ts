@@ -47,6 +47,12 @@ export interface ReplayStep {
   payload_ref: string | null
   duration_ms: number | null
   permission_id: string | null
+  // 审批结果 (PRD 12.1 G07 / 02-w3-interfaces.md §2 round-1 review fix) — the
+  // actual allow/deny outcome + who decided it, not just `permission_id` (that
+  // column is only the `permission_decisions` row's primary key). NULL when
+  // this Step never triggered a permission gate.
+  permission_decision: 'pending' | 'allow' | 'deny' | string | null
+  permission_decided_by: string | null
   status: 'running' | 'completed' | 'failed' | string
 }
 
@@ -58,16 +64,70 @@ interface RunPayloadResponse {
   eof: boolean
 }
 
-function decodePayload(res: RunPayloadResponse): string {
-  // atob is available in the renderer (browser-standard global) — no Node
-  // Buffer here, this runs with nodeIntegration: false (design §1).
-  const binary = atob(res.data_base64)
-  // `run.payload` is only ever used on the JSON/text payloads this codebase
-  // itself writes (replay/store.py — tool rawOutput / prompt snapshots), never
-  // arbitrary binary media, so UTF-8 text decoding is the right (and only)
-  // interpretation here.
-  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0))
-  return new TextDecoder('utf-8').decode(bytes)
+// Mirrors daemon `replay/store.py::CHUNK_THRESHOLD_BYTES` (02-w3-interfaces.md
+// §2: "大于 1MB 走分片 offset/limit"). Round-1 review fix: `loadPromptSnapshot`/
+// `loadStepPayload` used to call `run.payload` with no `offset`/`limit` at all
+// — the daemon happily reads the *entire* file to EOF and returns it in one
+// NDJSON frame regardless of size, so the chunking the contract requires was
+// implemented server-side and never exercised by the only caller. Every fetch
+// now goes through `fetchPayloadText` below, which pages with this `limit`.
+const CHUNK_BYTES = 1024 * 1024
+
+// A hard cap on how much of a payload this store will actually pull into
+// renderer memory/DOM for display, independent of the file's real size —
+// pagination alone (looping `offset`/`limit` until `eof`) still lets an
+// arbitrarily large payload get fully materialized as one giant string and
+// handed to a plain `<pre>` (not virtualized) if nothing ever stops the loop.
+// 8 MiB is generous for "read a tool's output while debugging a replay" while
+// keeping a pathological multi-hundred-MB `rawOutput` from hanging the
+// renderer — see the PR report's "评审关注点" for why display, not just
+// fetch, needed a bound here.
+const MAX_DISPLAY_BYTES = 8 * CHUNK_BYTES
+
+interface PayloadFetchResult {
+  text: string
+  truncated: boolean
+}
+
+async function fetchPayloadText(
+  transport: RpcTransport,
+  ref: string
+): Promise<PayloadFetchResult | { error: string }> {
+  const chunks: Uint8Array[] = []
+  let total = 0
+  let offset = 0
+  for (;;) {
+    const res = await transport.call<RunPayloadResponse>('run.payload', {
+      ref,
+      offset,
+      limit: CHUNK_BYTES
+    })
+    if (!res.ok || !res.result) return { error: res.message ?? '加载失败' }
+    const { data_base64, eof, size } = res.result
+    // atob is available in the renderer (browser-standard global) — no Node
+    // Buffer here, this runs with nodeIntegration: false (design §1).
+    const binary = atob(data_base64)
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0))
+    chunks.push(bytes)
+    total += bytes.length
+    offset += bytes.length
+    if (eof || total >= MAX_DISPLAY_BYTES) {
+      // Concatenate every chunk into one buffer *before* decoding — decoding
+      // chunk-by-chunk with a fresh `TextDecoder` per chunk would corrupt any
+      // multi-byte UTF-8 character that happened to straddle a chunk boundary.
+      const combined = new Uint8Array(total)
+      let pos = 0
+      for (const chunk of chunks) {
+        combined.set(chunk, pos)
+        pos += chunk.length
+      }
+      // `run.payload` is only ever used on the JSON/text payloads this codebase
+      // itself writes (replay/store.py — tool rawOutput / prompt snapshots),
+      // never arbitrary binary media, so UTF-8 text decoding is the right (and
+      // only) interpretation here.
+      return { text: new TextDecoder('utf-8').decode(combined), truncated: !eof && total < size }
+    }
+  }
 }
 
 interface ReplayState {
@@ -79,7 +139,9 @@ interface ReplayState {
   steps: ReplayStep[]
   cursor: number
   promptSnapshot: string | null
+  promptSnapshotTruncated: boolean
   payloadCache: Record<string, string>
+  payloadTruncated: Record<string, boolean>
   loading: boolean
   error: string | null
 
@@ -101,7 +163,9 @@ export const useReplayStore = create<ReplayState>()((set, get) => ({
   steps: [],
   cursor: 0,
   promptSnapshot: null,
+  promptSnapshotTruncated: false,
   payloadCache: {},
+  payloadTruncated: {},
   loading: false,
   error: null,
 
@@ -115,7 +179,9 @@ export const useReplayStore = create<ReplayState>()((set, get) => ({
       steps: [],
       cursor: 0,
       promptSnapshot: null,
+      promptSnapshotTruncated: false,
       payloadCache: {},
+      payloadTruncated: {},
       error: null
     })
     await get().refreshRuns()
@@ -196,22 +262,25 @@ export const useReplayStore = create<ReplayState>()((set, get) => ({
   async loadPromptSnapshot() {
     const { transport, run, promptSnapshot } = get()
     if (!transport || !run?.prompt_snapshot_ref || promptSnapshot !== null) return
-    const res = await transport.call<RunPayloadResponse>('run.payload', { ref: run.prompt_snapshot_ref })
-    if (!res.ok || !res.result) {
-      set({ error: res.message ?? '加载 prompt snapshot 失败' })
+    const result = await fetchPayloadText(transport, run.prompt_snapshot_ref)
+    if ('error' in result) {
+      set({ error: result.error })
       return
     }
-    set({ promptSnapshot: decodePayload(res.result) })
+    set({ promptSnapshot: result.text, promptSnapshotTruncated: result.truncated })
   },
 
   async loadStepPayload(ref) {
     const { transport, payloadCache } = get()
     if (!transport || ref in payloadCache) return
-    const res = await transport.call<RunPayloadResponse>('run.payload', { ref })
-    if (!res.ok || !res.result) {
-      set({ error: res.message ?? '加载 payload 失败' })
+    const result = await fetchPayloadText(transport, ref)
+    if ('error' in result) {
+      set({ error: result.error })
       return
     }
-    set((state) => ({ payloadCache: { ...state.payloadCache, [ref]: decodePayload(res.result!) } }))
+    set((state) => ({
+      payloadCache: { ...state.payloadCache, [ref]: result.text },
+      payloadTruncated: { ...state.payloadTruncated, [ref]: result.truncated }
+    }))
   }
 }))

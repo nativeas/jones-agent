@@ -450,22 +450,37 @@ def list_run_steps(
     (monotonic per Run — assigned by `_handle_tool_call_start`), `after_seq`/
     `limit` page forward through it. `after_seq=None` starts from the first Step;
     `limit=None` returns every remaining Step (small Runs — the common case —
-    don't need a second round trip)."""
+    don't need a second round trip).
+
+    LEFT JOINs `permission_decisions` on `steps.permission_id` and surfaces the
+    outcome as `permission_decision`/`permission_decided_by` on each row —
+    round-1 评审修复 (PRD 12.1 G07 / 02-w3-interfaces.md §2's "展示...审批结果"):
+    without this a caller only ever gets `permission_id`, the decision row's
+    *primary key*, with no way to read the actual allow/deny outcome back —
+    there was no RPC path to `permission_decisions` at all otherwise (that
+    table only ever gets written to, never read, everywhere else in this
+    module). A Step that never triggered a permission gate keeps both new
+    columns NULL (`permission_id IS NULL` -> the LEFT JOIN finds no match),
+    same as it always could for any other nullable column here."""
+    select = (
+        "SELECT s.*, pd.decision AS permission_decision, pd.decided_by AS permission_decided_by "
+        "FROM steps s LEFT JOIN permission_decisions pd ON pd.id = s.permission_id "
+    )
     if after_seq is not None and limit is not None:
         cur = conn.execute(
-            "SELECT * FROM steps WHERE run_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+            select + "WHERE s.run_id = ? AND s.seq > ? ORDER BY s.seq LIMIT ?",
             (run_id, after_seq, limit),
         )
     elif after_seq is not None:
         cur = conn.execute(
-            "SELECT * FROM steps WHERE run_id = ? AND seq > ? ORDER BY seq", (run_id, after_seq)
+            select + "WHERE s.run_id = ? AND s.seq > ? ORDER BY s.seq", (run_id, after_seq)
         )
     elif limit is not None:
         cur = conn.execute(
-            "SELECT * FROM steps WHERE run_id = ? ORDER BY seq LIMIT ?", (run_id, limit)
+            select + "WHERE s.run_id = ? ORDER BY s.seq LIMIT ?", (run_id, limit)
         )
     else:
-        cur = conn.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY seq", (run_id,))
+        cur = conn.execute(select + "WHERE s.run_id = ? ORDER BY s.seq", (run_id,))
     return _rows(cur)
 
 

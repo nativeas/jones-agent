@@ -189,18 +189,43 @@ app
     )
     if (!gotInputBar) return fail('session.create never produced a selected session with an input bar')
 
-    // Give the newly bound session's own initial `turn.messages`/`session.get`
-    // fetches (chatStore.ts's `bindSession()`) a moment to actually settle
-    // before sending — sending immediately can race a still-in-flight initial
-    // `turn.messages` call so its response (fetched a moment *after* this Turn's
-    // own Message row already exists) resolves to include the just-sent
-    // message too, alongside the optimistic local echo `send()` already added.
-    // Real users don't type+send within single-digit milliseconds of a session
-    // appearing; this wait keeps this test on the same "normal use" timing
-    // real usage exercises, not a synthetic edge race this issue's scope
-    // doesn't own (see the PR report's "评审关注点" for the underlying frontend
-    // bug this race would otherwise expose).
-    await new Promise((r) => setTimeout(r, 1000))
+    // Round-1 review fix: this used to be a blind `setTimeout(..., 1000)` — not
+    // a wait for any real signal, just a guessed constant papering over a race
+    // with `chatStore.ts`'s `bindSession()` (D/#5's file, not owned by this
+    // branch): its initial `turn.messages` fetch, if it resolves *after* the
+    // message below is sent and persisted, comes back carrying that same
+    // message in the daemon's real (object-shaped) `content` form —
+    // `MessageList.tsx:29` renders it as a raw string and crashes with no
+    // error boundary (white screen, PRD G08/N16 — this branch's own e2e job is
+    // supposed to gate exactly that, so waiting it out with a fixed timer
+    // instead of a real signal made this gate blind to its own failure mode).
+    // Filed as jones-agent#34 (MessageList/chatStore/domain/types.ts aren't
+    // this branch's files to fix — see docs/design/02-w3-interfaces.md §0).
+    //
+    // Deterministic-ish replacement: fetch the just-created session's id
+    // (`session.list`, read-only) and issue the *same* `turn.messages` RPC
+    // call `bindSession()` makes as part of binding it, then await it here
+    // too — both ride the one `window.jones.rpc` connection to the daemon,
+    // which answers requests on a connection in the order it reads them, so
+    // by the time this call's response lands, `bindSession()`'s own
+    // earlier-issued `turn.messages` request (fired the instant the session
+    // was selected, well before this script regains control from the click
+    // above) has already been answered too — for the overwhelmingly common
+    // interleaving, not provably every one (bindSession also awaits
+    // `session.subscribe`/`session.get` before its own `turn.messages` call;
+    // this doesn't pin down *that* ordering). Better than a constant nobody
+    // could justify the size of; not a substitute for fixing jones-agent#34.
+    const sessionId = await ev(`(async () => {
+      const res = await window.jones.rpc.call('session.list', {})
+      const s = (res.result || []).find((x) => !x.is_main)
+      return s ? s.id : null
+    })()`)
+    if (!sessionId) {
+      return fail('could not find the newly created (non-main) session via session.list')
+    }
+    await ev(
+      `window.jones.rpc.call('turn.messages', { session_id: ${JSON.stringify(sessionId)}, limit: 200 })`
+    )
 
     // 2. session.send — the daemon has no provider Key configured anywhere in
     //    this fresh JONES_HOME, so `_run_turn`'s provider pre-flight check

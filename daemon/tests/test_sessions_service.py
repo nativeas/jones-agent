@@ -843,3 +843,218 @@ async def test_send_to_first_message_delta_latency_measurement(tmp_path, monkeyp
         assert elapsed < 5.0
     finally:
         await service.shutdown()
+
+
+# -- 第 1 轮评审修复的新增测试 (docs/design/02-w3-interfaces.md §2, PR 报告"第 1 轮
+# 修复记录") -----------------------------------------------------------------
+
+
+async def test_run_steps_includes_the_steps_permission_decision(tmp_path, monkeypatch):
+    """G07 回放"审批结果" (PRD 12.1 / 02-w3-interfaces.md §2): `run.steps` used to
+    leave a caller with only `permission_id` — the `permission_decisions` row's
+    *primary key*, not the actual allow/deny outcome — and there was no RPC path
+    back to that row at all otherwise. `queries.list_run_steps` now LEFT JOINs
+    `permission_decisions` and surfaces `permission_decision`/
+    `permission_decided_by` directly on each Step row (ReplayView.tsx renders
+    those, not `permission_id`)."""
+
+    def _seed(conn):
+        session_id = "sess-g07"
+        queries.create_session(
+            conn, session_id=session_id, project_id=DEFAULT_PROJECT_ID,
+            agent_id=DEFAULT_AGENT_ID, parent_id=None, is_main=False, mode="task", title="g07",
+        )
+        queries.create_turn_and_user_message(
+            conn, turn_id="turn-g07", message_id="msg-g07", session_id=session_id,
+            text="x", queued=False,
+        )
+        queries.create_run(conn, run_id="run-g07", turn_id="turn-g07", session_id=session_id)
+        # Step 1: triggered a permission gate that was decided.
+        queries.insert_step(
+            conn, step_id="step-g07-decided", run_id="run-g07", seq=1, tool="risky_tool",
+            args={}, status="completed",
+        )
+        queries.insert_permission_decision(
+            conn, decision_id="dec-g07", step_id="step-g07-decided", gate="user",
+            risk="unclassified", request={"toolCall": {"toolCallId": "tc"}},
+        )
+        queries.decide_permission(conn, "dec-g07", decision="deny", decided_by="user")
+        # Step 2: never touched a permission gate at all — must not fabricate a
+        # decision for it (DEV.md 工程原则 #4 诚实失败).
+        queries.insert_step(
+            conn, step_id="step-g07-none", run_id="run-g07", seq=2, tool="quiet_tool",
+            args={}, status="completed",
+        )
+        return "run-g07"
+
+    service = await _make_service(tmp_path, monkeypatch)
+    run_id = await run_in_db_thread(_seed, service.ctx.db)
+
+    steps = await service.run_steps(run_id)
+    assert [s["id"] for s in steps] == ["step-g07-decided", "step-g07-none"]
+
+    decided, none = steps
+    assert decided["permission_id"] == "dec-g07"
+    assert decided["permission_decision"] == "deny"
+    assert decided["permission_decided_by"] == "user"
+
+    assert none["permission_id"] is None
+    assert none["permission_decision"] is None
+    assert none["permission_decided_by"] is None
+
+
+async def test_tool_call_update_serializes_raw_output_only_once(tmp_path, monkeypatch):
+    """性能修复 (02-w3-interfaces.md §3 "回放 payload 写入异步、不阻塞 ACP 读循环")：
+    `_handle_tool_call_update` used to `json.dumps(raw_output, ...)` once for the
+    truncated `result_summary`, then `_write_step_payload` dumped the very same
+    object a *second*, independent time — on the event loop thread, before ever
+    reaching `asyncio.to_thread` (CPython's C json encoder holds the GIL
+    regardless), roughly doubling the CPU the ACP read loop pays per
+    `tool_call_update` for a large payload. Counts only `json.dumps` calls whose
+    first argument *is* (identity, not equality) this test's own `raw_output`
+    object, so the assertion stays correct even with unrelated `json.dumps`
+    calls happening concurrently on other DB-thread writes."""
+    service = await _make_service(tmp_path, monkeypatch)
+    session_id = await service.ensure_main_session()
+
+    def _seed(conn):
+        queries.create_turn_and_user_message(
+            conn, turn_id="turn-ser", message_id="msg-ser", session_id=session_id,
+            text="x", queued=False,
+        )
+        queries.create_run(conn, run_id="run-ser", turn_id="turn-ser", session_id=session_id)
+
+    await run_in_db_thread(_seed, service.ctx.db)
+
+    from jones_daemon.sessions.service import _TurnContext  # noqa: PLC0415 - test-only import
+
+    ctx_turn = _TurnContext(turn_id="turn-ser", run_id="run-ser", session_id=session_id)
+    tool_call_id = "tc-ser"
+    await service._handle_tool_call_start(
+        ctx_turn,
+        {"toolCallId": tool_call_id, "title": "demo", "status": "pending", "rawInput": {}},
+    )
+
+    raw_output = {"big": "x" * 100}
+    real_dumps = json.dumps
+    calls = 0
+
+    def counting_dumps(obj, *args, **kwargs):
+        nonlocal calls
+        if obj is raw_output:
+            calls += 1
+        return real_dumps(obj, *args, **kwargs)
+
+    monkeypatch.setattr(json, "dumps", counting_dumps)
+
+    await service._handle_tool_call_update(
+        ctx_turn, {"toolCallId": tool_call_id, "status": "completed", "rawOutput": raw_output}
+    )
+    # The payload write is scheduled via `asyncio.create_task`, not awaited
+    # inline (see `_handle_tool_call_update`'s own comment) — wait for it.
+    tasks = list(service._background_tasks)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert calls == 1, f"json.dumps(raw_output, ...) ran {calls} times, expected exactly 1"
+
+    expected = real_dumps(raw_output, default=str, ensure_ascii=False)
+    step = await run_in_db_thread(
+        queries.get_step, service.ctx.db, ctx_turn.tool_call_steps[tool_call_id]
+    )
+    assert step["result_summary"] == expected[:4000]
+    assert step["payload_ref"] is not None
+    payload = await service.run_payload(step["payload_ref"])
+    assert base64.b64decode(payload["data_base64"]).decode("utf-8") == expected
+
+
+async def test_cwd_for_project_uses_the_real_projects_own_path(tmp_path, monkeypatch):
+    """02-w3-interfaces.md §2 集成收口 #1: the only existing test that touches
+    `_cwd_for_project` (`test_unexpected_exception_in_run_turn_still_terminates_
+    the_run`) monkeypatches it to raise — it exercises the failure-handling
+    path but never asserts what a *real*, non-default Project's own directory
+    resolves to, which is the entire point of this collapse item (replacing a
+    hardcoded home-directory special case with `ProjectService.get()`)."""
+    from jones_daemon.projects.service import ProjectService  # noqa: PLC0415
+
+    service = await _make_service(tmp_path, monkeypatch)
+    other_dir = tmp_path / "other-project"
+    other_dir.mkdir()
+    project = await run_in_db_thread(ProjectService(service.ctx.db).create, str(other_dir))
+    assert project["id"] != DEFAULT_PROJECT_ID
+
+    cwd = await service._cwd_for_project(project["id"])
+    assert cwd == str(other_dir.resolve())
+
+    default_cwd = await service._cwd_for_project(DEFAULT_PROJECT_ID)
+    assert default_cwd != cwd
+
+
+async def test_run_turn_writes_prompt_snapshot_ref_into_the_runs_row(tmp_path, monkeypatch):
+    """FR06 回放 (02-w3-interfaces.md §2): `test_replay_store.py` only unit-tests
+    `write_prompt_snapshot` writing a file — nothing asserted that `_run_turn`
+    actually persists the resulting ref onto `runs.prompt_snapshot_ref` (a
+    best-effort write that only logs on failure, exactly the kind of code whose
+    most likely failure mode is silently never running at all, not raising)."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="snap")
+        await service.send(session_id, "hello there")
+        await _wait_until(
+            lambda: any(
+                m in ("run.terminated", "message.completed")
+                for _sid, m, _p in service.ctx.server.broadcasts
+            )
+        )
+        run_id = (await service.get(session_id))["latest_turn"]["run_id"]
+        run_row = await service.run_get(run_id)
+        assert run_row["prompt_snapshot_ref"] is not None
+        assert run_row["prompt_snapshot_ref"].startswith(f"{run_id}/")
+
+        snapshot = await service.run_payload(run_row["prompt_snapshot_ref"])
+        decoded = json.loads(base64.b64decode(snapshot["data_base64"]))
+        assert decoded["run_id"] == run_id
+        assert decoded["user_message"] == "hello there"
+    finally:
+        await service.shutdown()
+
+
+async def test_daemon_status_reports_real_active_sessions_and_worker_counts(tmp_path, monkeypatch):
+    """02-w3-interfaces.md §2 集成收口 #2: `test_rpc.py`'s `daemon.status` test
+    only ever exercises `register_builtin_methods`'s honest-zero placeholder (it
+    never calls `register_daemon_status`) — nothing asserted that the live
+    `sessions_active`/`workers` counts `register_daemon_status` wires up actually
+    move off zero for a real running Turn/worker, only that the placeholder
+    stays zero forever."""
+    from jones_daemon.rpc.methods import register_daemon_status  # noqa: PLC0415
+    from jones_daemon.rpc.server import RpcServer  # noqa: PLC0415
+
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    server = RpcServer(None)
+    register_daemon_status(server, service)
+    handler = server._methods["daemon.status"]
+    try:
+        idle = await handler({}, None)
+        assert idle["sessions_active"] == 0
+        assert idle["workers"] == 0
+
+        session_id = await _new_session(service, title="status")
+        await service.send(session_id, "SLEEP_MS:300 hello there")
+        await _wait_until(lambda: service.active_turn_session_ids() != [])
+
+        busy = await handler({}, None)
+        assert busy["sessions_active"] == 1
+        assert busy["workers"] >= 1
+
+        await _wait_until(
+            lambda: any(m == "run.terminated" or m == "message.completed"
+                        for _sid, m, _p in service.ctx.server.broadcasts),
+            timeout=5,
+        )
+        await _wait_until(lambda: service.active_turn_session_ids() == [])
+        after = await handler({}, None)
+        assert after["sessions_active"] == 0
+    finally:
+        await service.shutdown()

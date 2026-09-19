@@ -856,17 +856,29 @@ class SessionService:
         if started is not None and status in ("completed", "failed"):
             duration_ms = int((time.monotonic() - started) * 1000)
         result_summary = None
+        dumped_output: str | None = None
         if raw_output is not None:
-            # Truncated text summary for quick UI rendering — the full-fidelity
-            # copy goes to `replay/store.py` below (FR06, 02-w3-interfaces.md §2).
-            result_summary = json.dumps(raw_output, default=str, ensure_ascii=False)[:4000]
+            # Serialize `raw_output` exactly once. Round-1 review fix: this used
+            # to be dumped twice — once here (truncated to 4000 chars for
+            # `result_summary`) and again, independently, inside
+            # `_write_step_payload` — and the second dump ran on *this* event
+            # loop thread, before ever reaching `asyncio.to_thread` (CPython's C
+            # json encoder holds the GIL throughout, so moving it into a thread
+            # later doesn't give the loop a chance to run anything else while it
+            # dumps). For a large tool `rawOutput` that roughly doubled the CPU
+            # the ACP read loop pays per `tool_call_update` — exactly the cost
+            # 02-w3-interfaces.md §3's "回放 payload 写入异步、不阻塞 ACP 读循环"
+            # is about. `dumped_output` (the one dump) feeds both the truncated
+            # summary and the full-fidelity payload below.
+            dumped_output = json.dumps(raw_output, default=str, ensure_ascii=False)
+            result_summary = dumped_output[:4000]
         row = await run_in_db_thread(
             queries.update_step, self.ctx.db, step_id,
             status=status, result_summary=result_summary, duration_ms=duration_ms,
         )
         if status in ("completed", "failed"):
             await self.ctx.server.broadcast(ctx_turn.session_id, "step.completed", row)
-        if raw_output is not None and status in ("completed", "failed"):
+        if dumped_output is not None and status in ("completed", "failed"):
             # Scheduled, not awaited: `_on_session_update` runs inline on
             # `AcpClient._read_loop`'s await chain (kernel/acp_client.py awaits
             # `on_session_update` for every incoming line before reading the
@@ -876,19 +888,22 @@ class SessionService:
             # (DEV.md 工程原则 #4) since nothing awaits this task's result.
             seq = ctx_turn.step_seq_by_id.get(step_id, ctx_turn.step_seq)
             task = asyncio.create_task(
-                self._write_step_payload(ctx_turn.run_id, step_id, seq, raw_output)
+                self._write_step_payload(ctx_turn.run_id, step_id, seq, dumped_output)
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
 
     async def _write_step_payload(
-        self, run_id: str, step_id: str, seq: int, raw_output: Any
+        self, run_id: str, step_id: str, seq: int, dumped_output: str
     ) -> None:
         """FR06 回放 full-fidelity Step payload (02-w3-interfaces.md §2) —
         background write scheduled by `_handle_tool_call_update`, see its
-        docstring comment for why this must never be awaited inline there."""
+        docstring comment for why this must never be awaited inline there.
+
+        Takes the already-`json.dumps`-ed text (not the raw object) — see that
+        same comment for why this must not re-serialize it a second time."""
         try:
-            data = json.dumps(raw_output, default=str, ensure_ascii=False).encode("utf-8")
+            data = dumped_output.encode("utf-8")
             ref = await asyncio.to_thread(
                 replay_store.write_payload, self.ctx.paths.user_root(), run_id, seq, data, "json"
             )

@@ -8,6 +8,15 @@ const TERMINATED_KIND_LABEL: Record<string, string> = {
   budget: '预算终止'
 }
 
+// G07 审批结果 (PRD 12.1 / 02-w3-interfaces.md §2 round-1 review fix): labels
+// for `steps.permission_decision`, not `permission_id` (that's just the
+// `permission_decisions` row's primary key, never meant for display).
+const PERMISSION_DECISION_LABEL: Record<string, string> = {
+  pending: '待裁决',
+  allow: '通过',
+  deny: '拒绝'
+}
+
 function formatArgs(args: unknown): string {
   if (args == null) return '—'
   try {
@@ -19,6 +28,7 @@ function formatArgs(args: unknown): string {
 
 function StepPayload({ step }: { step: ReplayStep }): JSX.Element | null {
   const payloadCache = useReplayStore((s) => s.payloadCache)
+  const payloadTruncated = useReplayStore((s) => s.payloadTruncated)
   const loadStepPayload = useReplayStore((s) => s.loadStepPayload)
   if (!step.payload_ref) return null
   const text = payloadCache[step.payload_ref]
@@ -29,7 +39,12 @@ function StepPayload({ step }: { step: ReplayStep }): JSX.Element | null {
           加载完整输出
         </button>
       ) : (
-        <pre className="replay-view__pre">{text}</pre>
+        <>
+          <pre className="replay-view__pre">{text}</pre>
+          {payloadTruncated[step.payload_ref] && (
+            <div className="replay-view__truncated">仅显示前 8MB，完整内容更大</div>
+          )}
+        </>
       )}
     </div>
   )
@@ -38,6 +53,7 @@ function StepPayload({ step }: { step: ReplayStep }): JSX.Element | null {
 function PromptSnapshotPanel(): JSX.Element | null {
   const run = useReplayStore((s) => s.run)
   const promptSnapshot = useReplayStore((s) => s.promptSnapshot)
+  const promptSnapshotTruncated = useReplayStore((s) => s.promptSnapshotTruncated)
   const loadPromptSnapshot = useReplayStore((s) => s.loadPromptSnapshot)
   if (!run?.prompt_snapshot_ref) return null
   return (
@@ -46,7 +62,10 @@ function PromptSnapshotPanel(): JSX.Element | null {
       {promptSnapshot === null ? (
         <button onClick={() => void loadPromptSnapshot()}>加载</button>
       ) : (
-        <pre className="replay-view__pre">{promptSnapshot}</pre>
+        <>
+          <pre className="replay-view__pre">{promptSnapshot}</pre>
+          {promptSnapshotTruncated && <div className="replay-view__truncated">仅显示前 8MB，完整内容更大</div>}
+        </>
       )}
     </div>
   )
@@ -168,7 +187,12 @@ export function ReplayView({
               )}
               <StepPayload step={step} />
               <div className="replay-view__permission">
-                审批：{step.permission_id ? step.permission_id : '未触发权限闸'}
+                审批：
+                {step.permission_id
+                  ? `${PERMISSION_DECISION_LABEL[step.permission_decision ?? ''] ?? step.permission_decision ?? '待裁决'}${
+                      step.permission_decided_by ? ` · ${step.permission_decided_by}` : ''
+                    }`
+                  : '未触发权限闸'}
               </div>
             </div>
           )}
