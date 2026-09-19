@@ -1,0 +1,18 @@
+# Jones Step-level pre_tool_call gate (docs/design/00-foundation.md §7/§8.2, W2 skeleton).
+#
+# Only `pre_tool_call` is registered. `post_tool_call` is deliberately not used: the
+# design doc's own review of that question concluded the tool-call *result* already
+# has an event-sourced record via ACP `session/update` tool_call_update events, so a
+# plugin-side post hook would just be a second, redundant channel for the same data
+# (00-foundation.md §2: "step 记录以 ACP session/update 的 tool call 事件为事实源，
+# 插件不另开通道").
+name: jones_gate
+version: "0.1.0"
+description: >-
+  Jones Step-level permission gate (W2 skeleton). Blocks the reserved startup-probe
+  tool name; approves everything else and hands the real wait off to Hermes's own
+  request_tool_approval() -> ACP session/request_permission round trip. Rule/review
+  gate logic lands in W3 (FR05).
+author: "Jones Agent"
+hooks:
+  - pre_tool_call
