@@ -15,10 +15,12 @@ import os
 import signal
 import sqlite3
 import sys
+import types
 from typing import TextIO
 
 from jones_daemon import paths
 from jones_daemon.logging import configure_logging, get_logger
+from jones_daemon.providers import methods as providers_methods
 from jones_daemon.rpc.methods import register_builtin_methods
 from jones_daemon.rpc.server import RpcServer
 from jones_daemon.store import apply_pending, connect, run_in_db_thread
@@ -93,6 +95,12 @@ async def _run() -> None:
 
         server = RpcServer(paths.sock_file())
         register_builtin_methods(server)
+        # Temporary stand-in for the shared `DaemonContext` (docs/design/01-w2-interfaces.md §1,
+        # owned by branch A, not yet landed in this worktree) — `providers_methods.register()`
+        # only reads `ctx.db`, so a minimal namespace carrying that one attribute is enough to
+        # wire provider.*/model.list up now rather than leaving them unreachable until §1 lands.
+        # Replace with the real `DaemonContext` once it exists; no other call site changes.
+        providers_methods.register(server, types.SimpleNamespace(db=conn))
         await server.start()
         logger.info(
             "daemon listening",

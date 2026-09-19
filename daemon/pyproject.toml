@@ -3,7 +3,10 @@ name = "jones-daemon"
 version = "0.1.0"
 description = "Jones Agent local daemon (RPC server, storage, session/worker orchestration)"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "cryptography>=50.0.1",
+    "keyring>=25.7.0",
+]
 
 [dependency-groups]
 dev = [
