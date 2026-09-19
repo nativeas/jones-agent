@@ -165,6 +165,20 @@ class Vault:
     def names(self) -> list[str]:
         return list(self._read_entries())
 
+    def reset(self, entries: dict[str, str]) -> None:
+        """Discard whatever is on disk — even if it's corrupt JSON or no longer decrypts with the
+        current data key — and start a brand new vault containing exactly `entries`. Unlike
+        `set`/`delete`, this never calls `_read_entries()`, so it works precisely when they can't
+        (round 1 review: a vault that fails `_read_entries()` — corrupt file, or a Keychain data
+        key that no longer matches, e.g. after `jones-agent/vault-key` was deleted or the machine
+        was migrated without it — used to permanently lock `provider.set_key`/`delete_key` behind
+        `VaultError` with no way back in). This is the explicit, opt-in recovery path callers use
+        for that: every entry the old vault held (for every provider, not just the one being set)
+        is unrecoverable and permanently gone after this call — callers must only reach this after
+        telling the user so (see `providers/methods.py`'s `force` param).
+        """
+        self._write_entries(entries)
+
 
 def build_default_vault(secrets_dir: Path) -> Vault:
     """`Vault` at the standard `<user_root>/secrets/vault.enc` location.

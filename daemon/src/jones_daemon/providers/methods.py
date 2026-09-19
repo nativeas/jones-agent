@@ -21,9 +21,9 @@ from typing import Any
 from jones_daemon import paths
 from jones_daemon.providers.catalog import VENDORS
 from jones_daemon.providers.resolver import DaemonProviderResolver, ProviderNotConfiguredError
-from jones_daemon.rpc.errors import INVALID_PARAMS, NOT_FOUND, RpcError
+from jones_daemon.rpc.errors import INVALID_PARAMS, NOT_FOUND, PROVIDER_ERROR, RpcError
 from jones_daemon.rpc.server import Connection, RpcServer
-from jones_daemon.secrets.vault import Vault, build_default_vault
+from jones_daemon.secrets.vault import Vault, VaultError, build_default_vault
 from jones_daemon.store import run_in_db_thread
 
 _MAX_KEY_LENGTH = 4096
@@ -70,13 +70,65 @@ def _query_provider_rows(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
     return {row["name"]: row for row in rows}
 
 
-def _write_provider_key(conn: sqlite3.Connection, vault: Vault, vendor: str, key: str) -> str:
+def _write_provider_key(
+    conn: sqlite3.Connection, vault: Vault, vendor: str, key: str, *, force: bool = False
+) -> str:
     """Vault first, then the `providers` row — so a crash between the two steps can only ever
     leave `has_key=0` with an orphaned (harmless) vault entry, never `has_key=1` pointing at a
     key that was never actually written (see resolver.py's db/vault-out-of-sync check, which
     exists as the second line of defense for the same reason).
+
+    Round 1 review: a `vault.enc` that `_read_entries()` can no longer read (corrupt file, or a
+    Keychain data key that no longer matches) used to make `vault.set()` raise `VaultError` on
+    every future `provider.set_key` call, forever — the *only* way in for BYOK (PRD §46) locked
+    shut with no recovery. Without `force`, that failure is now reported as a clear
+    `PROVIDER_ERROR` instead of a bare `INTERNAL_ERROR`; with `force=True`, the caller has already
+    been told this discards the old vault, so `vault.reset()` bypasses the read that just failed
+    and starts a fresh one containing only `vendor`'s key.
+
+    Round 2 review: the destructive "clear every other provider's `has_key`" UPDATE used to run
+    *before* `vault.reset()`, on this module's long-lived shared connection. If `reset()` itself
+    then raised (the data key being unavailable — not just unreadable ciphertext — fails it the
+    same way `vault.set()` just failed), that UPDATE was left sitting in an implicitly-open
+    transaction (`store/db.py::connect()` uses sqlite3's default isolation, so the first DML opens
+    one) with no rollback anywhere in this call stack, and got silently committed by the *next*,
+    completely unrelated `_write_provider_key`/`_clear_provider_key` call's `conn.commit()`. The
+    fix is ordering: only touch `providers` once `reset()` has actually succeeded, and if it still
+    fails, roll back before reporting — there is nothing to roll back to since we haven't written
+    anything, but a future DML added to this branch must not inherit an open transaction either.
     """
-    vault.set(vendor, key)
+    try:
+        vault.set(vendor, key)
+    except VaultError as exc:
+        if not force:
+            raise RpcError(
+                PROVIDER_ERROR,
+                f"the credential vault could not be read ({exc}); it may be corrupted or its "
+                "encryption key no longer matches. Resubmit provider.set_key with force=true to "
+                "discard it and start a fresh vault — every previously stored provider key will "
+                "need to be re-entered",
+                {"vendor": vendor, "vault_unreadable": True},
+            ) from exc
+        try:
+            vault.reset({vendor: key})
+        except VaultError as reset_exc:
+            conn.rollback()
+            raise RpcError(
+                PROVIDER_ERROR,
+                f"the credential vault could not be rewritten even with force=true ({reset_exc}); "
+                "its data encryption key itself is unavailable (e.g. the OS keychain backend "
+                "cannot be reached), which force cannot recover from — no provider keys were "
+                "changed",
+                {"vendor": vendor, "vault_unreadable": True},
+            ) from reset_exc
+        # Only now that the fresh vault (holding only `vendor`'s key) is actually on disk does
+        # `providers` get to agree with it — every other provider's `has_key` must drop to 0, or
+        # `providers` would keep claiming keys exist that no longer do anywhere (exactly the
+        # "db/vault out of sync" state resolver.py refuses to guess through).
+        conn.execute(
+            "UPDATE providers SET has_key = 0, key_hint = NULL, updated_at = ? WHERE name != ?",
+            (_now_iso(), vendor),
+        )
     hint = _key_hint(key)
     now = _now_iso()
     existing = conn.execute("SELECT id FROM providers WHERE name = ?", (vendor,)).fetchone()
@@ -100,13 +152,30 @@ def _clear_provider_key(conn: sqlite3.Connection, vault: Vault, vendor: str) -> 
     """`providers` row first, then the vault — the opposite order from `_write_provider_key`,
     deliberately: a crash here can only leave a stray vault entry behind a `has_key=0` row
     (harmless — resolver.py never reaches the vault when `has_key` is false), never the reverse.
+
+    Round 1 review: if the vault can't be read at all, `vault.delete()` used to raise a bare
+    `VaultError` that reached the RPC layer as `INTERNAL_ERROR` with no actionable message — even
+    though the `providers` row above had already committed `has_key=0`, i.e. the entire
+    externally-visible contract of `delete_key` already held. Report it as `PROVIDER_ERROR` with a
+    human message instead (there's nothing to force-reset here: unlike `set_key`, the recovery
+    path is "set any provider's key with force=true", which this same corrupt vault already
+    supports).
     """
     conn.execute(
         "UPDATE providers SET has_key = 0, key_hint = NULL, updated_at = ? WHERE name = ?",
         (_now_iso(), vendor),
     )
     conn.commit()
-    vault.delete(vendor)
+    try:
+        vault.delete(vendor)
+    except VaultError as exc:
+        raise RpcError(
+            PROVIDER_ERROR,
+            f"provider marked as not configured, but its stored key could not be removed from "
+            f"the credential vault ({exc}); the leftover entry is harmless on its own — set a new "
+            "key for any provider with force=true to discard the vault entirely",
+            {"vendor": vendor, "vault_unreadable": True},
+        ) from exc
 
 
 def _make_provider_list(conn: sqlite3.Connection):
@@ -132,7 +201,8 @@ def _make_provider_set_key(conn: sqlite3.Connection, vault: Vault):
     async def handler(params: dict[str, Any], _conn: Connection) -> dict:
         vendor = _require_vendor(params.get("provider"))
         key = _require_key(params.get("key"))
-        hint = await run_in_db_thread(_write_provider_key, conn, vault, vendor, key)
+        force = bool(params.get("force"))
+        hint = await run_in_db_thread(_write_provider_key, conn, vault, vendor, key, force=force)
         return {"provider": vendor, "has_key": True, "key_hint": hint}
 
     return handler

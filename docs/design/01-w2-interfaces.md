@@ -86,6 +86,31 @@ Anthropic/OpenAI/DeepSeek/Qwen(DashScope)/Gemini 五家都在 Hermes 内置的 `
 会过时，刷新留给 W5"BYOK 六厂商收口"）；Ollama 走本地 `GET http://localhost:11434/api/tags` 实时探测
 （探测不到本地服务时返回空列表，不报错——见 `resolver.py::_ollama_live_models`）。
 
+### 3.2 `model_pref` 形状（B ↔ C ↔ A 的真实接口，第 1 轮评审后补，2026-09-19）
+
+`ProviderResolver.resolve(model_pref: dict | None)` 的 `model_pref` 不是任意 dict——`resolver.py::
+DaemonProviderResolver._select_vendor` 认定它是：
+
+```python
+{"provider": str, "model": str | None}   # 两个键名都不能改，resolver.py 按这两个键取值
+```
+
+- 来源：`agents.model_pref_json`（`00-foundation.md` §5 schema，C 的 `agents/` 落地时写入）反
+  序列化后原样传给 `resolve()`；A 的 `WorkerManager` 拉起 worker 前调用 `resolve(agent.model_pref)`
+  也是同一份字典，不做转换。
+- `{}`（`001_init.sql:27` 的默认值）和 `None` 走同一条路径：`if model_pref:` 判假（空 dict 在
+  Python 里是 falsy），落到"用户默认厂商"分支——`VENDOR_PRIORITY` 里第一个 `has_key=1` 的厂商；
+  没有任何厂商配置 Key 时抛 `ProviderNotConfiguredError`（已实现，见 `resolver.py::_select_vendor`
+  与 `tests/test_providers_resolver.py` 里 `model_pref=None`/`{}` 的用例）。
+- `provider` 键值必须是 `catalog.VENDORS` 的键之一（`anthropic | openai | deepseek | qwen |
+  gemini | ollama`）；给别的值（包括空字符串）`resolve()` 会抛 `ProviderNotConfiguredError(f"unknown
+  provider '{vendor}'")`——**响亮地失败，但如果 C 按别的键名（例如 `{"vendor": ..., "model_id":
+  ...}`）写 `model_pref_json`，这条失败要到集成阶段才会被发现**；这正是本节存在的原因：C 写
+  `agent.upsert`/`agent/config.py` 序列化 `model_pref` 时，键名必须是 `provider`/`model`，不是
+  `vendor`/`model_id` 或其它命名。
+- `model` 键可省略或为 `None`/空字符串——`resolve()` 落到该厂商的 `providers.default_model`（db）
+  或 `VendorSpec.default_model`（catalog 兜底）。
+
 ## 4. C：Project / Agent / 配置合并（#8 #9）
 
 ```python
