@@ -177,6 +177,35 @@ def test_reconcile_conditional_builtin_absence_is_not_drift():
     assert entry.actually_loaded is False
 
 
+def test_reconcile_no_drift_for_ordinary_machine_without_browser_cli():
+    """Round-2 review finding #1: a real Hermes checkout (`ee44529`), run for
+    real on an ordinary machine (no `agent-browser` CLI installed, no MCP
+    servers) via `model_tools.get_tool_definitions(enabled_toolsets=
+    ['hermes-acp'], skip_tool_search_assembly=True)`, assembled exactly
+    `BUILTIN_TOOLS - CONDITIONAL_BUILTIN_TOOLS` — the entire routed/direct
+    `browser_*` surface `check_browser_requirements()` gates (`browser_
+    navigate/snapshot/click/type/scroll/back/press/get_images/vision/
+    console`) plus `browser_exec` was ABSENT from the real schema, not just
+    the `browser_cdp`/`browser_dialog`/`browser_vault_*`/`manage_connections`
+    handful the set held before this fix. Reproduces that exact input and
+    requires an empty drift — this is the "手推名单未经真实运行时验证" gap the
+    prior round's report flagged, now closed."""
+    expected = registry.expected_capabilities(mode="auto", tool_allowlist=[])
+    actual = sorted(set(registry.BUILTIN_TOOLS) - registry._policy.CONDITIONAL_BUILTIN_TOOLS)
+    result = registry.reconcile(expected, actual)
+    assert result.drift == []
+    hidden_browser = {
+        "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
+        "browser_scroll", "browser_back", "browser_press", "browser_get_images",
+        "browser_vision", "browser_console", "browser_exec",
+    }
+    assert hidden_browser <= registry._policy.CONDITIONAL_BUILTIN_TOOLS
+    for name in hidden_browser:
+        entry = next(t for t in result.tools if t.name == name)
+        assert entry.enabled is True
+        assert entry.actually_loaded is False
+
+
 def test_reconcile_still_flags_drift_when_a_core_builtin_never_loads():
     """The other direction R-H1 keeps: a tool with no environment dependency
     (not in `CONDITIONAL_BUILTIN_TOOLS`) that's expected enabled but never

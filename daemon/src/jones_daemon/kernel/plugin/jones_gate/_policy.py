@@ -96,10 +96,25 @@ BUILTIN_TOOLS: tuple[str, ...] = (
 # `check_fn` for each tool below (grep `check_fn=` under `tools/*.py`, then
 # read each function): these are the `BUILTIN_TOOLS` names whose presence in
 # the model's REAL assembled schema depends on a Hermes subsystem Jones does
-# not (yet, or ever, for v1) configure — a browser profile (`browser_cdp`/
-# `browser_dialog`/the five `browser_vault_*` tools all gate on
-# `check_browser_requirements()`, which is J/#15-16's browser capability, not
-# yet wired on this branch), the connector gateway (`manage_connections` ->
+# not (yet, or ever, for v1) configure — a browser profile (`tools/
+# browser_tool_install.py::check_browser_requirements()`, which is J/#15-16's
+# browser capability, not yet wired on this branch, gates the ENTIRE
+# `browser_*` surface, not just the vault/cdp/dialog corner: `browser_cdp`/
+# `browser_dialog`/the five `browser_vault_*` tools check it directly
+# (`browser_cdp_tool.py`/`browser_vault_tool.py`); `browser_get_images`/
+# `browser_console` check it directly too (`browser_tool.py`'s
+# `_BROWSER_TOOL_TABLE`); `browser_vision` checks
+# `check_browser_vision_requirements()`, which calls it first; and
+# `browser_navigate`/`browser_snapshot`/`browser_click`/`browser_type`/
+# `browser_scroll`/`browser_back`/`browser_press` route through
+# `check_browser_routed_requirements()` = `check_browser_requirements() or
+# extension_controller_available(action)` — still `False` on an ordinary
+# machine with neither the `agent-browser` CLI nor a routed browser
+# extension attached. `browser_exec` is gated the other way round
+# (`tools/browser_use_cli.py::is_browser_use_cli_mode`, `check_fn=` on its
+# `registry.register` call) but is equally absent outside that one non-default
+# mode, so it belongs in this set for the same "not realistically in the
+# schema by default" reason), the connector gateway (`manage_connections` ->
 # `tools/connections_tool.py::_connectors_available()`), a configured web
 # search backend/API key (`web_search`/`web_extract` -> `check_web_api_key()`
 # — see 03-w4-interfaces.md §4's "深度调研" note that this needs a Key via B's
@@ -114,6 +129,17 @@ BUILTIN_TOOLS: tuple[str, ...] = (
 # `TERMINAL_ENV=local` checker) — their absence from a real worker's assembled
 # schema would be a genuine anomaly, not routine.
 #
+# Round-2 review finding #1 (2026-09-19): a real Hermes checkout
+# (`ee44529`), run for real with `model_tools.get_tool_definitions(
+# enabled_toolsets=['hermes-acp'], skip_tool_search_assembly=True)` on an
+# ordinary machine (no `agent-browser` CLI installed), assembled exactly the
+# 25 names this set now predicts as absent minus itself (36 `BUILTIN_TOOLS` -
+# 11 conditional = 25) would NOT include — i.e. every one of the 10 routed/
+# direct `browser_*` names above showed up as real drift before this fix,
+# because only `manage_connections`/`browser_cdp`/`browser_dialog`/the five
+# `browser_vault_*` names were listed here; `browser_exec` was already
+# absent from that real run too (no Browser Use CLI mode configured).
+#
 # Used by `capabilities/registry.py::reconcile()` (controller ruling R-H1) so
 # a completely ordinary Jones deployment — no browser profile, no connectors,
 # no search key configured yet — doesn't manufacture G21 `daemon.error` noise
@@ -126,6 +152,10 @@ CONDITIONAL_BUILTIN_TOOLS: frozenset[str] = frozenset(
         "browser_cdp", "browser_dialog",
         "browser_vault_list", "browser_vault_unlock", "browser_vault_fill",
         "browser_vault_save_login", "browser_vault_enter_code",
+        "browser_navigate", "browser_snapshot", "browser_click",
+        "browser_type", "browser_scroll", "browser_back", "browser_press",
+        "browser_get_images", "browser_vision", "browser_console",
+        "browser_exec",
     }
 )
 

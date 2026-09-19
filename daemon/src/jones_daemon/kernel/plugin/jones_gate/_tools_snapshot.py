@@ -68,7 +68,8 @@ proving what got REALLY assembled (G21). `get_tool_definitions` takes a
 `model_tools.py:709`, to get the real per-tool catalog for its own purposes)
 — passed `True` below to get the raw, unfolded tool list instead.
 
-## `mcp_discovery_complete` (review round-2 finding #3)
+## `mcp_discovery_complete` (review round-2 finding #3, and its round-2
+## follow-up: join BEFORE reading names, not after)
 
 MCP discovery is asynchronous (`acp_adapter/entry.py` starts it on a
 background thread at worker startup; `ensure_mcp_discovery_before_agent_build`
@@ -91,6 +92,24 @@ bool` in the written payload. Best-effort, same as everything else in this
 hook: unimportable or erroring `hermes_cli.mcp_startup` records `False` (never
 `True`) — "can't tell" must never be read downstream as "confirmed done",
 since that's the one claim `McpServerState` requires real evidence for.
+
+**Ordering** (round-2 review finding #2): `join_mcp_discovery(timeout=1.0)`
+runs FIRST, before either `mcp_names` or `names` is read even once. The
+original code computed `names` (which internally read
+`get_registered_mcp_server_names()` to build `enabled_toolsets`), THEN read
+`mcp_names` a second time for the payload, and only THEN joined — so a probe
+Turn that lands while discovery is still in flight but finishes inside that
+same 1-second join produced the worst combination: `mcp_servers=[]`/`tools`
+missing the late server's tools (both computed from the stale pre-join read)
+paired with `mcp_discovery_complete=True` (computed from the post-join state)
+— a snapshot that looks complete but isn't, which is exactly the false
+"confirmed down" `capabilities/methods.py` §"mcp_discovery_complete" section
+above says must never happen. `get_registered_mcp_server_names()` is now
+called exactly ONCE, after the join, and that one result is reused for both
+`enabled_toolsets`/`_compute_tool_names` and the `mcp_servers` field — all
+three payload fields (`tools`, `mcp_servers`, `mcp_discovery_complete`) are
+now evaluated from the same point in time, after discovery has had its one
+chance to finish.
 """
 
 from __future__ import annotations
@@ -109,14 +128,21 @@ def _hermes_home() -> Path | None:
     return Path(home) if home else None
 
 
-def _compute_tool_names() -> list[str] | None:
+def _registered_mcp_server_names() -> list[str]:
+    """The single read point for `get_registered_mcp_server_names()` — see
+    module docstring's "Ordering" section: callers must call this exactly
+    once, AFTER `_mcp_discovery_complete()`'s join, and reuse the one result
+    for every field of the payload so `tools`/`mcp_servers`/
+    `mcp_discovery_complete` all describe the same point in time."""
     try:
         from tools.mcp_tool_discovery import get_registered_mcp_server_names
 
-        mcp_names = sorted(get_registered_mcp_server_names())
+        return sorted(get_registered_mcp_server_names())
     except Exception:
-        mcp_names = []
+        return []
 
+
+def _compute_tool_names(mcp_names: list[str]) -> list[str] | None:
     enabled_toolsets = list(
         dict.fromkeys(["hermes-acp", *(f"mcp-{name}" for name in mcp_names if name)])
     )
@@ -180,20 +206,22 @@ def on_session_start(session_id: str = "", **_kwargs: Any) -> None:
         home = _hermes_home()
         if home is None:
             return
-        names = _compute_tool_names()
+        # Round-2 review finding #2: join FIRST, read names exactly once,
+        # AFTER the join — see module docstring's "Ordering" section. Reusing
+        # one `mcp_names` read for both `_compute_tool_names` and the
+        # `mcp_servers` field keeps all three payload fields consistent with
+        # each other (no field computed from a pre-join snapshot next to one
+        # computed post-join).
+        discovery_complete = _mcp_discovery_complete()
+        mcp_names = _registered_mcp_server_names()
+        names = _compute_tool_names(mcp_names)
         if names is None:
             return
-        try:
-            from tools.mcp_tool_discovery import get_registered_mcp_server_names
-
-            mcp_names = sorted(get_registered_mcp_server_names())
-        except Exception:
-            mcp_names = []
         payload = {
             "session_id": session_id,
             "tools": names,
             "mcp_servers": mcp_names,
-            "mcp_discovery_complete": _mcp_discovery_complete(),
+            "mcp_discovery_complete": discovery_complete,
             "written_at": time.time(),
         }
         target = home / _FILE_NAME

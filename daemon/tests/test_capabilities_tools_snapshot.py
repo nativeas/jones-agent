@@ -109,6 +109,42 @@ def test_on_session_start_records_discovery_incomplete_when_unimportable(
     assert written["mcp_discovery_complete"] is False
 
 
+def test_on_session_start_joins_discovery_before_reading_mcp_names(
+    tmp_path, monkeypatch, _fake_hermes_modules
+):
+    """Review round-2 finding #2: the original code read `mcp_names`/computed
+    `tools` BEFORE joining discovery, and only called `_mcp_discovery_complete`
+    (which itself joins) afterwards — so a server that finishes registering
+    DURING that 1s join was invisible in `tools`/`mcp_servers` while
+    `mcp_discovery_complete` still came back `True`, a snapshot that looks
+    complete but isn't. Simulates exactly that: `mcp_servers` is empty and
+    discovery is in flight until `join_mcp_discovery` is actually called, at
+    which point the "echo" server (and its tool) becomes visible — the fixed
+    hook must join FIRST, so the one `mcp_names` read it makes already sees
+    "echo", and `tools`/`mcp_servers`/`mcp_discovery_complete` all agree."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _fake_hermes_modules["mcp_servers"] = []
+    _fake_hermes_modules["discovery_in_flight"] = True
+
+    def _join(timeout=None):
+        # The join is what makes the late-arriving server actually show up —
+        # mirrors a real slow MCP handshake completing inside the wait.
+        _fake_hermes_modules["discovery_in_flight"] = False
+        _fake_hermes_modules["mcp_servers"] = ["echo"]
+        return True
+
+    import sys as _sys
+
+    _sys.modules["hermes_cli.mcp_startup"].join_mcp_discovery = _join
+
+    _tools_snapshot.on_session_start(session_id="s1")
+    written = json.loads((tmp_path / "jones_tools.json").read_text(encoding="utf-8"))
+    assert written["mcp_discovery_complete"] is True
+    # Must NOT be the pre-join empty read — the whole point of joining first.
+    assert written["mcp_servers"] == ["echo"]
+    assert "mcp__echo__ping" in written["tools"]
+
+
 def test_on_session_start_expands_enabled_toolsets_with_connected_mcp_servers(
     tmp_path, monkeypatch, _fake_hermes_modules
 ):
