@@ -29,9 +29,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from jones_daemon.context import DaemonContext
 from jones_daemon.context import ProviderResolver as ProviderResolverProtocol
@@ -163,5 +166,52 @@ async def test_stop_sends_acp_cancel_while_a_terminal_call_is_pending_approval(
         await _wait_until(lambda: service.ctx.server.events("run.terminated"))
         terminated = service.ctx.server.events("run.terminated")[0][1]
         assert terminated["kind"] == "user"
+    finally:
+        await service.shutdown()
+
+
+async def test_cancel_reaps_a_real_subprocess_spawned_by_the_worker_and_reports_the_pid(
+    tmp_path, monkeypatch
+):
+    """Controller ruling R-I2 (round 3, 2026-09-19): splits G09's remaining
+    open item into its two independently provable halves. The test above
+    proves the daemon actually SENDS `session/cancel` when it should — this
+    one proves that once an ACP agent that owns a real OS child process
+    receives that cancel, the child is actually gone afterward — the "reap"
+    half real Hermes's own subprocess-killing code (`tools/environments/
+    base.py::_kill_process_group_posix`, SIGTERM then SIGKILL) is
+    responsible for, which this module's other test can't exercise because
+    `fake_acp_agent.py`'s ordinary modes never spawn a real subprocess at
+    all. `fake_acp_agent.py`'s `SPAWN_REAL_SUBPROCESS_TERMINAL` marker
+    starts a real `sleep 30`, reports it as an in-flight `terminal`
+    tool_call, blocks until `session/cancel` arrives, kills the child, and
+    reports the pid it killed in the `tool_call_update`'s `rawOutput` —
+    still not a real Hermes process (that remains `JONES_E2E`-gated, see
+    module docstring), but a real OS-level kill/reap this sandbox CAN prove
+    without an `ANTHROPIC_API_KEY`."""
+    service = await _make_service(tmp_path, monkeypatch)
+    try:
+        session_id = await _new_session(service, mode="task")
+        await service.send(session_id, "SPAWN_REAL_SUBPROCESS_TERMINAL")
+        await _wait_until(lambda: service.ctx.server.events("step.started"))
+
+        result = await service.stop(session_id)
+        assert result["stopped"] is True
+
+        await _wait_until(lambda: service.ctx.server.events("step.completed"))
+        completed = service.ctx.server.events("step.completed")[-1][1]
+        summary = json.loads(completed["result_summary"])
+        # `cancelled` is False only if the fake agent's own 10s wait for
+        # `session/cancel` timed out — would mean the daemon's cancel never
+        # reached it, a real bug this assertion is here to catch, not a
+        # value this test should treat as an acceptable alternative.
+        assert summary["cancelled"] is True
+        pid = summary["killed_pid"]
+
+        # The pid `fake_acp_agent.py` reports killing must actually be gone
+        # — the G09 "no orphan process" proof this module's other test
+        # can't give on its own (it never owns a real subprocess to check).
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
     finally:
         await service.shutdown()

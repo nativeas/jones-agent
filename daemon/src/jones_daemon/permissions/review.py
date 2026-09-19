@@ -204,7 +204,12 @@ def _workspace_root_too_wide(root: Path) -> bool:
 
 
 def _classify_path_access(
-    path: Any, *, cwd: str | None, verb: str, escalate_too_wide_workspace: bool = True
+    path: Any,
+    *,
+    cwd: str | None,
+    verb: str,
+    escalate_too_wide_workspace: bool = True,
+    check_credential_filename: bool = False,
 ) -> Risk:
     """Shared "which real filesystem location does this touch" reasoning for
     both a write-family call (`_classify_write`) and, since Issue #13/#14
@@ -227,7 +232,19 @@ def _classify_path_access(
     task/auto mode — a direct violation of PRD 9.1's "任务模式：只读工具直接
     放行" and G06 (see `_classify_read`'s `directory_scope` parameter for
     which callers pass which value, and why `search_files` keeps the
-    escalation on)."""
+    escalation on).
+
+    Controller ruling R-I1 (round 3, 2026-09-19): `check_credential_filename`
+    — `read_file` only (see `classify()`) — adds one more tier BELOW the
+    sensitive-directory/escapes-workspace `high` checks and ABOVE the plain
+    `low` default: a path whose bare filename matches `permissions/
+    defaults.py::is_credential_filename` (`id_rsa`, `.env`, `*.pem`, …) is
+    `medium`, not `low`, even though it isn't under any denylisted
+    directory — the filename alone is a real, if weaker, credential signal
+    (ruling text: "凭据类文件名模式...→ medium（走审查闸→用户闸）；其余读
+    → low"). Checked last (after the workspace-boundary checks above), since
+    a path that already escapes the workspace is `high` regardless of its
+    name, and a path inside the workspace has nothing else left to check."""
     if not isinstance(path, str) or not path:
         return _medium(f"{verb} tool call with no resolvable path")
     try:
@@ -274,16 +291,26 @@ def _classify_path_access(
             "default Project's cwd is $HOME until real Project paths land, review "
             "findings #7/#9)"
         )
-    if _is_relative_to(resolved, root):
-        return _low(f"path {path!r} is inside the project workspace")
-    return _high(f"path {path!r} escapes the project workspace ({cwd!r}) — FR07's 越界路径走权限闸")
+    if not _is_relative_to(resolved, root):
+        return _high(
+            f"path {path!r} escapes the project workspace ({cwd!r}) — FR07's 越界路径走权限闸"
+        )
+    if check_credential_filename and defaults.is_credential_filename(resolved.name):
+        return _medium(
+            f"path {path!r} has a credential-shaped filename (id_*, *.pem, .env, "
+            "*token*, *secret*, known_hosts, …) — controller ruling R-I1; stop and "
+            "confirm even though it isn't under a denylisted directory"
+        )
+    return _low(f"path {path!r} is inside the project workspace")
 
 
 def _classify_write(path: Any, *, cwd: str | None) -> Risk:
     return _classify_path_access(path, cwd=cwd, verb="write-family")
 
 
-def _classify_read(path: Any, *, cwd: str | None, directory_scope: bool) -> Risk:
+def _classify_read(
+    path: Any, *, cwd: str | None, directory_scope: bool, check_credential_filename: bool = False
+) -> Risk:
     """Issue #13/#14 (G15): `read_file`/`search_files` used to be
     unconditionally `_low` (via `_READ_ONLY_LOW`) regardless of `path` — a
     sensitive-path read (or one outside the Project workspace, FR07's "越界
@@ -329,7 +356,11 @@ def _classify_read(path: Any, *, cwd: str | None, directory_scope: bool) -> Risk
     if not isinstance(path, str) or not path:
         return _medium("read-family tool call with no resolvable path")
     return _classify_path_access(
-        path, cwd=cwd, verb="read-family", escalate_too_wide_workspace=directory_scope
+        path,
+        cwd=cwd,
+        verb="read-family",
+        escalate_too_wide_workspace=directory_scope,
+        check_credential_filename=check_credential_filename,
     )
 
 
@@ -656,7 +687,17 @@ def classify(tool_name: str, args: dict[str, Any] | None, *, cwd: str | None = N
         path = args.get("path")
         if not isinstance(path, str) or not path:
             path = "."
-        return _classify_read(path, cwd=cwd, directory_scope=tool_name == "search_files")
+        return _classify_read(
+            path,
+            cwd=cwd,
+            directory_scope=tool_name == "search_files",
+            # Controller ruling R-I1 (round 3): the credential-filename tier
+            # is `read_file`-only — `search_files`'s `path` names a directory
+            # ROOT being recursively walked, not the single file being
+            # disclosed, so a filename-pattern match on it wouldn't mean
+            # what it means for `read_file`.
+            check_credential_filename=tool_name == "read_file",
+        )
     if tool_name in ("write_file", "patch"):
         return _classify_write(args.get("path"), cwd=cwd)
     if tool_name == "terminal":

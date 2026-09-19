@@ -242,6 +242,88 @@ def test_read_file_under_home_placeholder_normal_file_is_low(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# Unit: permissions/defaults.py::is_credential_filename() + review.py::
+# classify() — controller ruling R-I1 (round 3, 2026-09-19): a credential-
+# SHAPED filename earns `medium` (walks the review gate -> user gate) even
+# when it isn't under any `SENSITIVE_HOME_RELATIVE_DIRS`/`SENSITIVE_ABSOLUTE_
+# DIRS` denylist root — the ruling's own three test categories.
+# ---------------------------------------------------------------------------
+
+
+def test_is_credential_filename_matches_ruling_r_i1_patterns():
+    for name in (
+        ".env", ".env.local", "id_rsa", "id_ed25519.pub", "server.pem", "client.key",
+        "cert.p12", "cert.pfx", "vault.kdbx", ".netrc", ".npmrc", ".pypirc",
+        ".git-credentials", "known_hosts", "authorized_keys", "api_token.txt",
+        "SECRET.yaml", "db_credential.json",
+    ):
+        assert defaults.is_credential_filename(name), name
+
+
+def test_is_credential_filename_does_not_match_ordinary_names():
+    for name in ("main.py", "README.md", "a.txt", "index.html", "identity.py"):
+        assert not defaults.is_credential_filename(name), name
+
+
+def test_read_file_dotenv_under_home_placeholder_is_medium(tmp_path, monkeypatch):
+    # Ruling R-I1's first repro: `~/.env` isn't under any directory denylist
+    # root, but the filename alone is a credential signal — `medium`, not
+    # `low` (would auto-allow in task/auto mode with no user-gate stop) and
+    # not `high`/deny (it's a name-only signal, weaker than a denylist hit).
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("read_file", {"path": str(tmp_path / ".env")}, cwd=str(tmp_path))
+    assert risk.level == "medium"
+
+
+def test_read_file_id_rsa_outside_denylist_dir_is_medium(tmp_path, monkeypatch):
+    # Ruling R-I1's second repro: `~/proj/id_rsa` — `proj/` is an ordinary
+    # project directory, not `~/.ssh`, so the directory denylist doesn't fire;
+    # the `id_*` filename pattern is what has to catch it.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("read_file", {"path": str(tmp_path / "proj" / "id_rsa")}, cwd=str(tmp_path))
+    assert risk.level == "medium"
+
+
+def test_read_file_ordinary_document_under_home_placeholder_stays_low(tmp_path, monkeypatch):
+    # Ruling R-I1's third repro: `~/Documents/a.txt` matches neither the
+    # directory denylist nor a credential filename pattern — PRD 9.1's "任务
+    # 模式：只读工具直接放行" still has to hold for this one.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify(
+        "read_file", {"path": str(tmp_path / "Documents" / "a.txt")}, cwd=str(tmp_path)
+    )
+    assert risk.level == "low"
+
+
+def test_read_file_credential_filename_via_relative_path_resolves_against_cwd(
+    tmp_path, monkeypatch
+):
+    # Ruling R-I1: "相对路径按 cwd 解析后再判" — a relative `path` must be
+    # resolved against `cwd` BEFORE the filename check runs, not judged on
+    # its literal unresolved text.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("read_file", {"path": "id_rsa"}, cwd=str(tmp_path / "proj"))
+    assert risk.level == "medium"
+
+
+def test_search_files_credential_looking_root_is_unaffected_by_r_i1(tmp_path, monkeypatch):
+    # R-I1 is scoped to `read_file` only (see `classify()`'s comment) —
+    # `search_files`'s `path` names a directory ROOT being recursively
+    # walked, not the single file being disclosed, so a directory whose own
+    # NAME happens to match a credential pattern (here, a dir literally
+    # called `id_rsa`) must not be escalated by this ruling — only `low` (no
+    # other risk signal applies) proves the check truly didn't run for it.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    workspace = tmp_path / "workspace"
+    target = workspace / "id_rsa"
+    target.mkdir(parents=True)
+    risk = classify(
+        "search_files", {"path": str(target), "pattern": "*"}, cwd=str(workspace)
+    )
+    assert risk.level == "low"
+
+
+# ---------------------------------------------------------------------------
 # Unit: permissions/review.py::classify() — terminal touching a sensitive path
 # ---------------------------------------------------------------------------
 

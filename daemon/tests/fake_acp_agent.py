@@ -61,6 +61,21 @@ Behavior is selected via the `FAKE_ACP_MODE` env var (default "normal"):
   `"default"` — exercises `AcpClient.new_session()`'s startup self-check
   (Issue #11 round-1 review finding #6, docs/design/02-w3-interfaces.md
   §1.2).
+- "SPAWN_REAL_SUBPROCESS_TERMINAL" marker (pure addition, "normal" mode
+  only, same pattern as "USE_TOOL"/`CUSTOM_PERMISSION_JSON`): controller
+  ruling R-I2 (round 3, 2026-09-19, Issue #14/G09) — this fake agent starts
+  a REAL OS child process (`sleep 30`) for a `terminal` tool_call, exactly
+  like real Hermes's own `tools/environments/base.py` would for an actual
+  shell command, then BLOCKS until a `session/cancel` notification arrives
+  for this session — simulating the daemon-side half of G09
+  (`test_cap_terminal_stop_cancel.py`) actually reaching a worker that owns
+  a live subprocess. On cancel, it kills the child (SIGTERM then, if still
+  alive after a grace period, SIGKILL — the same two-stage shape real
+  Hermes's `_kill_process_group_posix` uses) and reports the pid it killed
+  in the `tool_call_update`'s `rawOutput` (`{"killed_pid": ..., "reaped":
+  true}`) — the daemon-side test asserts that pid no longer exists
+  (`os.kill(pid, 0)` -> `ProcessLookupError`), which is what a fake agent
+  with no real subprocess (this file's other modes) could never prove.
 """
 
 from __future__ import annotations
@@ -68,6 +83,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -81,6 +97,11 @@ _GATE_BLOCK_MARKER = "jones_gate startup self-check: this tool is reserved and n
 
 _stdout_lock = threading.Lock()
 _cancelled_sessions: set[str] = set()
+# Controller ruling R-I2 (round 3): one `threading.Event` per session
+# currently blocked inside `_handle_spawn_subprocess_terminal`, waiting for
+# THIS session's `session/cancel` — set from the dispatch loop's reader
+# thread (below), waited on from the per-prompt handler thread.
+_cancel_events: dict[str, threading.Event] = {}
 _next_id = [1000]  # outgoing (agent-initiated) request ids, boxed for the closure below
 
 
@@ -192,6 +213,41 @@ def _handle_custom_permission_prompt(session_id: str, text: str) -> None:
     )
 
 
+_SPAWN_SUBPROCESS_MARKER = "SPAWN_REAL_SUBPROCESS_TERMINAL"
+
+
+def _handle_spawn_subprocess_terminal(session_id: str) -> None:
+    """Controller ruling R-I2 (round 3, 2026-09-19, Issue #14/G09): spawn a
+    REAL OS child (`sleep 30`), report it as an in-flight `terminal`
+    tool_call, then block until `session/cancel` arrives for THIS session —
+    on cancel, kill the child and report the pid killed. See this module's
+    docstring for the full contract; `test_cap_terminal_stop_cancel.py` is
+    the only caller."""
+    tool_call_id = "term-subproc-1"
+    proc = subprocess.Popen(["sleep", "30"])
+    _send_update(
+        session_id,
+        {"sessionUpdate": "tool_call", "toolCallId": tool_call_id, "title": "terminal",
+         "status": "pending", "rawInput": {"command": "sleep 30"}},
+    )
+    ev = threading.Event()
+    _cancel_events[session_id] = ev
+    got_cancel = ev.wait(10.0)
+    _cancel_events.pop(session_id, None)
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+    _send_update(
+        session_id,
+        {"sessionUpdate": "tool_call_update", "toolCallId": tool_call_id, "title": "terminal",
+         "status": "failed",
+         "rawOutput": {"killed_pid": proc.pid, "reaped": True, "cancelled": got_cancel}},
+    )
+
+
 def _handle_normal_prompt(session_id: str, text: str) -> None:
     _send_update(
         session_id,
@@ -251,6 +307,8 @@ def _handle_normal_prompt(session_id: str, text: str) -> None:
         )
     if _CUSTOM_PERMISSION_MARKER in text:
         _handle_custom_permission_prompt(session_id, text)
+    if _SPAWN_SUBPROCESS_MARKER in text:
+        _handle_spawn_subprocess_terminal(session_id)
 
 
 _pending_responses: dict[int, dict] = {}
@@ -337,6 +395,9 @@ def _dispatch_loop() -> None:
                 session_id = params.get("sessionId")
                 if session_id:
                     _cancelled_sessions.add(session_id)
+                    ev = _cancel_events.get(session_id)
+                    if ev is not None:
+                        ev.set()
             # Unknown incoming methods are ignored — this double only needs to
             # answer what kernel/acp_client.py actually sends.
             continue

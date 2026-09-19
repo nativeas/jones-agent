@@ -287,3 +287,50 @@ RECURSIVE_ESCALATES_TO_HIGH_PROGRAMS: frozenset[str] = frozenset({"chmod", "chow
 # directory argument needs the reverse "does it CONTAIN a sensitive root"
 # check at all, not to change `dd`'s data-destructive handling above.
 RECURSIVE_TRAVERSAL_PROGRAMS: frozenset[str] = frozenset({"find", "tar", "zip"})
+
+
+# ---------------------------------------------------------------------------
+# Controller ruling R-I1 (round 3, 2026-09-19): credential-shaped FILENAME
+# patterns — a second, deliberately distinct tier from the sensitive-
+# DIRECTORY denylist above. Ruling text (verbatim): "此外凭据类文件名模式
+# （*.pem *.key *.p12 *.pfx id_* *.kdbx .env .env.* .netrc .npmrc .pypirc
+# .git-credentials *token* *secret* *credential* known_hosts
+# authorized_keys）→ medium（走审查闸→用户闸）；其余读 → low". A file like
+# `~/proj/id_rsa` or `~/.env` doesn't sit under any `SENSITIVE_HOME_RELATIVE_
+# DIRS` root (it can live anywhere the workspace happens to reach) — the
+# NAME alone is the only signal available, and it's a weaker one than "this
+# IS a known secrets location" (a directory denylist hit), so it earns a
+# stop-and-confirm (`medium`, review gate -> user gate) rather than the
+# denylist's unconditional `high`/deny. `permissions/review.py::
+# _classify_read` is the only caller (`read_file` only, per the ruling's own
+# title — `search_files`'s `path` argument is a directory root, not the
+# single file being disclosed, and is unaffected by this ruling).
+# ---------------------------------------------------------------------------
+
+CREDENTIAL_FILENAME_EXACT: frozenset[str] = frozenset({
+    ".env", ".netrc", ".npmrc", ".pypirc", ".git-credentials",
+    "known_hosts", "authorized_keys",
+})
+CREDENTIAL_FILENAME_PREFIXES: tuple[str, ...] = (".env.", "id_")
+CREDENTIAL_FILENAME_SUFFIXES: tuple[str, ...] = (".pem", ".key", ".p12", ".pfx", ".kdbx")
+CREDENTIAL_FILENAME_SUBSTRINGS: tuple[str, ...] = ("token", "secret", "credential")
+
+
+def is_credential_filename(name: str) -> bool:
+    """`name` is a bare filename (`Path.name`, e.g. from an already-resolved
+    path — not a full path, this only ever looks at the last component).
+    Case-folded before every comparison (same APFS case-insensitivity
+    rationale as `_casefold()` above — and just sensible for a name pattern
+    regardless of filesystem). Implements ruling R-I1's exact pattern list;
+    `id_*`/`*token*`/`*secret*`/`*credential*` are deliberately broad
+    (matches e.g. `id_rsa.pub`, `api_token.txt`) — that breadth is the
+    ruling's own choice, not something this function narrows on its own
+    judgment."""
+    lowered = name.lower()
+    if lowered in CREDENTIAL_FILENAME_EXACT:
+        return True
+    if lowered.startswith(CREDENTIAL_FILENAME_PREFIXES):
+        return True
+    if lowered.endswith(CREDENTIAL_FILENAME_SUFFIXES):
+        return True
+    return any(marker in lowered for marker in CREDENTIAL_FILENAME_SUBSTRINGS)
