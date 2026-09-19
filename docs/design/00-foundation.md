@@ -417,6 +417,20 @@ worker 侧接线（`capabilities/browser.py::browser_worker_config(ctx, session)
       event loop——`browser_worker_config` 现在直接是 `async def`，内部自己做
       `asyncio.to_thread(manager.ensure_started)`，调用方不需要（也不应该）自己
       再包一层。
+  - **并发串行化（第三轮评审 finding #12，round-2 只做完了上一条，没做这一条）**：
+      `asyncio.to_thread` 派发到真实线程池，不是协作式调度——两个 Session 并发
+      走 `browser_worker_config` 时，会有两个真实 OS 线程同时进入
+      `get_browser_manager`/`ensure_started()`。round-2 的版本在这里留了一句
+      过期的文档「daemon 单事件循环天然串行，RPC handler 不会在不同 OS 线程上并发
+      跑同一个 manager」——这句话被同一次改动（把这个函数改成 `async` + `to_thread`）
+      自己证伪了，却一直留到 round-3 评审指出才删掉。`capabilities/browser.py`
+      现在用 `_MANAGERS_LOCK`（保护 `get_browser_manager` 的建表 check-then-set）
+      + `BrowserManager._lock`（保护 `ensure_started()` 整个方法体，含 `_launch()`）
+      两把锁把这条并发路径重新变回串行：两个线程谁先拿到锁谁先跑完
+      `ensure_started()`，另一个要么复用它刚启动的活 Chrome，要么（Chrome 还没起来时）
+      排队等它，不会再出现「各自造一个 manager」「后一个 `_launch()` 删掉前一个的
+      `DevToolsActivePort`」「两个真 Chrome 撞同一个 `--user-data-dir` 单实例锁」
+      这三种竞态（见 `capabilities/browser.py` 两处锁的 docstring）。
   - **懒启动的触发时机（控制者裁定 R-J4）**：不允许在 worker spawn 时无条件调用
       这个函数（会给每个 Session 弹一个可见 Chrome 窗口，不管这个 Session 的
       Agent 有没有启用任何 `browser_*` 工具）。推荐的触发点：`sessions/

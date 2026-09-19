@@ -45,6 +45,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -197,10 +198,24 @@ SpawnFn = Callable[..., subprocess.Popen]
 
 class BrowserManager:
     """Owns the single Jones-dedicated Chrome process for one profile directory.
-    Not thread-safe by itself; callers serialize through `get_browser_manager`'s
-    module-level cache + the daemon's single-threaded asyncio event loop (RPC
-    handlers never run concurrently against the same manager on separate OS
-    threads today — see report "并发" note if that changes)."""
+
+    **Round-2 review finding #12**: the previous version of this docstring
+    claimed callers "serialize through the daemon's single-threaded asyncio
+    event loop (RPC handlers never run concurrently ... on separate OS
+    threads today)" — that was already false the moment `browser_worker_config`
+    became `async def` (controller ruling R-J4) and started running its blocking
+    work via `asyncio.to_thread(manager.ensure_started)`: two sessions racing
+    `browser_worker_config` concurrently now genuinely dispatch to
+    `ensure_started()` on separate OS threads, at the same time the
+    single-threaded-event-loop claim was describing as impossible. `self._lock`
+    (below) is what actually makes this safe now — `ensure_started()` holds it
+    for its entire body, so two concurrent callers serialize into "one launches,
+    the other reuses the live handle" instead of racing `_launch()` (which would
+    otherwise: possibly construct two `BrowserManager`s for the same profile via
+    `get_browser_manager`'s check-then-set — see `_MANAGERS_LOCK` there; delete
+    each other's `DevToolsActivePort` file via `_launch()`'s
+    `unlink(missing_ok=True)`; or spawn two real Chrome processes against the
+    same `--user-data-dir` and collide on Chrome's own single-instance lock)."""
 
     def __init__(
         self,
@@ -219,6 +234,10 @@ class BrowserManager:
         # subprocess.Popen-like object supporting .pid/.poll()/.wait()/.terminate()/.kill().
         self._spawn: SpawnFn = spawn or subprocess.Popen
         self._handle: BrowserHandle | None = None
+        # Round-2 review finding #12: serializes `ensure_started()` across OS
+        # threads (see class docstring above for why this is now load-bearing,
+        # not defensive).
+        self._lock = threading.Lock()
 
     @property
     def profile_dir(self) -> Path:
@@ -233,45 +252,53 @@ class BrowserManager:
 
     def ensure_started(self) -> BrowserHandle:
         """Idempotent: reuse a live handle, reattach to a live orphan (profile
-        survived a daemon crash — see module docstring), or launch fresh."""
-        if self.is_alive():
-            assert self._handle is not None
-            return self._handle
+        survived a daemon crash — see module docstring), or launch fresh.
 
-        self._profile_dir.mkdir(parents=True, exist_ok=True)
-        self._profile_dir.chmod(0o700)
+        Round-2 review finding #12: holds `self._lock` for the whole body —
+        `browser_worker_config`'s `asyncio.to_thread(manager.ensure_started)`
+        means two Sessions can now call this on the SAME manager from two
+        different OS threads at once; without the lock both could pass the
+        `is_alive()` check as False concurrently and both fall through to
+        `_launch()` (see class docstring for the failure modes that opens up)."""
+        with self._lock:
+            if self.is_alive():
+                assert self._handle is not None
+                return self._handle
 
-        existing = _read_devtools_active_port(self._profile_dir)
-        if existing is not None and _probe_cdp_alive(existing[0]):
-            port, ws_path = existing
-            # Review finding #10: recover a real pid so `shutdown()` can still
-            # gracefully SIGTERM this Chrome later — without it, this instance
-            # would have no way to ever signal a process it didn't spawn.
-            recovered_pid = _read_singleton_lock_pid(self._profile_dir)
-            if recovered_pid is None:
-                logger.warning(
-                    "browser: reattached to a live orphan Chrome but could not recover "
-                    "its pid from SingletonLock — shutdown() will not be able to signal "
-                    "it (review finding #10)",
-                    extra={"detail": {"profile_dir": str(self._profile_dir)}},
+            self._profile_dir.mkdir(parents=True, exist_ok=True)
+            self._profile_dir.chmod(0o700)
+
+            existing = _read_devtools_active_port(self._profile_dir)
+            if existing is not None and _probe_cdp_alive(existing[0]):
+                port, ws_path = existing
+                # Review finding #10: recover a real pid so `shutdown()` can still
+                # gracefully SIGTERM this Chrome later — without it, this instance
+                # would have no way to ever signal a process it didn't spawn.
+                recovered_pid = _read_singleton_lock_pid(self._profile_dir)
+                if recovered_pid is None:
+                    logger.warning(
+                        "browser: reattached to a live orphan Chrome but could not recover "
+                        "its pid from SingletonLock — shutdown() will not be able to signal "
+                        "it (review finding #10)",
+                        extra={"detail": {"profile_dir": str(self._profile_dir)}},
+                    )
+                logger.info(
+                    "browser: reattached to a live orphan Chrome",
+                    extra={
+                        "detail": {
+                            "profile_dir": str(self._profile_dir),
+                            "port": port,
+                            "recovered_pid": recovered_pid,
+                        }
+                    },
                 )
-            logger.info(
-                "browser: reattached to a live orphan Chrome",
-                extra={
-                    "detail": {
-                        "profile_dir": str(self._profile_dir),
-                        "port": port,
-                        "recovered_pid": recovered_pid,
-                    }
-                },
-            )
-            self._handle = BrowserHandle(
-                pid=recovered_pid if recovered_pid is not None else -1,
-                profile_dir=self._profile_dir, port=port, ws_path=ws_path, process=None,
-            )
-            return self._handle
+                self._handle = BrowserHandle(
+                    pid=recovered_pid if recovered_pid is not None else -1,
+                    profile_dir=self._profile_dir, port=port, ws_path=ws_path, process=None,
+                )
+                return self._handle
 
-        return self._launch()
+            return self._launch()
 
     def _launch(self) -> BrowserHandle:
         active_port_file = self._profile_dir / _DEVTOOLS_ACTIVE_PORT_FILE
@@ -449,6 +476,13 @@ class _terminate_best_effort:
 
 
 _MANAGERS: dict[Path, BrowserManager] = {}
+# Round-2 review finding #12: guards `_MANAGERS`'s check-then-set below against
+# two Sessions calling `browser_worker_config` concurrently (it dispatches to
+# this function from `asyncio.to_thread`, i.e. real separate OS threads) —
+# without it, two threads could both observe `_MANAGERS.get(profile_dir) is
+# None` and each construct + install its own `BrowserManager` for the same
+# profile_dir, defeating the "one Chrome per install" cache entirely.
+_MANAGERS_LOCK = threading.Lock()
 
 
 def get_browser_manager(user_root: Path, **kwargs: object) -> BrowserManager:
@@ -456,11 +490,12 @@ def get_browser_manager(user_root: Path, **kwargs: object) -> BrowserManager:
     §9) — a process-wide cache so every session's `browser_worker_config` call
     reuses the same Chrome instead of each one trying to own its own."""
     profile_dir = Path(user_root) / "browser" / "profile"
-    manager = _MANAGERS.get(profile_dir)
-    if manager is None:
-        manager = BrowserManager(profile_dir, **kwargs)  # type: ignore[arg-type]
-        _MANAGERS[profile_dir] = manager
-    return manager
+    with _MANAGERS_LOCK:
+        manager = _MANAGERS.get(profile_dir)
+        if manager is None:
+            manager = BrowserManager(profile_dir, **kwargs)  # type: ignore[arg-type]
+            _MANAGERS[profile_dir] = manager
+        return manager
 
 
 def shutdown_all(*, timeout_s: float = DEFAULT_SHUTDOWN_TIMEOUT_S) -> None:
@@ -525,8 +560,11 @@ async def browser_worker_config(ctx: object, session: object = None) -> dict:
     `review.py`'s escalation-to-high for these URLs stays in place regardless,
     as defense in depth for the day either of those lands.
 
-    **Review finding #12 — two things any caller MUST account for, not just
-    "call it"**:
+    **Review finding #12 — three things any caller MUST account for, not just
+    "call it"** (round-3 review: the round-2 fix only did item 1 below — making
+    this function `async` — and that alone was the NEW trigger for the race,
+    not a fix for it; item 3 is round-3's actual fix, `BrowserManager._lock` /
+    `_MANAGERS_LOCK`, see those docstrings):
     1. This function is now `async def` (controller ruling R-J4) precisely so
        callers never have to remember the off-thread wrapper themselves — the
        actual blocking work (`subprocess.Popen` + `urllib.request.urlopen`
@@ -556,6 +594,14 @@ async def browser_worker_config(ctx: object, session: object = None) -> dict:
        must surface `BrowserLaunchError` as a scoped `hidden_reason=
        browser_unavailable` + error card for the browser toolset only (§6),
        never fail the whole worker/session.
+    3. Making this function `async` (item 1) means two Sessions racing
+       `browser_worker_config` now genuinely dispatch to `get_browser_manager`/
+       `manager.ensure_started()` on two different OS threads at the same
+       time — `asyncio.to_thread` uses a real thread pool, not cooperative
+       scheduling. `get_browser_manager` and `BrowserManager.ensure_started()`
+       now hold locks (`_MANAGERS_LOCK`, `self._lock`) across their whole
+       bodies specifically to serialize that, so this function itself needs no
+       locking of its own — it just awaits into already-safe code.
     """
     user_root = getattr(ctx, "user_root", ctx)
     if user_root is ctx:

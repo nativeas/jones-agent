@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -300,6 +301,86 @@ def test_get_browser_manager_is_a_process_wide_singleton_per_profile(tmp_path):
     m2 = get_browser_manager(tmp_path)
     assert m1 is m2
     assert m1.profile_dir == tmp_path / "browser" / "profile"
+
+
+def test_get_browser_manager_serializes_concurrent_callers_for_the_same_profile(tmp_path):
+    """Round-3 review finding #12: `get_browser_manager`'s `_MANAGERS` cache used
+    to be a plain check-then-set with no lock — two Sessions racing
+    `browser_worker_config` (which dispatches here from `asyncio.to_thread`, i.e.
+    real OS threads) could each observe the cache empty and install their own
+    `BrowserManager` for the same profile_dir, silently defeating the "one
+    Chrome per install" guarantee. `_MANAGERS_LOCK` now serializes this."""
+    barrier = threading.Barrier(8)
+    results: list[BrowserManager] = []
+
+    def _worker() -> None:
+        barrier.wait(timeout=5)
+        results.append(get_browser_manager(tmp_path))
+
+    threads = [threading.Thread(target=_worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert len(results) == 8
+    assert len({id(m) for m in results}) == 1, (
+        "every concurrent caller must get back the SAME manager instance"
+    )
+
+
+def test_ensure_started_serializes_concurrent_callers_launching_only_one_chrome(tmp_path):
+    """Round-3 review finding #12: `browser_worker_config` runs
+    `manager.ensure_started()` via `asyncio.to_thread` — two Sessions calling it
+    at the same time really do call `ensure_started()` on the SAME manager from
+    two different OS threads. Before `BrowserManager._lock` existed, both threads
+    could see `is_alive()` == False at once (spawning even a fake Chrome
+    subprocess and waiting for it to write DevToolsActivePort takes long enough
+    to leave that window open) and both fall through to `_launch()` — deleting
+    each other's DevToolsActivePort file and starting two real Chrome processes
+    against the same `--user-data-dir`. This proves that no longer happens:
+    exactly one Chrome gets spawned, and every concurrent caller ends up with a
+    handle pointing at the SAME live port."""
+    manager = _make_manager(tmp_path)
+    spawn_calls: list[object] = []
+    real_spawn = manager._spawn
+
+    def _counting_spawn(argv, **kwargs):
+        spawn_calls.append(argv)
+        return real_spawn(argv, **kwargs)
+
+    manager._spawn = _counting_spawn
+
+    barrier = threading.Barrier(5)
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            barrier.wait(timeout=5)
+            results.append(manager.ensure_started())
+        except BaseException as exc:  # noqa: BLE001 - surfaced via `errors` below, not swallowed
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_worker) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    try:
+        assert not errors, errors
+        assert len(results) == 5
+        ports = {handle.port for handle in results}
+        assert len(ports) == 1, (
+            f"expected every concurrent caller to land on the same live Chrome, got ports={ports}"
+        )
+        assert len(spawn_calls) == 1, (
+            f"expected exactly one real Chrome spawn, got {len(spawn_calls)} — the lock is not "
+            "serializing concurrent ensure_started() calls (review finding #12)"
+        )
+    finally:
+        manager.shutdown()
 
 
 async def test_browser_worker_config_duck_types_ctx_and_lazy_starts(tmp_path, monkeypatch):

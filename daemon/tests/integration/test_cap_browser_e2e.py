@@ -23,6 +23,7 @@ import json
 import os
 import tempfile
 import threading
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -79,19 +80,36 @@ class _LoginSiteHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"Secure Area" if ok else b"Not logged in")
         elif self.path == "/form":
-            # Review finding #5: a real page with a real form field, for
-            # `test_snapshot_then_click_then_type_covers_the_form_filling_
-            # acceptance_bar` — labeled input Hermes's own accessibility
-            # snapshot can resolve a ref for.
+            # Review finding #5 (round-3: the round-2 fixture had a field but no
+            # submit control, so the "填表" test that used it could type but had
+            # nothing to genuinely `click` — see `/form-submitted` below and
+            # `test_snapshot_then_type_then_click_covers_the_form_filling_
+            # acceptance_bar`). A real labeled input Hermes's accessibility
+            # snapshot can resolve a ref for, plus a real submit button whose
+            # (unmodified, no-JS) GET submission actually navigates the page —
+            # so a real `agent-browser click @ref` has a real effect to assert
+            # on, not just a `{"success": true}` response.
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
             self.wfile.write(
-                b'<html><body><form>'
+                b'<html><body><form action="/form-submitted" method="get">'
                 b'<label for="name">Name</label>'
                 b'<input id="name" name="name" type="text">'
+                b'<button type="submit">Submit</button>'
                 b"</form></body></html>"
             )
+        elif self.path.startswith("/form-submitted"):
+            # Round-3, review finding #5: the target of the /form submit button
+            # above — echoes the submitted value so the click test can assert the
+            # click actually triggered a real navigation with the typed value,
+            # not just that the CLI call returned success.
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            name = query.get("name", [""])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(f"Submitted: {name}".encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -418,23 +436,26 @@ def test_browser_navigate_to_a_loopback_target_is_refused_by_hermes_itself(tmp_p
     not (_chrome_available() and _hermes_available()),
     reason="needs a real Chrome AND hermes-agent importable (uv sync --group worker)",
 )
-def test_snapshot_then_click_then_type_covers_the_form_filling_acceptance_bar(
+def test_snapshot_then_type_then_click_covers_the_form_filling_acceptance_bar(
     tmp_path, login_site
 ):
-    """Review finding #5: PRD 12.3 FR09's "导航/读页/点击/填表" acceptance had
-    zero click/type coverage before this test — the report's claim that
-    `browser_snapshot` → ref → `browser_click`/`browser_type` covers "填表" had
-    no run behind it. Drives the real `agent-browser` CLI directly (same level
-    as the other tests in this file, no model needed): snapshot a real form
-    page, resolve a `@ref` from it (`snapshot`'s own JSON:
-    `data.refs.<id> == {"name": ..., "role": ...}` — verified against a real
-    run against this exact fixture, not assumed), type into the field via that
-    ref (`type @e1 <text>`, NOT `find ... type` — that subaction genuinely
-    doesn't exist in agent-browser 0.26.0's CLI, verified the same way), and
-    read the value back via `get value @ref` — the actual composition this
-    branch's report claims works, actually run end to end while writing this
-    test (real Chrome, real agent-browser, this file's own `login_site`
-    fixture's new `/form` route)."""
+    """Review finding #5 (round-3, following up on a round-2 fix that only did
+    half the job): PRD 12.3 FR09's "导航/读页/点击/填表" acceptance needs a real
+    run for navigate/read/click/fill each. The round-2 version of this test
+    typed into a field and read the value back, but never once called
+    `agent-browser click` — `grep -rn "click"` on this file returned nothing,
+    despite the test's old name and docstring both claiming click coverage.
+    This version actually clicks: after typing into the Name field, it clicks
+    the fixture's real submit button (`@ref`, resolved from the same
+    `snapshot`) and asserts the click had a REAL effect — the page actually
+    navigated to `/form-submitted?name=Jones` and that page's body actually
+    reads "Submitted: Jones" — not just that the CLI call returned
+    `{"success": true}` (a click on the wrong element, or one the browser
+    silently no-ops, would still return success). Drives the real
+    `agent-browser` CLI directly (same level as the other tests in this file,
+    no model needed) — every command below (`click <ref>`, `get url`) was run
+    against this exact fixture while writing this test, not assumed from
+    `--help` text (finding #5's original mistake)."""
     manager = BrowserManager(tmp_path / "profile", headless=True)
     handle = manager.ensure_started()
     socket_dir = _short_socket_dir("form")
@@ -445,11 +466,29 @@ def test_snapshot_then_click_then_type_covers_the_form_filling_acceptance_bar(
         refs = snap.get("data", {}).get("refs", {})
         name_ref = next((ref for ref, info in refs.items() if info.get("name") == "Name"), None)
         assert name_ref is not None, f"expected a ref for the Name field, got refs={refs}"
+        submit_ref = next(
+            (ref for ref, info in refs.items() if info.get("name") == "Submit"), None
+        )
+        assert submit_ref is not None, f"expected a ref for the Submit button, got refs={refs}"
 
         typed = _agent_browser_run(handle.cdp_http_url, socket_dir, "type", f"@{name_ref}", "Jones")
         assert typed.get("success") is True, typed
-
         value = _agent_browser_run(handle.cdp_http_url, socket_dir, "get", "value", f"@{name_ref}")
         assert value.get("data", {}).get("value") == "Jones", value
+
+        # The actual click coverage finding #5 required: a real
+        # `agent-browser click @ref` on the submit button, driving the
+        # fixture's plain (no-JS) GET form submission.
+        clicked = _agent_browser_run(handle.cdp_http_url, socket_dir, "click", f"@{submit_ref}")
+        assert clicked.get("success") is True, clicked
+
+        url = _agent_browser_run(handle.cdp_http_url, socket_dir, "get", "url")
+        assert url.get("data", {}).get("url", "").endswith("/form-submitted?name=Jones"), (
+            f"click must have actually submitted the form and navigated, got {url}"
+        )
+        text = _agent_browser_get_text(handle.cdp_http_url, socket_dir)
+        assert text == "Submitted: Jones", (
+            f"the clicked-through page must reflect the typed value, got {text!r}"
+        )
     finally:
         manager.shutdown()
