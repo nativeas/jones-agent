@@ -902,6 +902,60 @@ async def test_startup_key_redaction_self_check_only_rescans_newly_appended_log_
     assert third == ["anthropic"]
 
 
+async def test_startup_key_redaction_self_check_detects_a_leak_after_log_rotation_reuses_a_name(
+    scan_db_path, scan_runtime_dir, tmp_path
+):
+    # Review item 1 (post-round-3): `logging.py`'s `RotatingFileHandler`
+    # rotates by *renaming* — a path like `daemon.log` (or a numbered
+    # backup) can hold a completely different file's bytes from one scan
+    # pass to the next. Keying the persisted offset purely by path let a
+    # freshly-rotated-in file that happens to reach the same size the old
+    # file at that path had when last scanned be silently treated as
+    # "nothing new" — the leak this test writes into the new file must
+    # still be found.
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    log_path = logs_dir / "daemon.log"
+
+    secret = "sk-ant-abcdef1234567890"
+    gen1 = ("no secrets here, just padding to control the exact file size\n" * 3)[:200]
+    log_path.write_text(gen1)
+
+    async def on_hit(code, message, detail):
+        pass
+
+    first = await maintenance.startup_key_redaction_self_check(
+        vault=_FakeVault({"anthropic": secret}),
+        logs_dir=logs_dir,
+        db_path=scan_db_path,
+        runs_dir=tmp_path / "runs",
+        runtime_dir=scan_runtime_dir,
+        recent_response_samples=[],
+        on_hit=on_hit,
+    )
+    assert first == []
+
+    # Real rotation, not a rewrite: rename the already-scanned file out from
+    # under its path, then create a *new* file at that same path — sized to
+    # exactly match the offset just persisted for "daemon.log", which is the
+    # condition that made the old path-keyed offset silently skip it.
+    log_path.rename(logs_dir / "daemon.log.1")
+    gen2 = f"leaked here: {secret}".ljust(len(gen1))
+    assert len(gen2) == len(gen1)
+    log_path.write_text(gen2)
+
+    second = await maintenance.startup_key_redaction_self_check(
+        vault=_FakeVault({"anthropic": secret}),
+        logs_dir=logs_dir,
+        db_path=scan_db_path,
+        runs_dir=tmp_path / "runs",
+        runtime_dir=scan_runtime_dir,
+        recent_response_samples=[],
+        on_hit=on_hit,
+    )
+    assert second == ["anthropic"]
+
+
 async def test_startup_key_redaction_self_check_caps_each_source_independently(
     scan_db_path, scan_runtime_dir, tmp_path
 ):

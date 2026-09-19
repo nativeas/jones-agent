@@ -743,17 +743,24 @@ def _redaction_state_path(runtime_dir: Path) -> Path:
     return runtime_dir / REDACTION_SCAN_STATE_FILENAME
 
 
-def _load_log_offsets(state_path: Path) -> dict[str, int]:
+def _load_log_offsets(state_path: Path) -> dict[str, dict[str, int]]:
     try:
         raw = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     if not isinstance(raw, dict):
         return {}
-    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, int)}
+    result: dict[str, dict[str, int]] = {}
+    for key, entry in raw.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        offset, inode = entry.get("offset"), entry.get("inode")
+        if isinstance(offset, int) and isinstance(inode, int):
+            result[key] = {"offset": offset, "inode": inode}
+    return result
 
 
-def _save_log_offsets(state_path: Path, offsets: dict[str, int]) -> None:
+def _save_log_offsets(state_path: Path, offsets: dict[str, dict[str, int]]) -> None:
     # Soft state, not the vault/export durability contract (`_write_file_
     # durably` above): losing the last update to a crash just means the next
     # pass re-scans a bit more (or from the front) for the one file that lost
@@ -772,21 +779,17 @@ def _save_log_offsets(state_path: Path, offsets: dict[str, int]) -> None:
         )
 
 
-def _read_new_bytes(path: Path, *, last_offset: int, max_bytes: int) -> tuple[str, int]:
-    """Bytes appended to `path` since `last_offset`, capped at `max_bytes` (the
+def _read_new_bytes(path: Path, *, size: int, last_offset: int, max_bytes: int) -> tuple[str, int]:
+    """Bytes appended to `path` (whose current size the caller already knows,
+    as `size`) since `last_offset`, capped at `max_bytes` (the
     should-not-happen-at-this-loop's-hourly-cadence, but not impossible, case
     where a burst of writes between passes exceeds it — still bounded, tail
-    of the new bytes). If the file shrank below `last_offset` (rotated or
-    truncated out from under this scan — see `logging.py`'s
-    `RotatingFileHandler`), the remembered position no longer means anything
+    of the new bytes). If the file shrank below `last_offset` (truncated out
+    from under this scan), the remembered position no longer means anything
     for this file's *current* bytes, so this restarts from the front (still
     capped the same way). Returns `(text, new_offset)` — the caller persists
     `new_offset` so the next pass only reads what's newly appended since this
     one, instead of re-reading the same bytes forever."""
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return "", last_offset
     start = last_offset if last_offset <= size else 0
     if size - start > max_bytes:
         start = size - max_bytes
@@ -807,14 +810,28 @@ def _read_logs_incremental(logs_dir: Path, state_path: Path) -> list[str]:
     """Every log file under `logs_dir`, but only the bytes appended since this
     function's own previous pass (round-3 review, controller ruling R-O2) —
     tracked per-file by resolved path in the small JSON state file
-    `state_path` names. Offsets for files that no longer exist under
-    `logs_dir` are dropped from the persisted state on every pass, so a
-    long-lived daemon rotating through many log filenames doesn't grow this
-    state file forever."""
+    `state_path` names.
+
+    A path alone isn't a stable file identity here: `logging.py`'s
+    `RotatingFileHandler` rotates by *renaming* (`daemon.log` -> `.1`, the old
+    `.1` -> `.2`, and so on), so `daemon.log.1` names a different file's bytes
+    after every rotation even though the offset is persisted under that same
+    path string — and the freshly-renamed-in file is typically the same
+    ~`DAEMON_LOG_MAX_BYTES` size as the stale persisted offset for that path,
+    so a naive `last_offset <= size` check reads it as "nothing new" and
+    silently skips it (round-3-followup review). Each entry therefore also
+    records the file's inode; a path whose current inode doesn't match the
+    persisted one is a different file wearing an old name, so this restarts
+    that path from byte 0 (logged once) instead of reusing a stale offset
+    that happens to still fit within the new file's size.
+
+    Offsets for files that no longer exist under `logs_dir` are dropped from
+    the persisted state on every pass, so a long-lived daemon rotating
+    through many log filenames doesn't grow this state file forever."""
     if not logs_dir.exists():
         return []
     offsets = _load_log_offsets(state_path)
-    updated: dict[str, int] = {}
+    updated: dict[str, dict[str, int]] = {}
     texts: list[str] = []
     for path in logs_dir.iterdir():
         if not path.is_file():
@@ -823,12 +840,31 @@ def _read_logs_incremental(logs_dir: Path, state_path: Path) -> list[str]:
             key = str(path.resolve())
         except OSError:
             key = str(path)
+        try:
+            st = path.stat()
+        except OSError:
+            # Gone between `iterdir()` and here — skip this pass for it; not
+            # writing an entry for `key` just drops its offset from the
+            # persisted state, same "soft state, worst case rescan more"
+            # tolerance `_save_log_offsets` already documents.
+            continue
+        entry = offsets.get(key)
+        if entry is not None and entry["inode"] == st.st_ino:
+            last_offset = entry["offset"]
+        else:
+            if entry is not None:
+                logger.warning(
+                    "redaction self-check: log file changed identity under "
+                    "an existing name (rotated in), rescanning from the start",
+                    extra={"detail": {"path": key}},
+                )
+            last_offset = 0
         text, new_offset = _read_new_bytes(
-            path, last_offset=offsets.get(key, 0), max_bytes=MAX_SCAN_BYTES_PER_FILE
+            path, size=st.st_size, last_offset=last_offset, max_bytes=MAX_SCAN_BYTES_PER_FILE
         )
         if text:
             texts.append(text)
-        updated[key] = new_offset
+        updated[key] = {"offset": new_offset, "inode": st.st_ino}
     _save_log_offsets(state_path, updated)
     return texts
 
