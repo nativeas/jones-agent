@@ -18,10 +18,19 @@ without changing the binary gating rule above it.
 
 from __future__ import annotations
 
-import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+
+# Round 5 (controller ruling R7, 2026-09-19, final): the terminal classifier
+# below must not use `shlex.split` any more — reuse `kernel/plugin/
+# jones_gate`'s own tokenizer/transparency-classifier instead of a second,
+# independent implementation (R7: "复用 jones_gate 的 tokenize...两处 import
+# 同一份"). The daemon process can import that package as an ordinary
+# Python package (it already does, for `_review_payload`) — only the
+# WORKER's copy of it has to stay dependency-free, see that package's
+# `__init__.py` docstring.
+from jones_daemon.kernel.plugin.jones_gate import _hard_deny, _transparency
 
 RiskLevel = Literal["low", "medium", "high"]
 
@@ -40,8 +49,10 @@ _READ_ONLY_LOW = frozenset(
 
 # 02-w3-interfaces.md §1.1: "终端命令是否含网络外发 curl|wget|ssh|scp"; round 4
 # (controller ruling R2, 2026-09-19) named `nc` explicitly alongside them
-# ("compound 命令...含 curl|wget|ssh|scp|nc 给 high") — added here.
-_NETWORK_EGRESS_PROGRAMS = frozenset({"curl", "wget", "ssh", "scp", "nc"})
+# ("compound 命令...含 curl|wget|ssh|scp|nc 给 high"); round 5 (controller
+# ruling R7, 2026-09-19, final) adds `rsync`/`ftp` ("网络外发程序名（curl wget
+# ssh scp nc rsync ftp）在 token 流任意位置出现 → high").
+_NETWORK_EGRESS_PROGRAMS = frozenset({"curl", "wget", "ssh", "scp", "nc", "rsync", "ftp"})
 
 # 00-foundation.md §9.2's user-gate condition ③ for `browser_evaluate`: "求值的
 # 表达式里含网络请求...或存储写入". Deliberately coarse (a substring scan, not a
@@ -178,25 +189,39 @@ def _classify_write(path: Any, *, cwd: str | None) -> Risk:
 
 
 def _classify_terminal(args: dict[str, Any]) -> Risk:
-    # Round 4 (controller ruling R2): a `terminal` call never classifies
-    # below `medium` in this function (see the `return _medium(...)` at the
-    # bottom) — which already IS the "compound 命令...给 medium 起步" floor
-    # the ruling asks for, since a compound command is still just a
-    # `terminal` call by the time it reaches here (the rule gate's own
-    # `compound` check, `kernel/plugin/jones_gate/_rules.py::
-    # is_compound_command`, only ever decides whether ① can fast-path
-    # `allow` — everything that escalates to ② lands in this same function
-    # regardless of compound-ness). No separate compound-aware branch is
-    # needed here for that reason; the network-egress check right below is
-    # what raises it to `high`.
+    # Round 5 (controller ruling R5/R7, 2026-09-19, final): the FIRST thing
+    # this function does is the same `transparency(command)` judgment the
+    # rule gate's allow fast path uses (`kernel/plugin/jones_gate/_rules.py`)
+    # — R5, verbatim: "opaque 命令...永不被审查闸判 low/medium，直接 high →
+    # 用户闸". This supersedes round 4's narrower "a terminal call never
+    # classifies below `medium`" floor (still true below, but no longer the
+    # strongest guarantee this function makes): an opaque command skips
+    # `medium` entirely and goes straight to `high`, in every mode, because
+    # this codebase cannot prove by static analysis alone that its literal
+    # text is what actually runs (quoting that could hide a substitution, an
+    # indirect-execution program name, ... — see `_transparency.py`'s
+    # docstring for the full trigger list and the round-4 re-review bypasses
+    # this closes: a double-quoted `$(...)`, `$'rm'` ANSI-C quoting).
     command = args.get("command")
     if not isinstance(command, str) or not command:
         return _high("terminal call with no command text to analyze")
-    try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
+    if _transparency.classify(command) == "opaque":
+        return _high(
+            "该命令无法静态分析，请人工确认 — this command contains shell syntax "
+            "(quoting, substitution, redirection, an operator, or an "
+            "indirect-execution/interpreter program name) that cannot be "
+            "proven safe by static analysis alone (controller ruling R5)"
+        )
+    # R7: "在 token 流上做已有扫描" — reuse `_hard_deny.tokenize()` (shared with
+    # the rule gate, see this module's import comment) instead of a second,
+    # independent `shlex.split` implementation. A `None` result here means
+    # `command` is unparseable, which `_transparency.classify()` above
+    # already treats as `opaque` and returns early for — this branch is a
+    # defensive fallback, not a path any test input is expected to reach.
+    tokens = _hard_deny.tokenize(command)
+    if tokens is None:
         return _high("could not parse this command for risk analysis")
-    programs = {Path(t).name for t in tokens if t and not t.startswith("-")}
+    programs = {Path(t).name for t in tokens}
     hit = programs & _NETWORK_EGRESS_PROGRAMS
     if hit:
         return _high(f"command includes a network-egress tool: {', '.join(sorted(hit))}")

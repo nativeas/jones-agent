@@ -42,37 +42,49 @@ how strictly it (and any hand-written `permissions.json` rule) is compared
 against a later call: "收窄到具体 match" now means what it always should
 have: THAT command, not anything starting with it.
 
-## `compound` commands never take the allow fast path (controller ruling R2)
+## `opaque` commands never take the allow fast path (controller ruling R5,
+## round 5, superseding round 4's narrower `compound` check)
 
-Independent of whether a rule matches: a command containing any of
-`; & | \\`` `$(` or a literal newline is `compound`, and `decide()` never
-returns `"allow"` for one — not even when a `permissions.json` rule's
-`match` text happens to equal the compound string verbatim (a user CAN
-still write `{"match": "terminal", "action": "allow"}` — the blanket
-whole-tool shape is the one deliberate "trust everything" escape hatch, and
-stays exempt from this, same as it's always been documented to be). A
-compound command that doesn't match a whole-tool allow rule always escalates
-to the daemon's review gate (`permissions/review.py::classify()` never
-returns `low` for a `terminal` call, so this can never silently execute
-unreviewed — see that module).
+Independent of whether a rule matches: a command `_transparency.classify()`
+calls `opaque` — any construct (an operator, quoting that could hide a
+substitution, an indirect-execution program name, ...) this codebase can't
+statically prove is simple, see that module's docstring for the full R5
+trigger list — never takes the allow fast path here, not even when a
+`permissions.json` rule's `match` text happens to equal the opaque string
+verbatim (a user CAN still write `{"match": "terminal", "action": "allow"}`
+— the blanket whole-tool shape is the one deliberate "trust everything"
+escape hatch, and stays exempt from this, same as it's always been
+documented to be). Round 4's `compound`/`is_compound_command` (a narrower,
+five-character substring check) is gone — R5's `opaque` is a strict
+superset of what `compound` caught (it still marks every `;`/`&`/`|`/
+`` ` ``/`$(`/newline-containing command opaque, plus quoting that could hide
+`$`/`` ` ``, `$'`/`$"` prefixes, any redirection, `$IFS`, and indirect-
+execution program names) — round 4's re-review (docs/design/
+02-w3-interfaces.md §1.4) found real bypasses `compound` missed (a
+double-quoted `$(...)`, `$'rm'` ANSI-C quoting, a bare `>` redirecting into a
+protected path under a blanket allow rule), all of which `opaque` now
+catches. An opaque command that doesn't match a whole-tool allow rule always
+escalates to the daemon's review gate, which itself never returns `low` (and,
+for an opaque `terminal` call specifically, never even `medium` — see
+`permissions/review.py::_classify_terminal`) — so this can never silently
+execute unreviewed.
 
 Self-contained (stdlib only) — see `__init__.py`'s module docstring; this
-module has no dependency on `_hard_deny.py` any more (round 1–3's shared
-`_split_shell_segments` is gone along with the whole segment-matching
-apparatus — deleting `_is_command_prefix`-style matching left nothing here
-for the two modules to share).
+module imports `_transparency` (same package, sibling module, also
+stdlib-only) for the opacity check above, and otherwise has no dependency on
+`_hard_deny.py` (round 1–3's shared `_split_shell_segments` is gone along
+with the whole segment-matching apparatus — deleting `_is_command_prefix`-
+style matching left nothing here for the two modules to share beyond what
+`_transparency.py` itself borrows from `_hard_deny.tokenize`).
 """
 
 from __future__ import annotations
 
 from typing import Any, Literal
 
-Action = Literal["allow", "deny"]
+from . import _transparency
 
-# Controller ruling R2: these characters (or a literal newline) anywhere in
-# the raw command text mark it `compound` — a purely textual check, no
-# shell parsing, deliberately independent of `_hard_deny.py`'s tokenizer.
-_COMPOUND_MARKERS = (";", "&", "|", "`", "$(", "\n")
+Action = Literal["allow", "deny"]
 
 
 def _command_text(tool_name: str, args: dict[str, Any]) -> str | None:
@@ -88,10 +100,6 @@ def _normalize(text: str) -> str:
     whitespace (spaces, tabs, newlines) and drops empty pieces, so
     `" ".join(text.split())` is exactly that normalization in one line."""
     return " ".join(text.split())
-
-
-def is_compound_command(command: str) -> bool:
-    return any(marker in command for marker in _COMPOUND_MARKERS)
 
 
 def _actions_for_exact_match(rules: list[dict[str, Any]], match_value: str) -> set[str]:
@@ -124,7 +132,7 @@ def decide(rules: list[dict[str, Any]], tool_name: str, args: dict[str, Any]) ->
     """Return `"deny"`/`"allow"` if this call is covered by a
     `permissions.json` rule, `None` if nothing applies (falls through to the
     daemon's review/user gate). See the module docstring for the exact-
-    whole-string-match semantics and the `compound` carve-out."""
+    whole-string-match semantics and the `opaque` carve-out."""
     if not isinstance(rules, list):
         return None
 
@@ -145,12 +153,12 @@ def decide(rules: list[dict[str, Any]], tool_name: str, args: dict[str, Any]) ->
     if "deny" in command_actions:
         return "deny"
 
-    if is_compound_command(command):
-        # Controller ruling R2: a compound command never takes the allow
-        # fast path — always escalate, regardless of what matched (including
-        # a whole-tool blanket allow whose `match` isn't specific to this
-        # command's text at all, and so was never "about" this particular
-        # compound command in the first place).
+    if _transparency.classify(command) == "opaque":
+        # Controller ruling R5 (round 5, final): an opaque command never
+        # takes the allow fast path — always escalate, regardless of what
+        # matched (including a whole-tool blanket allow whose `match` isn't
+        # specific to this command's text at all, and so was never "about"
+        # this particular command in the first place).
         return None
 
     if "allow" in tool_actions or "allow" in command_actions:

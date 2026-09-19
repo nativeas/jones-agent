@@ -447,6 +447,48 @@ async def test_remember_session_persists_an_allow_rule_for_this_session_only(tmp
         await service.shutdown()
 
 
+async def test_remember_session_normalizes_and_dedupes_by_normalized_match(tmp_path, monkeypatch):
+    # Round 5 (controller ruling R8, 2026-09-19, final): `_remember_allow`
+    # normalizes `match` before writing (`_rules._normalize` — same
+    # whitespace collapsing §1.1's R1 already uses for comparison) and
+    # de-dupes against it by the NORMALIZED form, not a raw-string `!=` — two
+    # `remember`s of the same command differing only in incidental
+    # whitespace must not pile up as two rules.
+    #
+    # Calls `_remember_allow` directly (same technique
+    # `test_remember_session_persists_an_allow_rule_for_this_session_only`
+    # uses, see its comment) rather than driving two real Turns through the
+    # fake worker — a second real permission round trip in the same session
+    # reproduces the pre-existing `main` teardown hang documented there,
+    # unrelated to what this test actually needs to prove.
+    service = await _make_service(tmp_path, monkeypatch)
+    try:
+        session_id = await _new_session(service, mode="task")
+        for command in ("git   status", "  git status  "):
+            encoded = _review_payload.encode("terminal", {"command": command}, mode="task")
+            params = {
+                "toolCall": {
+                    "rawInput": {
+                        "command": "terminal (plugin approval rule)",
+                        "description": encoded,
+                    }
+                }
+            }
+            entry = service_module._PendingPermission(
+                session_id=session_id,
+                params=params,
+                future=asyncio.get_running_loop().create_future(),
+            )
+            await service._remember_allow(entry, "session")
+        # Both remembers normalize to the same "git status" match -> exactly
+        # one rule, not two, and it's the normalized form.
+        assert service._session_remembered_rules[session_id] == [
+            {"match": "git status", "action": "allow"}
+        ]
+    finally:
+        await service.shutdown()
+
+
 async def test_remember_project_writes_to_the_projects_permissions_json(tmp_path, monkeypatch):
     # `_cwd_for_project` resolves via `ProjectService.get()` (G/#12); this
     # test wants a controlled, disposable directory for its `permissions.json`

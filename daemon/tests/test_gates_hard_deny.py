@@ -281,3 +281,54 @@ def test_adversarial_table_benign_strings_are_not_denied(command):
     # `_rm_denied` only ever fires when the token stream actually contains
     # an `rm` token, so this must stay clean.
     assert not _denied(command)
+
+
+# -- Round 5 (controller ruling R6): raw-text regex scan, alongside the -----
+# token-stream scan above — closes the two bypasses round 4's re-review
+# found in the token scanner itself (a quoted `rm -rf` folded into one
+# token by `tokenize()`, not a missing pattern).
+
+
+def test_rm_rf_inside_a_double_quoted_command_substitution_is_denied():
+    # Round 4's tokenizer keeps `"$(rm -rf ~/x)"` as ONE token (correct for
+    # an ordinary quoted argument) — `rm`/`-rf` never show up as separate
+    # entries in the flat stream, so the token-stream scan alone misses this
+    # (round-4 re-review finding #1). The raw-text scan (quote characters
+    # stripped, plain regex) catches it without needing to understand why
+    # the text was quoted.
+    assert _denied('echo "$(rm -rf ~/x)"')
+
+
+def test_ansi_c_quoted_rm_is_denied():
+    # `$'rm'` (bash ANSI-C quoting): the tokenizer's simple `'...'`-only
+    # quote tracker folds the leading `$` onto the quoted text, producing
+    # the single token `"$rm"` — not equal to `"rm"`, so `_rm_denied`'s
+    # token comparison misses it (round-4 re-review finding #2). The
+    # raw-text scan matches `\brm\b` against `"$rm"` (with the quote
+    # character removed) because `$` is a non-word character, so the word
+    # boundary before `rm` still exists.
+    assert _denied("$'rm' -rf ~/x")
+
+
+def test_redirect_write_to_protected_project_permissions_json_is_denied():
+    # `echo evil > <project>/.jones/permissions.json`: `echo` isn't a
+    # write/delete-verb TOKEN, so the token-stream `_protected_path_denied`
+    # check misses it — the danger is the redirection itself, which the
+    # raw-text protected-path check (R6) catches directly (round-4 re-review
+    # finding #3).
+    assert _denied(
+        "echo evil > /repo/.jones/permissions.json",
+        project_permissions_path="/repo/.jones/permissions.json",
+    )
+
+
+def test_redirect_append_to_user_root_jones_dir_is_denied():
+    assert _denied("echo evil >> ~/.jones/permissions.json", user_root="~/.jones")
+
+
+def test_literal_rm_rf_string_inside_an_echo_is_a_known_accepted_false_reject():
+    # R6's explicit tradeoff (docs/design/02-w3-interfaces.md §1.4's "已知
+    # 误拒"): the raw-text scan can't tell "a real rm -rf invocation" apart
+    # from "the literal text rm -rf sitting inside a string that's only ever
+    # printed" — over-denial here is accepted, not a bug.
+    assert _denied('echo "rm -rf /tmp/x"')
