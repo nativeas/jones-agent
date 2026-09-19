@@ -65,6 +65,8 @@ class DaemonContext:
 
 结果：`daemon/` 目录归属未变，`.github/` 不在任何 Issue 的专属目录表里，这次改动只加了 `env:` 一行 + 沿用已有的 `uv sync`/`uv run ruff check .`/`uv run pytest -q` 三步，未改 CI 的步骤结构本身。
 
+**第 2 轮评审补充（2026-09-19）**：上面只救活了 CI——CI 的 `daemon` job 有 `env: UV_FROZEN: "1"`，但仓库根 `Makefile` 的 `check-daemon` 目标和裸 `uv sync`/`uv run` 完全没有这个变量，在任何没有 `/Users/nativeas/.hermes/hermes-agent` checkout 的机器上依旧必然失败（已实测复现：把 `[tool.uv.sources]` 路径改成不存在的路径、删掉 `.venv`，不带 `UV_FROZEN` 跑 `uv sync` 直接报 `error: Distribution not found`），报错文字不提 `worker` 分组也不提 `UV_FROZEN`，仓库里除了这份文档和 `ci.yml` 的注释外没有别处告诉贡献者要加这个变量。修法：`Makefile` 的 `check-daemon` 目标现在给两条 `uv` 命令都加上 `UV_FROZEN=1`；`docs/DEV.md` 新增"本地环境"一节，把裸 `uv sync`/`uv run`（不经过 `make`）时同样要加 `UV_FROZEN=1` 写成给人看的指令。§2 原文"锁到 commit"里可解析来源那一半（现在仍是本机绝对路径）依旧未解决——如上所述，这是 Hermes 自身打包策略造成的约束，不是这条分支能解开的。
+
 ## 3. B：Provider / Key vault（#7）
 
 ```python
