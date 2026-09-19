@@ -161,7 +161,14 @@ class ConfigResolver(Protocol):
   "default_agent_id": "agent_default", // 项目级覆盖此 key = "项目级 Agent 覆盖用户级"（FR03）的落地方式，
                                         // 见 agents/service.py 模块注释：不是同 id 跨作用域遮蔽，是指针换绑
   "concurrency_limit": 4,
-  "approval_timeout_minutes": null // null = 不超时（PRD 9.4 默认）
+  "approval_timeout_minutes": null, // null = 不超时（PRD 9.4 默认）
+  // R-N5（controller ruling，2026-09-20；PRD 11.2「单个 Run 最大 Step 数 200」/
+  // 「单个 Run 最大时长 2 h」，PRD 9.3 预算终止行"触顶 11.2 的单 Run Step 数/
+  // 时长上限"）：`sessions/service.py::_run_turn` 在 Turn 开始时读一次，
+  // `_handle_tool_call_start` 每次工具调用用缓存值比较，触顶即
+  // `_terminate_run(kind="budget", ...)`，见 04-w5-interfaces.md §4.3。
+  "max_steps_per_run": 200,        // 防死循环；可在 Agent 配置中放宽（R-N5 本轮未实现，见 04-w5-interfaces.md §4.3）
+  "max_run_duration_s": 7200       // 2 小时，同上
 }
 ```
 

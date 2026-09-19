@@ -240,6 +240,18 @@ export class MockTransport implements RpcTransport {
         this.emit('queue.changed', { session_id: params.id, items: reordered })
         return reordered
       }
+      case 'session.queue_resume': {
+        // R-N4 mock side — good enough to exercise the "继续" button's real
+        // RPC round trip in `pnpm dev:mock`, not a full re-implementation of
+        // `_advance_queue`'s suspend bookkeeping (this mock's error/budget
+        // scripted commands already never call `maybeSendNextQueued`, so
+        // they never auto-advance in the first place — see that method).
+        const session = this.requireSession(params.id)
+        const items = this.queue.get(params.id) ?? []
+        if (!items[0]) throw new Error('no pending queue items to resume')
+        this.maybeSendNextQueued(session)
+        return { resumed: true, items: this.queue.get(params.id) ?? [] }
+      }
 
       case 'turn.messages':
         return this.messages.get(params.session_id) ?? []

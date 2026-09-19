@@ -66,6 +66,24 @@ class _RaisingProviderResolver(ProviderResolverProtocol):
         return []
 
 
+class _SlowRaisingProviderResolver(_RaisingProviderResolver):
+    """R-N4's budget-suspend test needs a real "this Session is running"
+    window a second `send()` can reliably observe — `_RaisingProviderResolver`
+    alone fails so fast (a single `run_in_db_thread` round trip, no ACP
+    round trip at all) that it's often already terminated again before a
+    poll loop can ever catch it as "running". `resolve()` here runs on
+    `run_in_db_thread`'s own executor thread, not the event loop, so blocking
+    it briefly costs nothing the test needs and doesn't stall anything else."""
+
+    def __init__(self, message: str, *, delay_s: float = 0.15) -> None:
+        super().__init__(message)
+        self._delay_s = delay_s
+
+    def resolve(self, model_pref: dict[str, Any] | None) -> Any:
+        time.sleep(self._delay_s)
+        return super().resolve(model_pref)
+
+
 class FakeServer:
     def __init__(self) -> None:
         self.broadcasts: list[tuple[str, str, Any]] = []
@@ -122,6 +140,26 @@ async def _wait_until(predicate, *, timeout: float = 5.0, interval: float = 0.02
 
 def _terminated(service: SessionService) -> list[dict[str, Any]]:
     return [p for _sid, m, p in service.ctx.server.broadcasts if m == "run.terminated"]
+
+
+def _queue_changed_events(service: SessionService) -> list[dict[str, Any]]:
+    return [p for _sid, m, p in service.ctx.server.broadcasts if m == "queue.changed"]
+
+
+async def _wait_for_queue_suspended(service: SessionService, *, suspended: bool) -> None:
+    """R-N4: `_advance_queue`'s `queue.changed` broadcast (the one carrying
+    `suspended`/`reason`) is a few `await`s AFTER `run.terminated` fires (it
+    happens in the just-terminated Turn's own `finally` block, released from
+    the lock, then the DB read, then the broadcast) — waiting only on
+    `run.terminated` and then immediately reading `_queue_changed_events`
+    synchronously is a real, observed-in-practice race, not a hypothetical
+    one. Poll for the specific broadcast this test actually needs instead."""
+    await _wait_until(
+        lambda: any(
+            e.get("suspended") is suspended for e in _queue_changed_events(service)
+        ),
+        timeout=5,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1002,5 +1040,341 @@ async def test_retry_unknown_turn_id_is_not_found(tmp_path, monkeypatch):
             raise AssertionError("expected RpcError for an unknown turn")
         except Exception as exc:  # noqa: BLE001
             assert "not found" in str(exc)
+    finally:
+        await service.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# R-N4 (controller ruling, 2026-09-20; 04-w5-interfaces.md §4.3, PRD 9.3):
+# "终止不清空 Session 队列；队列中的后续指令挂起，等用户决定继续或清空" — applies
+# to all three outer termination kinds (user/error/budget), not just
+# error/budget. `_advance_queue` no longer auto-pops the next queued item for
+# ANY of them; `session.queue_resume` (explicit) and `session.send` a new
+# message (implicit) are the two ways to un-suspend.
+# ---------------------------------------------------------------------------
+
+
+async def test_user_stop_suspends_the_queue_instead_of_auto_advancing(tmp_path, monkeypatch):
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        first = await service.send(session_id, "SLEEP_MS:500 hello")
+        assert first["queued"] is False
+        await _wait_until(lambda: session_id in service._active_turns)
+        second = await service.send(session_id, "queued behind the stop")
+        assert second["queued"] is True
+
+        stop_result = await service.stop(session_id)
+        assert stop_result["stopped"] is True
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        card = _terminated(service)[0]
+        assert card["kind"] == "user"
+        await _wait_for_queue_suspended(service, suspended=True)
+
+        # R-N4: the queued item must NOT have been popped/started.
+        items = await service.queue(session_id)
+        assert len(items) == 1
+        assert items[0]["text"] == "queued behind the stop"
+        assert session_id not in service._active_turns
+        assert len(service.ctx.server.events("turn.started")) == 1
+
+        suspend_events = [e for e in _queue_changed_events(service) if e.get("suspended")]
+        assert suspend_events[-1]["reason"] == "user"
+    finally:
+        await service.shutdown()
+
+
+async def test_error_termination_suspends_the_queue_instead_of_auto_advancing(
+    tmp_path, monkeypatch
+):
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        first = await service.send(session_id, "TOOL_EXCEPTION please")
+        assert first["queued"] is False
+        await _wait_until(lambda: session_id in service._active_turns)
+        second = await service.send(session_id, "queued behind the failure")
+        assert second["queued"] is True
+
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        card = _terminated(service)[0]
+        assert card["kind"] == "error"
+        await _wait_for_queue_suspended(service, suspended=True)
+
+        items = await service.queue(session_id)
+        assert len(items) == 1
+        assert session_id not in service._active_turns
+        assert len(service.ctx.server.events("turn.started")) == 1
+
+        suspend_events = [e for e in _queue_changed_events(service) if e.get("suspended")]
+        assert suspend_events[-1]["reason"] == "error"
+    finally:
+        await service.shutdown()
+
+
+async def test_budget_termination_suspends_the_queue_instead_of_auto_advancing(
+    tmp_path, monkeypatch
+):
+    """Unlike the "user"/"error" siblings above, the provider-resolve-only
+    fault injection this needs for a `kind="budget"` termination (no real ACP
+    round trip — see `_RaisingProviderResolver`'s own docstring) resolves so
+    fast that a plain `_wait_until(lambda: session_id in service.
+    _active_turns)` can miss the window entirely (observed flaky in practice
+    while writing this test). `_SlowRaisingProviderResolver` (this file, right
+    above) adds a small real delay on the executor thread `run_in_db_thread`
+    runs `resolve()` on — doesn't touch the event loop, just gives the second
+    `send()` below a reliable window to land while the first Turn is still
+    genuinely "running"."""
+    service = await _make_service(
+        tmp_path,
+        monkeypatch,
+        providers=_SlowRaisingProviderResolver("insufficient_quota: monthly cap reached"),
+    )
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        first = await service.send(session_id, "first (fails immediately, quota)")
+        assert first["queued"] is False
+        await _wait_until(lambda: session_id in service._active_turns)
+        second = await service.send(session_id, "queued behind the budget termination")
+        assert second["queued"] is True
+
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        card = _terminated(service)[0]
+        assert card["kind"] == "budget"
+        await _wait_for_queue_suspended(service, suspended=True)
+
+        items = await service.queue(session_id)
+        assert len(items) == 1
+        assert session_id not in service._active_turns
+        assert len(service.ctx.server.events("turn.started")) == 1
+
+        suspend_events = [e for e in _queue_changed_events(service) if e.get("suspended")]
+        assert suspend_events[-1]["reason"] == "budget"
+    finally:
+        await service.shutdown()
+
+
+async def test_queue_resume_starts_the_next_pending_item(tmp_path, monkeypatch):
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "TOOL_EXCEPTION please")
+        await _wait_until(lambda: session_id in service._active_turns)
+        await service.send(session_id, "resume me")
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        # `_advance_queue` (this Turn's own `finally`) has to have actually
+        # cleared `_active_turns`/suspended the queue before `queue_resume`
+        # below can see "not running" — `run.terminated` alone (just waited
+        # for) fires strictly earlier, inside `_terminate_run`, before
+        # `_run_turn`'s `finally: await self._advance_queue(...)` even starts.
+        await _wait_for_queue_suspended(service, suspended=True)
+        assert len(await service.queue(session_id)) == 1
+
+        result = await service.queue_resume(session_id)
+        assert result["resumed"] is True
+        # `queue_resume`'s own broadcast is fully awaited before it returns —
+        # no extra wait needed for this one, unlike the racier sibling below.
+        assert _queue_changed_events(service)[-1]["suspended"] is False
+        assert (await service.queue(session_id)) == []
+
+        # The resumed Turn runs the fake agent's plain "normal" path (no
+        # marker in "resume me") and completes on its own.
+        await _wait_until(
+            lambda: len(service.ctx.server.events("turn.started")) >= 2, timeout=5
+        )
+    finally:
+        await service.shutdown()
+
+
+async def test_queue_resume_rejects_when_nothing_is_pending(tmp_path, monkeypatch):
+    service = await _make_service(tmp_path, monkeypatch)
+    try:
+        session_id = await _new_session(service, title="s1")
+        try:
+            await service.queue_resume(session_id)
+            raise AssertionError("expected RpcError for an empty queue")
+        except Exception as exc:  # noqa: BLE001
+            assert "no pending queue items" in str(exc)
+    finally:
+        await service.shutdown()
+
+
+async def test_queue_resume_rejects_while_a_turn_is_running(tmp_path, monkeypatch):
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "SLEEP_MS:500 hello")
+        await _wait_until(lambda: session_id in service._active_turns)
+        try:
+            await service.queue_resume(session_id)
+            raise AssertionError("expected RpcError while a Turn is running")
+        except Exception as exc:  # noqa: BLE001
+            assert "already running" in str(exc)
+    finally:
+        await service.shutdown()
+
+
+async def test_send_a_new_message_implicitly_resumes_a_suspended_queue(tmp_path, monkeypatch):
+    """The second of R-N4's two resume paths — `session.send` itself is
+    unmodified (out of this round's authorized touch set): with nothing
+    "running" once the queue is suspended, `send()`'s existing "not running
+    -> start immediately" branch already fires for a brand new message, and
+    THAT Turn's own normal completion (via `_advance_queue`'s non-suspended
+    branch) is what actually pops the still-pending older item behind it —
+    see `_advance_queue`'s own comment for why this needs no changes to
+    `send()` at all."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "TOOL_EXCEPTION please")
+        await _wait_until(lambda: session_id in service._active_turns)
+        await service.send(session_id, "still queued behind the failure")
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        # `send()` below decides immediate-run-vs-queue from `_active_turns`/
+        # `_turn_tasks`, which only `_advance_queue` (this failed Turn's own
+        # `finally`) clears — `run.terminated` alone fires strictly earlier
+        # (see `_wait_for_queue_suspended`'s own docstring).
+        await _wait_for_queue_suspended(service, suspended=True)
+        assert len(await service.queue(session_id)) == 1
+
+        new_msg = await service.send(session_id, "brand new message, jumps the queue")
+        assert new_msg["queued"] is False  # nothing "running" -> starts immediately
+
+        # Once this brand-new Turn completes normally, the still-pending old
+        # item resumes on its own via `_advance_queue`'s non-suspended
+        # branch — wait for THAT specific broadcast rather than racing it
+        # against the resumed item's own `turn.started` (a different
+        # broadcast, fired from a different, concurrently-scheduled task —
+        # the two have no guaranteed order relative to each other).
+        await _wait_for_queue_suspended(service, suspended=False)
+        items = await service.queue(session_id)
+        assert items == []
+        assert len(service.ctx.server.events("turn.started")) == 3
+    finally:
+        await service.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# R-N5 (controller ruling, 2026-09-20; 04-w5-interfaces.md §4.3, PRD 11.2/9.3):
+# 单个 Run 最大 Step 数 (200) / 最大时长 (7200s) — `_handle_tool_call_start`
+# enforces both as a 预算终止 (`kind="budget"`), with `card.budget` filled in.
+# ---------------------------------------------------------------------------
+
+
+async def test_step_count_budget_terminates_the_run_with_a_budget_card(tmp_path, monkeypatch):
+    """"假 ACP agent 发 201 个 tool_call" (R-N5's own test description) — the
+    fake agent's `MANY_TOOL_CALLS:201` marker (this round's own addition to
+    `fake_acp_agent.py`, see its module docstring) sends 201 real
+    `tool_call`/`tool_call_update` pairs over one real ACP round trip;
+    `NullConfigResolver` (via `_make_service`) returns `{}`, so the Session
+    is running against PRD 11.2's own default (200), not a test-configured
+    override — exactly the "假 ACP agent 发 201 个 tool_call" scenario
+    against the real default limit."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "MANY_TOOL_CALLS:201")
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+
+        card = _terminated(service)[0]
+        assert card["kind"] == "budget"
+        assert card["card"]["kind"] == ErrorKind.BUDGET.value
+        assert card["card"]["actions"] == ["abandon"]
+        assert card["card"]["budget"] == {
+            "name": "单个 Run 最大 Step 数",
+            "used": 201,
+            "limit": 200,
+            "unit": "步",
+        }
+
+        run = await run_in_db_thread(
+            service_module.queries.get_run, service.ctx.db, card["run_id"]
+        )
+        # The 201st (over-limit) tool_call never got counted/inserted as a
+        # Step — `terminated_step_seq` stays at the last one that actually ran.
+        assert run["terminated_step_seq"] == 200
+
+        steps = await service.run_steps(card["run_id"])
+        assert len(steps) == 200
+
+        # R-N4: a budget termination suspends the queue too (nothing queued
+        # here, but the Turn/worker bookkeeping must still have unwound —
+        # the runaway worker's still-streaming tool_call events must not
+        # leave the session stuck "running" forever).
+        await _wait_until(lambda: session_id not in service._active_turns, timeout=5)
+    finally:
+        await service.shutdown()
+
+
+async def test_run_duration_budget_terminates_the_run_via_injected_clock(tmp_path, monkeypatch):
+    """"注入时钟超时长" (R-N5's own test description) — injects the clock by
+    reaching into the live `ctx_turn.started_at` this Turn's `_run_turn`
+    already set (`service._active_turns[session_id]`, the same direct-state
+    access this file's other tests already use — see e.g. the N07 watchdog
+    tests further below) and pushing it back past the PRD 11.2 default
+    (7200s), rather than monkeypatching the global `time.monotonic` function
+    itself. Tried that first; it breaks far more than intended — CPython's
+    `asyncio.BaseEventLoop.time()` IS `time.monotonic()`, so patching the
+    module attribute also patches every OTHER piece of scheduling in the
+    process for the rest of the test: any callback already scheduled via
+    `call_later`/`asyncio.sleep` (this daemon's own idle-worker reaper
+    included — `workers/manager.py::_reap_idle_loop`, already sleeping when
+    `service.worker_manager.start()` ran, well before this test even begins)
+    sees its deadline as having already passed the instant the clock jumps,
+    and fires immediately — the reaper's own idle check then reads the SAME
+    patched clock against `worker.last_active` (set with the *original*,
+    pre-jump value) and — confirmed by reproducing it while writing this
+    test — reaps this Turn's still-busy worker mid-flight as "idle", which
+    surfaces here as `kind="error"`/`worker_crash`, not the `kind="budget"`
+    duration cap this test actually wants to exercise. Mutating just this one
+    Turn's own `started_at` sidesteps all of that: nothing else in the
+    process reads it.
+
+    Timing still needs care even without touching the clock: `session_id in
+    service._active_turns` becomes true well BEFORE the worker startup
+    self-check even starts (`ctx_turn` is stored there long before `ensure_
+    started` runs it) — waiting only on that, then mutating `started_at`,
+    raced the real `USE_TOOL` tool_call event arriving first often enough in
+    practice to flake (self-check + the real prompt's "Hel"/"lo" deltas +
+    its `USE_TOOL` tool_call can all complete within that same window). The
+    fix mirrors the (removed) clock-patching version's own synchronization:
+    `SLEEP_MS:200` makes the fake agent hold its `USE_TOOL` tool_call for
+    200ms of real wall time — AFTER it has already sent its "Hel"/"lo"
+    deltas — giving a deterministic window once this test observes the
+    first `message.delta` (proof self-check finished and the REAL prompt,
+    not the probe, is the one now in flight — probe updates never reach
+    `SessionService` at all, see `workers/manager.py::_collect_startup_
+    update`'s docstring)."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+
+        result = await service.send(session_id, "SLEEP_MS:200 USE_TOOL")
+        assert result["queued"] is False
+        await _wait_until(
+            lambda: len(service.ctx.server.events("message.delta")) >= 1, timeout=5
+        )
+        # Push this Turn's own start time back past the PRD 11.2 default —
+        # `_handle_tool_call_start`'s duration check reads `time.monotonic() -
+        # ctx_turn.started_at`, real `time.monotonic()`, unpatched.
+        service._active_turns[session_id].started_at = time.monotonic() - (7200.0 + 10.0)
+
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        card = _terminated(service)[0]
+        assert card["kind"] == "budget"
+        assert card["card"]["kind"] == ErrorKind.BUDGET.value
+        budget = card["card"]["budget"]
+        assert budget["name"] == "单个 Run 最大时长"
+        assert budget["limit"] == 7200
+        assert budget["unit"] == "秒"
+        assert budget["used"] >= 7200
     finally:
         await service.shutdown()

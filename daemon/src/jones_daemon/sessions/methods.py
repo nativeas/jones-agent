@@ -177,6 +177,12 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
             )
         return await service.queue_reorder(_require_str(params, "id"), item_ids)
 
+    async def session_queue_resume(params: dict[str, Any], conn: Connection) -> Any:
+        # R-N4 (controller ruling, 2026-09-20; 04-w5-interfaces.md §4.3): the
+        # queue panel's "继续" button, params -> call translation same as
+        # every other thin handler in this file.
+        return await service.queue_resume(_require_str(params, "id"))
+
     async def session_subscribe(params: dict[str, Any], conn: Connection) -> Any:
         conn.subscriptions.add(_require_str(params, "id"))
         return {"subscribed": True}
@@ -310,6 +316,7 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
     server.register("session.queue", session_queue)
     server.register("session.queue_remove", session_queue_remove)
     server.register("session.queue_reorder", session_queue_reorder)
+    server.register("session.queue_resume", session_queue_resume)
     server.register("session.subscribe", session_subscribe)
     server.register("session.unsubscribe", session_unsubscribe)
     server.register("session.delete", session_delete)

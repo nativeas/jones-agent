@@ -27,6 +27,15 @@ interface ChatState {
   activeSessionId: string | null
   timeline: TimelineEntry[]
   queue: QueueItem[]
+  /** R-N4 (controller ruling, 2026-09-20; 04-w5-interfaces.md §4.3, PRD 9.3):
+   * `null` when the queue is running normally; the terminated Run's outer
+   * `kind` ("user"|"error"|"budget") once `queue.changed`'s `suspended:true`
+   * arrives — the three termination kinds no longer auto-advance the queue,
+   * so `QueuePanel` shows "已暂停" + a "继续" button instead of silently
+   * looking like nothing is queued. Cleared by any `queue.changed` broadcast
+   * that carries `suspended:false` (a normal advance, `queueResume()`, or
+   * `abandonTermination()`'s own clear). */
+  queueSuspendedReason: 'user' | 'error' | 'budget' | null
   pendingPermissions: PermissionRequest[]
   running: boolean
   error: string | null
@@ -72,6 +81,8 @@ interface ChatState {
   stop(): Promise<void>
   removeQueueItem(itemId: string): Promise<void>
   reorderQueue(orderedIds: string[]): Promise<void>
+  /** R-N4 队列面板"继续"按钮 — `session.queue_resume`。 */
+  queueResume(): Promise<void>
   decidePermission(
     requestId: string,
     decision: 'allow' | 'deny',
@@ -130,6 +141,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
   activeSessionId: null,
   timeline: [],
   queue: [],
+  queueSuspendedReason: null,
   pendingPermissions: [],
   running: false,
   error: null,
@@ -176,6 +188,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       activeSessionId: sessionId,
       timeline: [],
       queue: [],
+      queueSuspendedReason: null,
       pendingPermissions: [],
       running: false,
       error: null,
@@ -229,6 +242,14 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         if (params.session_id !== sessionId) return
         set((state) => ({
           running: true,
+          // R-N4: a Run just started for real — whatever suspended the
+          // queue before (this new Turn is exactly the "send a new message"
+          // implicit-resume path, or `queueResume()`'s own explicit one)
+          // no longer applies; the eventual `queue.changed` broadcast this
+          // Turn's own completion fires will re-confirm this, but the panel
+          // shouldn't keep showing "已暂停" while something is visibly
+          // running.
+          queueSuspendedReason: null,
           runToSession: new Map(state.runToSession).set(params.run_id, params.session_id)
         }))
       }),
@@ -271,9 +292,29 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         }))
       }),
       transport.on('queue.changed', (raw) => {
-        const params = raw as { session_id: string; items: QueueItem[] }
+        // R-N4 (04-w5-interfaces.md §4.3): `suspended`/`reason` are only
+        // populated by `_advance_queue`/`session.queue_resume`/`abandon`'s
+        // own broadcasts (00-foundation.md §4.2's `queue.changed` row) — the
+        // other, untouched broadcast points (`session.queue`/`_remove`/
+        // `_reorder`, `send()`'s enqueue branch) omit them entirely, so a
+        // missing `suspended` here means "no new information", not "no
+        // longer suspended" — only an explicit `false` clears it.
+        const params = raw as {
+          session_id: string
+          items: QueueItem[]
+          suspended?: boolean
+          reason?: 'user' | 'error' | 'budget' | null
+        }
         if (params.session_id !== sessionId) return
-        set({ queue: params.items })
+        set((state) => ({
+          queue: params.items,
+          queueSuspendedReason:
+            params.suspended === undefined
+              ? state.queueSuspendedReason
+              : params.suspended
+                ? (params.reason ?? null)
+                : null
+        }))
       }),
       // permission.requested carries session_id directly — confirmed against
       // `sessions/service.py`'s real broadcast (domain/types.ts's
@@ -544,6 +585,20 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     })
     if (res.ok) set({ queue: res.result ?? [] })
     else set({ error: res.message ?? '调序失败' })
+  },
+
+  async queueResume() {
+    const { transport, activeSessionId } = get()
+    if (!transport || !activeSessionId) return
+    const res = await transport.call<{ resumed: boolean; items: QueueItem[] }>(
+      'session.queue_resume',
+      { id: activeSessionId }
+    )
+    if (res.ok && res.result) {
+      set({ queue: res.result.items, queueSuspendedReason: null })
+    } else {
+      set({ error: res.message ?? '继续失败' })
+    }
   },
 
   async decidePermission(requestId, decision, remember) {

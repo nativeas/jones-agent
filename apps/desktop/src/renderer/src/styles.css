@@ -464,6 +464,24 @@ body {
 .queue-panel__title {
   font-weight: 600;
   margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* R-N4 (04-w5-interfaces.md §4.3, PRD 9.3): 三类终止后队列挂起的提示 + 继续按钮 */
+.queue-panel__suspended {
+  font-weight: 400;
+  color: #b45309;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.queue-panel__resume {
+  font-weight: 600;
+  cursor: pointer;
 }
 
 .queue-panel__list {

@@ -27,6 +27,8 @@ export function CenterPane({ transport }: CenterPaneProps): JSX.Element {
   const timeline = useChatStore((s) => s.timeline)
   const running = useChatStore((s) => s.running)
   const queue = useChatStore((s) => s.queue)
+  const queueSuspendedReason = useChatStore((s) => s.queueSuspendedReason)
+  const queueResume = useChatStore((s) => s.queueResume)
   const send = useChatStore((s) => s.send)
   const stop = useChatStore((s) => s.stop)
   const retryTermination = useChatStore((s) => s.retryTermination)
@@ -110,7 +112,13 @@ export function CenterPane({ transport }: CenterPaneProps): JSX.Element {
           handledTerminations={handledTerminations}
         />
       </div>
-      <QueuePanel items={queue} onRemove={removeQueueItem} onReorder={reorderQueue} />
+      <QueuePanel
+        items={queue}
+        suspendedReason={queueSuspendedReason}
+        onRemove={removeQueueItem}
+        onReorder={reorderQueue}
+        onResume={queueResume}
+      />
       <InputBar running={running} onSend={send} onStop={stop} />
     </main>
   )

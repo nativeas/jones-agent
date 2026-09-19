@@ -12,6 +12,7 @@ function resetStore(): void {
     activeSessionId: null,
     timeline: [],
     queue: [],
+    queueSuspendedReason: null,
     pendingPermissions: [],
     running: false,
     error: null,

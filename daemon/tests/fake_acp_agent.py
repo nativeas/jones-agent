@@ -85,6 +85,21 @@ Behavior is selected via the `FAKE_ACP_MODE` env var (default "normal"):
   Hermes uses when a tool's exception is unrecoverable enough to end the
   Turn (`kernel/acp_client.py`'s `AcpError`), as opposed to "USE_TOOL"'s
   always-succeeds `demo_tool`, which the agent just continues past.
+- "MANY_TOOL_CALLS:<n>" prompt marker (R-N5, controller ruling 2026-09-20,
+  04-w5-interfaces.md §4.3 — Issue #22's Step-count budget test: "假 ACP
+  agent 发 201 个 tool_call") — pure addition, same pattern as "USE_TOOL"/
+  "TOOL_EXCEPTION": emits `n` `tool_call`/`tool_call_update(status=
+  "completed")` pairs back to back for a fake `demo_tool`, then finishes the
+  prompt normally (`stopReason: "end_turn"`, same as any other "normal"-mode
+  prompt) — unlike "USE_TOOL" (always exactly one pair), `n` lets a test
+  drive the daemon's `sessions/service.py::_handle_tool_call_start` Step
+  budget past its limit with a single real ACP round trip. The daemon is
+  expected to `task.cancel()` the Turn partway through once its own
+  Step-count check trips (see that method's docstring) — this agent has no
+  idea that happens and just keeps writing `session/update` lines to stdout
+  until it's done sending all `n` (a closed pipe on the daemon side, if the
+  Turn's worker gets torn down first, surfaces as a normal `BrokenPipeError`
+  from `_send`, not a hang).
 """
 
 from __future__ import annotations
@@ -318,6 +333,28 @@ def _handle_normal_prompt(session_id: str, text: str) -> None:
         _handle_custom_permission_prompt(session_id, text)
     if _SPAWN_SUBPROCESS_MARKER in text:
         _handle_spawn_subprocess_terminal(session_id)
+    many_match = _MANY_TOOL_CALLS_MARKER.search(text)
+    if many_match:
+        _handle_many_tool_calls_prompt(session_id, int(many_match.group(1)))
+
+
+_MANY_TOOL_CALLS_MARKER = re.compile(r"MANY_TOOL_CALLS:(\d+)")
+
+
+def _handle_many_tool_calls_prompt(session_id: str, count: int) -> None:
+    """R-N5 (controller ruling, 2026-09-20) — see this module's docstring."""
+    for i in range(count):
+        tool_call_id = f"many-{i}"
+        _send_update(
+            session_id,
+            {"sessionUpdate": "tool_call", "toolCallId": tool_call_id, "title": "demo_tool",
+             "status": "pending", "rawInput": {"i": i}},
+        )
+        _send_update(
+            session_id,
+            {"sessionUpdate": "tool_call_update", "toolCallId": tool_call_id, "title": "demo_tool",
+             "status": "completed", "rawOutput": {"ok": True}},
+        )
 
 
 _TOOL_EXCEPTION_MARKER = "TOOL_EXCEPTION"

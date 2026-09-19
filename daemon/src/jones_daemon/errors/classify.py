@@ -40,6 +40,12 @@ watchdog) adds exactly one more: `"worker process exited unexpectedly ..."` —
 deliberately worded so `_WORKER_CRASH_MARKERS` below matches it before anything
 else, since that call site *knows* for certain it's a worker_crash (no text
 sniffing needed, most reliable of every branch below).
+
+R-N5 (controller ruling, 2026-09-20) adds `_handle_tool_call_start`'s
+Step-count/时长上限 checks as callers too, but they don't need a `reason`
+marker of their own — they pass `kind_hint="budget"` directly, which `classify()`
+trusts outright and returns before any text matching runs at all (see that
+function's docstring).
 """
 
 from __future__ import annotations
@@ -174,19 +180,20 @@ class ErrorCard:
     an optional `budget` detail (round-2 review #4).
 
     `budget`: PRD 9.3's 预算终止 row requires "显式卡片说明是哪个预算、用了多少、
-    上限多少" — `{name, used, limit, unit}` — but nothing in this repo today
-    has that structured data to hand (the two call sites that can produce
-    `kind="budget"` are: a caller passing it explicitly, which no call site
-    does yet — 11.2's Step/时长 upper bounds have no trigger wired anywhere,
-    see 04-w5-interfaces.md §4.2 — and this module's own text-based upgrade of
-    a rate-limit/quota `reason` string, which is free text from a provider
-    exception, not a structured API response with numbers to parse out
-    reliably). Left `None` in both cases rather than guessing — this field
-    exists so a *future* caller that does have real numbers (once 11.2's
-    triggers are wired, or a provider error body is parsed instead of just its
-    message) has somewhere to put them, and the renderer already knows how to
-    show it when present; that is the "structural, not deferred" fix the
-    review asked for, without fabricating numbers this module doesn't have."""
+    上限多少" — `{name, used, limit, unit}`. Two call sites can produce
+    `kind="budget"`: a caller passing it explicitly — as of R-N5 (controller
+    ruling, 2026-09-20), that's `sessions/service.py::_handle_tool_call_start`'s
+    Step-count/duration-cap checks (11.2's two upper bounds, now actually
+    wired — see 04-w5-interfaces.md §4.2), which DOES have real numbers to
+    hand and passes them through here — and this module's own text-based
+    upgrade of a rate-limit/quota `reason` string, which is still free text
+    from a provider exception, not a structured API response with numbers to
+    parse out reliably, and so still leaves this `None`. This field exists so
+    a *future* caller that does have real numbers (e.g. once a provider error
+    body is parsed instead of just its message) has somewhere to put them,
+    and the renderer already knows how to show it when present; that is the
+    "structural, not deferred" fix the round-2 review asked for, without
+    fabricating numbers this module doesn't have."""
 
     kind: str  # ErrorKind.value, or "user" for the non-error pass-through card
     title: str
@@ -352,10 +359,10 @@ def classify(
 
     `kind_hint` is the `kind` the caller passed to `_terminate_run` — today
     always `"error"` or `"budget"` (never `"user"`, see `is_user_stop`). An
-    explicit `"budget"` hint is trusted outright (a future Step-count/duration-
-    cap caller — 04-w5-interfaces.md §4's Step/时长上限 triggers are not wired
-    to any call site by this branch, see the PR report — would pass this once
-    it exists); `"error"`/anything else falls through to text classification of
+    explicit `"budget"` hint is trusted outright — as of R-N5 (controller
+    ruling, 2026-09-20), `sessions/service.py::_handle_tool_call_start`'s
+    Step-count/duration-cap checks (11.2's two upper bounds) are exactly such a
+    caller; `"error"`/anything else falls through to text classification of
     `reason`, using `last_step_status` (the last Step recorded for this Run, if
     any) to distinguish "the model/API layer failed" from "a specific tool call
     itself failed" within the shared `"ACP prompt failed: ..."` bucket.
@@ -415,7 +422,13 @@ def build_user_card(reason: str) -> ErrorCard:
     )
 
 
-def build_card(kind: ErrorKind, *, reason: str, step_seq: int | None) -> ErrorCard:
+def build_card(
+    kind: ErrorKind,
+    *,
+    reason: str,
+    step_seq: int | None,
+    budget: dict[str, Any] | None = None,
+) -> ErrorCard:
     redacted = redact_secrets(reason)
     title = _TITLES[kind]
     actions = _actions_for(kind)
@@ -450,4 +463,11 @@ def build_card(kind: ErrorKind, *, reason: str, step_seq: int | None) -> ErrorCa
         raw_excerpt=_truncate(redacted, _MAX_EXCERPT_CHARS),
         actions=actions,
         retryable="retry" in actions,
+        # R-N5 (controller ruling, 2026-09-20; PRD 9.3 预算终止 row: "显式卡片
+        # 说明是哪个预算、用了多少、上限多少") — only `_handle_tool_call_start`'s
+        # Step-count/duration-cap call sites pass this today; every other
+        # caller still has no structured numbers to give (see this dataclass's
+        # own docstring above), so `budget` stays `None` for them exactly as
+        # before this round.
+        budget=budget,
     )
