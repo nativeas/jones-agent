@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import type { RpcTransport } from '../rpc/transport'
 
 interface PingResult {
   version: string
@@ -9,18 +10,20 @@ interface PingResult {
 type Status = { kind: 'loading' } | { kind: 'ok'; data: PingResult } | { kind: 'error'; message: string }
 
 /** Small card calling `daemon.ping` — no polling (idle CPU must stay ~0, PRD 11.2):
- * it pings once on mount and again only when the user asks. */
-export function DaemonStatusCard(): JSX.Element {
+ * it pings once on mount and again only when the user asks. Goes through the
+ * injected `RpcTransport` (not `window.jones` directly) so it also works under
+ * `MockTransport` — vitest and `pnpm dev:mock` (01-w2-interfaces.md §5). */
+export function DaemonStatusCard({ transport }: { transport: RpcTransport }): JSX.Element {
   // Initial state is already 'loading', so the mount-time fetch below never needs to
   // set state synchronously from within the effect body (react-hooks/set-state-in-effect).
   const [status, setStatus] = useState<Status>({ kind: 'loading' })
 
   const runPing = useCallback(() => {
-    window.jones.rpc
-      .call('daemon.ping')
+    transport
+      .call<PingResult>('daemon.ping')
       .then((res) => {
-        if (res.ok) {
-          setStatus({ kind: 'ok', data: res.result as PingResult })
+        if (res.ok && res.result) {
+          setStatus({ kind: 'ok', data: res.result })
         } else {
           setStatus({ kind: 'error', message: res.message ?? 'unknown error' })
         }
@@ -28,7 +31,7 @@ export function DaemonStatusCard(): JSX.Element {
       .catch((err: unknown) => {
         setStatus({ kind: 'error', message: err instanceof Error ? err.message : String(err) })
       })
-  }, [])
+  }, [transport])
 
   const refresh = useCallback(() => {
     setStatus({ kind: 'loading' })
