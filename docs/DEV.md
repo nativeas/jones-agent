@@ -25,6 +25,14 @@
 
 一个分支只应触碰它的 Issue 所需目录。需要改别的目录的接口 → 先在 `docs/design/` 里改契约，并在报告中显式说明。
 
+## 本地环境
+
+- **daemon（`uv sync`/`uv run`）在没有 `hermes-agent` 本机 checkout 时**：`daemon/pyproject.toml` 的 `worker` 依赖组（只有真的要跑*真实* Hermes worker 才需要，daemon 自身代码和全部测试都不 `import` 它）把 `hermes-agent` 声明成本机路径 editable 依赖，默认不装（`uv sync`/`uv run` 只装 `dev` 组）。但一次不带 `--frozen` 的 `uv sync`/`uv run` 仍会在执行前重新解析*全部*分组（含 `worker`）来核对/生成 `uv.lock`，这一步会触碰那条本机路径，在没有这份 checkout 的机器上必然报 `error: Distribution not found at: file:///...`。
+  - `make check-daemon` 已经内置了这个环境变量，直接跑即可，不需要额外设置。
+  - 手动跑 `cd daemon && uv sync` / `uv run ...`（不经过 `make`）时，加上 `UV_FROZEN=1`（信任已提交的 `uv.lock`，跳过重新解析）：`cd daemon && UV_FROZEN=1 uv sync && UV_FROZEN=1 uv run pytest -q`。
+  - 只有显式 `uv sync --group worker`（真的要跑真实 Hermes worker）才需要本机有这份 checkout，或把 `daemon/pyproject.toml` 的 `[tool.uv.sources]` 改指到你自己的路径。
+  - 详见 `docs/design/01-w2-interfaces.md` §2.2。
+
 ## 工程原则
 1. **第一性原理**：先问「这个问题的本质约束是什么」，再选方案。不要因为某个库流行就用它；不要因为 Hermes 有某个东西就绕开它重写——能直接复用 Hermes 的（会话状态、工具、Skill、MCP、cron、provider）就复用，只在 Jones 独有的地方（权限闸、Project/Agent 模型、Electron 前端、回放）写代码。
 2. **不打补丁**：发现前提错了就改前提（文档 + 结构），不要在错的结构上加 if。一个 PR 里出现第三个 workaround 时停下来重新设计。

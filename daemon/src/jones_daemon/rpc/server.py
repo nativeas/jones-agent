@@ -80,6 +80,12 @@ class Connection:
         # Requests from this connection currently dispatched (task created) but
         # not yet responded to — see MAX_INFLIGHT_PER_CONNECTION.
         self.inflight = 0
+        # Session ids this connection has `session.subscribe`d to (design §4.2:
+        # notifications are delivered "按 session 订阅") — a plain set, not
+        # asyncio-guarded: only ever mutated from this connection's own dispatch
+        # tasks, which already serialize through `_dispatch_bounded`'s per-request
+        # handling of a single reader loop (see `_handle_client`).
+        self.subscriptions: set[str] = set()
 
     async def _send(self, obj: dict[str, Any]) -> None:
         line = json.dumps(obj, ensure_ascii=False) + "\n"
@@ -104,9 +110,41 @@ class RpcServer:
         # MAX_INFLIGHT_GLOBAL for why this is a distinct, larger number than the
         # per-connection cap.
         self._dispatch_semaphore = asyncio.Semaphore(MAX_INFLIGHT_GLOBAL)
+        # Every currently-connected client, so `broadcast()` (design §4.2's
+        # per-session notification delivery — added here by A/#10, the one
+        # rpc/server.py file every W2 branch may extend additively, see
+        # 01-w2-interfaces.md §2 "加法不改法") has something to fan out to. A plain
+        # set: connections add themselves in `_handle_client` and remove
+        # themselves in its `finally`, both on the event loop thread.
+        self._connections: set[Connection] = set()
 
     def register(self, method: str, handler: Handler) -> None:
         self._methods[method] = handler
+
+    async def broadcast(self, session_id: str, method: str, params: Any) -> None:
+        """Push a notification to every connection currently subscribed to
+        `session_id` (`session.subscribe`, design §4.2). Best-effort per connection:
+        one connection's write failing (e.g. it disconnected between the
+        subscription check and the write) must not stop delivery to the others —
+        `_handle_client`'s own reader loop is what notices a dead connection and
+        removes it from `_connections`, this method just skips over the gap.
+        """
+        # Snapshot before iterating: `notify()` awaits (holds `conn._lock`, drains
+        # the socket), during which `_handle_client`'s finally block could mutate
+        # `_connections` for an unrelated client disconnecting concurrently —
+        # iterating a live set across an await point is a `RuntimeError: Set
+        # changed size during iteration` waiting to happen, not a hypothetical.
+        targets = [c for c in self._connections if session_id in c.subscriptions]
+        for conn in targets:
+            try:
+                await conn.notify(method, params)
+            except (ConnectionError, OSError) as exc:
+                logger.debug(
+                    "broadcast to a subscribed connection failed, skipping",
+                    extra={
+                        "detail": {"session_id": session_id, "method": method, "error": str(exc)}
+                    },
+                )
 
     async def start(self) -> None:
         if self.socket_path.exists():
@@ -136,6 +174,7 @@ class RpcServer:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         conn = Connection(writer)
+        self._connections.add(conn)
         peer = writer.get_extra_info("peername") or "unix"
         logger.info("client connected", extra={"detail": {"peer": str(peer)}})
         tasks: set[asyncio.Task[None]] = set()
@@ -193,6 +232,7 @@ class RpcServer:
                 "connection reset while reading", extra={"detail": {"peer": str(peer)}}
             )
         finally:
+            self._connections.discard(conn)
             for task in tasks:
                 task.cancel()
             if tasks:

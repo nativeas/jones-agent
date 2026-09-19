@@ -305,3 +305,102 @@ async def test_connection_inflight_cap_rejects_overflow_instead_of_queueing(serv
         assert "error" not in after_response
     finally:
         writer.close()
+
+
+# -- broadcast / per-session subscriptions (added by A/#10, design §4.2) ---------
+
+
+async def test_broadcast_delivers_only_to_subscribed_connections(server):
+    # A raw handler standing in for `session.subscribe` (sessions/methods.py owns
+    # the real one) — this file tests the rpc/server.py mechanism A is allowed to
+    # add, independent of the sessions/ package.
+    async def subscribe(params, conn):
+        conn.subscriptions.add(params["id"])
+        return {"subscribed": True}
+
+    server.register("test.subscribe", subscribe)
+
+    reader_a, writer_a = await asyncio.open_unix_connection(str(server.socket_path))
+    reader_b, writer_b = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        # Only connection A subscribes to session "s1".
+        writer_a.write(b'{"jsonrpc":"2.0","id":"1","method":"test.subscribe","params":{"id":"s1"}}\n')
+        await writer_a.drain()
+        await asyncio.wait_for(reader_a.readuntil(b"\n"), timeout=2)  # consume the ack
+
+        await server.broadcast("s1", "message.delta", {"delta": "hi"})
+
+        note = json.loads(await asyncio.wait_for(reader_a.readuntil(b"\n"), timeout=2))
+        assert note == {"jsonrpc": "2.0", "method": "message.delta", "params": {"delta": "hi"}}
+
+        # Connection B never subscribed — prove it got nothing by sending it a
+        # request afterwards and confirming that's the *first* thing it reads
+        # (a leaked broadcast would have arrived first and broken this parse).
+        writer_b.write(b'{"jsonrpc":"2.0","id":"2","method":"daemon.ping"}\n')
+        await writer_b.drain()
+        response_b = json.loads(await asyncio.wait_for(reader_b.readuntil(b"\n"), timeout=2))
+        assert response_b["id"] == "2"
+    finally:
+        writer_a.close()
+        writer_b.close()
+
+
+async def test_broadcast_to_no_subscribers_is_a_silent_no_op(server):
+    # Must not raise just because nobody is listening for this session.
+    await server.broadcast("nobody-subscribed", "message.delta", {"delta": "x"})
+
+
+async def test_unsubscribe_stops_further_broadcasts(server):
+    async def subscribe(params, conn):
+        conn.subscriptions.add(params["id"])
+        return {}
+
+    async def unsubscribe(params, conn):
+        conn.subscriptions.discard(params["id"])
+        return {}
+
+    server.register("test.subscribe", subscribe)
+    server.register("test.unsubscribe", unsubscribe)
+
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        writer.write(b'{"jsonrpc":"2.0","id":"1","method":"test.subscribe","params":{"id":"s1"}}\n')
+        await writer.drain()
+        await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2)
+
+        writer.write(b'{"jsonrpc":"2.0","id":"2","method":"test.unsubscribe","params":{"id":"s1"}}\n')
+        await writer.drain()
+        await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2)
+
+        await server.broadcast("s1", "message.delta", {"delta": "should not arrive"})
+
+        # Confirm nothing arrived by racing a fresh request past it.
+        writer.write(b'{"jsonrpc":"2.0","id":"3","method":"daemon.ping"}\n')
+        await writer.drain()
+        response = json.loads(await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2))
+        assert response["id"] == "3"
+    finally:
+        writer.close()
+
+
+async def test_broadcast_to_a_connection_that_already_disconnected_does_not_raise(server):
+    class DeadConnLikeWriter:
+        async def notify(self, method, params):
+            raise ConnectionError("peer gone")
+
+    from jones_daemon.rpc.server import Connection
+
+    dead = Connection.__new__(Connection)
+    dead.subscriptions = {"s1"}
+
+    async def _boom_notify(method, params=None):
+        raise ConnectionError("peer gone")
+
+    dead.notify = _boom_notify
+    server._connections.add(dead)
+    try:
+        # Must swallow the per-connection failure and not blow up the whole
+        # broadcast for whoever else is subscribed.
+        await server.broadcast("s1", "message.delta", {"delta": "x"})
+    finally:
+        server._connections.discard(dead)

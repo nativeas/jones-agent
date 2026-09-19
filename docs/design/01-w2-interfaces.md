@@ -42,6 +42,31 @@ class DaemonContext:
 - **测试**：用一个假的 ACP agent（`tests/fake_acp_agent.py`，纯 stdlib，按脚本回放 update/request_permission）覆盖 client、WorkerManager 生命周期、队列串行、stop、崩溃恢复；真实 Hermes 的端到端放 `tests/integration/`，用 `JONES_E2E=1` 门控（需要模型 Key，CI 不跑）。
 - **通知路由**：`session.subscribe/unsubscribe` 在 A 里实现，`Connection` 上挂订阅集合；`RpcServer.broadcast(session_id, method, params)` 由 A 加到 `rpc/server.py`（这是 A 唯一允许改的 rpc/ 文件，加法不改法）。
 
+### 2.1 落地时的契约变更（2026-09-19，实现阶段发现，非设计推测）
+
+- **`queue_items.turn_id`**：002 迁移给 `queue_items` 加了一列 `turn_id TEXT REFERENCES turns(id)`。00-foundation.md §5 把 Turn 定义为"一次用户输入"（1 Turn -> 1 Run），但 `queue_items` 原表没有 `turn_id`，无法表达"排队中的输入已经有一行 Turn，只是还没轮到执行"。现在的语义：`session.send` 无论立即执行还是排队都先建 Turn+Message（`turn.messages` 里立刻可见），排队只是"这个 Turn 还没轮到 `worker.client.prompt()`"。理由与实现见 `store/migrations/002_seed_defaults_and_queue_turn.sql` 文件头注释。
+- **`permission_decisions.decided_by` 从 `NOT NULL` 改为可空**：001 把这一列声明成 `NOT NULL`，但一个刚创建、还没人裁决的 `decision='pending'` 请求没有诚实的非空值可填——这是 001 的一个 bug，不是设计选择（用实际跑 `INSERT` 复现过 `NOT NULL constraint failed`，不是猜测）。已有迁移不能就地改，修复走 002 里标准的"重建表"手法（见该文件）。
+- **`hermes-agent` 依赖形态与 §2 原文不同**：原文"锁到 commit...git 依赖或 PyPI 同版本...提交的 pyproject 必须是可复现的远端引用"这条在实现阶段发现走不通——PyPI 目前最新是 `0.19.0`（早于这个 commit 自报的 `0.21.2`，即这个 commit 还没发过 PyPI 包），而 `hermes-agent` 自己的 `setup.py` 对非 editable 安装（含普通的 `@ git+...` 直接引用）直接抛错拒绝（"Building wheels or sdists for hermes-agent is not supported...use an editable install instead"，已实测复现，非猜测），`uv` 的 `[tool.uv.sources]` 又不接受 `git` + `editable` 同时出现（"cannot specify both `git` and `editable`"，同样已实测）。结果是**唯一能让 `uv sync` 成功的形态是本机路径 editable 依赖**（`daemon/pyproject.toml` 的 `[tool.uv.sources]` 指向 `/Users/nativeas/.hermes/hermes-agent`，恰好是这个 commit 的完整 checkout）——这在别的机器/CI 上不是开箱可复现的，需要那台机器有同一 commit 的本地 checkout（或把这一行改指到它自己的路径）。这是这条子任务范围内能做到的最接近"可复现"的形态；真正跨机器可复现需要 Hermes 官方发一个匹配这个 commit 的 PyPI/可安装 artifact，不是 A 这条分支能解决的。
+- **`cryptography` 版本下限从 `>=50.0.1` 放宽到 `>=50.0.0`**：B/#7 的 `uv add cryptography` 落了 `>=50.0.1`；`hermes-agent` 对每个直接依赖都精确锁定（它自己的补给链安全策略），锁的是 `cryptography==50.0.0`，与 `>=50.0.1` 无解可解。50.0.0 已有 `secrets/vault.py` 用到的全部原语（`AESGCM` 多年前就稳定），降下限不影响 B 的实现。
+- **Provider 绑定未接入 worker 启动**：`ProviderResolver.resolve()`（B 已落地）目前没有被 `SessionService`/`WorkerManager` 调用——worker 的 `config.yaml` 里没有写入任何 `model:`/`providers:` 段。这不在 Issue #10 验收清单内（验收清单只要求队列/并行/重启/schema 版本，不要求真实模型能出字），且本机没有可用 Key 也无法验证接上之后的真实效果，所以留作明确记录的缺口（`sessions/service.py` 模块 docstring、本 PR 报告"没做什么"一节）而不是没说明地漏掉；`tests/integration/test_real_hermes_e2e.py` 用测试内 monkeypatch 手工绕过这个缺口以证明 worker 生命周期本身是对的。
+
+### 2.2 第 1 轮评审修复：`hermes-agent` 依赖形态再次改变（2026-09-19，取代 §2.1 的"本机路径 editable"结论）
+
+评审指出 §2.1 记录的"本机路径 editable 依赖"形态会让 CI（以及任何没有 `/Users/nativeas/.hermes/hermes-agent` 这份 checkout 的机器）的 `uv sync` 直接失败——已实测复现：把路径换成不存在的目录后，`uv sync` 报 `error: Distribution not found at: file:///nonexistent/hermes-agent`；`.github/workflows/ci.yml` 的 daemon job 第一步就是 `uv sync`，在 CI 的 ubuntu-latest 上这条路径必然不存在。
+
+第一性原理重新审视："`daemon/` 自身代码是否真的需要 `hermes-agent` 才能 `uv sync`？" 答案是否：`src/jones_daemon` 下没有任何一处 `import hermes_agent`/`import acp_adapter`——`workers/manager.py` 只用 `sys.executable -m acp_adapter.entry` 当子进程命令行，从不在 daemon 自己的进程里 import 它；全部 128 个测试都通过 `worker_cmd=[sys.executable, "tests/fake_acp_agent.py"]`（纯 stdlib）注入假 worker，`tests/integration/test_real_hermes_e2e.py` 是唯一需要真实 `hermes-agent` 的测试，且已经用 `JONES_E2E=1`+`ANTHROPIC_API_KEY` 双重门控、本机无 Key 时自行跳过。
+
+修法（对应评审给出的选项 (a)）：
+
+- `hermes-agent[acp]` 从 `dependencies` 移到新的 `[dependency-groups] worker`，并显式加 `[tool.uv] default-groups = ["dev"]`——一个不带 `--group worker` 的 `uv sync`/`uv run` 现在完全不接触这个依赖，无论 `[tool.uv.sources]` 里那条本机路径存不存在。
+- 但即便挪到非默认分组，`uv sync`/`uv run`（不带 `--frozen`）在没有既存 `uv.lock` 时仍会重新解析*全部*分组（包括 `worker`）来生成锁文件，同样会在路径不存在时报错；已实测复现，且即便预先提交一份用真实路径生成好的 `uv.lock`，`uv sync`（不带 `--frozen`）依旧会重新校验，同样失败——只有 `uv sync --frozen`（信任已提交的 `uv.lock`，不重新解析）才能在路径不存在的情况下成功。因此 `.github/workflows/ci.yml` 的 `daemon` job 新增 `env: UV_FROZEN: "1"`，对该 job 下的每一条 `uv sync`/`uv run` 生效（已实测：把路径改成 `/nonexistent/...` 后，`UV_FROZEN=1 uv sync && UV_FROZEN=1 uv run ruff check . && UV_FROZEN=1 uv run pytest -q` 全绿，128 passed / 1 skipped）。
+- `worker` 分组里把裸的 `"hermes-agent[acp]"` 改成 `"hermes-agent[acp]==0.21.2"`（这个 commit 自报的版本号）——即便可解析来源那一半仍未解决，这至少把 §2 "锁到 commit" 里"锁版本"这一半的 metadata 落进提交物，而不是完全没有约束。
+- `[tool.uv.sources]` 本身维持指向本机路径不变（真正的可移植修复仍然需要 Hermes 官方发一个匹配这个 commit 的可安装 artifact，不是这条分支能解决的）——区别在于现在只有显式 `uv sync --group worker` 的人才会撞到它，而不是每一次 `uv sync`/CI。
+
+结果：`daemon/` 目录归属未变，`.github/` 不在任何 Issue 的专属目录表里，这次改动只加了 `env:` 一行 + 沿用已有的 `uv sync`/`uv run ruff check .`/`uv run pytest -q` 三步，未改 CI 的步骤结构本身。
+
+**第 2 轮评审补充（2026-09-19）**：上面只救活了 CI——CI 的 `daemon` job 有 `env: UV_FROZEN: "1"`，但仓库根 `Makefile` 的 `check-daemon` 目标和裸 `uv sync`/`uv run` 完全没有这个变量，在任何没有 `/Users/nativeas/.hermes/hermes-agent` checkout 的机器上依旧必然失败（已实测复现：把 `[tool.uv.sources]` 路径改成不存在的路径、删掉 `.venv`，不带 `UV_FROZEN` 跑 `uv sync` 直接报 `error: Distribution not found`），报错文字不提 `worker` 分组也不提 `UV_FROZEN`，仓库里除了这份文档和 `ci.yml` 的注释外没有别处告诉贡献者要加这个变量。修法：`Makefile` 的 `check-daemon` 目标现在给两条 `uv` 命令都加上 `UV_FROZEN=1`；`docs/DEV.md` 新增"本地环境"一节，把裸 `uv sync`/`uv run`（不经过 `make`）时同样要加 `UV_FROZEN=1` 写成给人看的指令。§2 原文"锁到 commit"里可解析来源那一半（现在仍是本机绝对路径）依旧未解决——如上所述，这是 Hermes 自身打包策略造成的约束，不是这条分支能解开的。
+
 ## 3. B：Provider / Key vault（#7）
 
 ```python
