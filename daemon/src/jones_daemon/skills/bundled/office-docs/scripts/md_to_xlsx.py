@@ -24,6 +24,27 @@ from pathlib import Path
 from _shared_md import parse_blocks, plain_text
 
 
+def _append_text_row(ws, values: list[str]) -> None:
+    """Append a row where every cell is forced to Excel's "string" type,
+    no matter what the text looks like.
+
+    Plain ``ws.append(values)`` alone hands each value to openpyxl's
+    ``Cell.value`` setter, which infers the cell's type from its content —
+    a value starting with "=" is bound as a live formula (``data_type =
+    "f"``). Markdown table/paragraph text is untrusted (it can come from a
+    scraped page or an agent-authored report), so a literal cell like
+    "=1+1" or "=cmd|'/C calc'!A1" would silently become an executable
+    formula in the generated workbook instead of staying literal text
+    (CSV/formula injection, CWE-1236; review round-1, #3). Re-stamping
+    ``data_type`` *after* the value assignment is required — the setter
+    would otherwise overwrite it right back to "f" on the next value set.
+    """
+    ws.append(values)
+    row = ws.max_row
+    for col in range(1, len(values) + 1):
+        ws.cell(row=row, column=col).data_type = "s"
+
+
 def _sheet_title(name: str, used: set[str]) -> str:
     # Excel sheet name limits: <=31 chars, no `: \ / ? * [ ]`.
     cleaned = re.sub(r"[:\\/?*\[\]]", " ", name).strip() or "Sheet"
@@ -50,12 +71,12 @@ def build_workbook(markdown_text: str):
         ws = wb.create_sheet(_sheet_title("Document", used_titles))
         for kind, payload in blocks:
             if kind == "heading":
-                ws.append([plain_text(payload[1])])
+                _append_text_row(ws, [plain_text(payload[1])])
             elif kind == "paragraph":
-                ws.append([plain_text(payload)])
+                _append_text_row(ws, [plain_text(payload)])
             elif kind in ("bullet_list", "ordered_list"):
                 for item in payload:
-                    ws.append(["", plain_text(item)])
+                    _append_text_row(ws, ["", plain_text(item)])
         return wb
 
     for idx, (block_i, rows) in enumerate(tables, start=1):
@@ -66,7 +87,7 @@ def build_workbook(markdown_text: str):
                 break
         ws = wb.create_sheet(_sheet_title(title, used_titles))
         for row in rows:
-            ws.append([plain_text(cell) for cell in row])
+            _append_text_row(ws, [plain_text(cell) for cell in row])
     return wb
 
 

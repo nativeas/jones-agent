@@ -22,7 +22,9 @@ Split by cost/what's being proven:
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -35,7 +37,7 @@ OFFICE_DOCS_SCRIPTS = BUNDLED_DIR / "office-docs" / "scripts"
 
 SAMPLE_MD = """# Sample Report
 
-A paragraph with **bold**, *italic*, and `code`.
+A paragraph with **bold**, *italic*, `code`, and raw a<b & c markers.
 
 ## Section
 
@@ -48,7 +50,7 @@ A paragraph with **bold**, *italic*, and `code`.
 > a blockquote
 
 ```
-plain code block
+if (a<b && c) { }
 ```
 
 ## Numbers
@@ -87,10 +89,12 @@ class TestListing:
             assert env_var in text
 
 
-def _uv_run(script: Path, *args: str, timeout: int = 180) -> subprocess.CompletedProcess:
+def _uv_run(
+    script: Path, *args: str, timeout: int = 180, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["uv", "run", str(script), *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, timeout=timeout, env=env,
     )
 
 
@@ -176,6 +180,43 @@ print("READBACK_OK")
         assert readback.returncode == 0, readback.stderr
         assert "READBACK_OK" in readback.stdout
 
+    def test_md_to_xlsx_does_not_execute_a_leading_equals_sign_as_a_formula(self, tmp_path):
+        """Round-1 review #3: a table cell whose literal text happens to
+        start with '=' must round-trip as text, not get bound by openpyxl
+        as a live formula — content corruption (a plain-text column turned
+        into computed values) plus CWE-1236 formula/CSV injection, since
+        this markdown routinely comes from scraped pages or agent-authored
+        reports, not a trusted spreadsheet author."""
+        src = tmp_path / "formula.md"
+        src.write_text(
+            "| Name | Formula |\n"
+            "| --- | --- |\n"
+            '| Alice | =1+1 |\n'
+            '| Bob | =HYPERLINK("http://evil.example","click") |\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "formula.xlsx"
+        result = _uv_run(OFFICE_DOCS_SCRIPTS / "md_to_xlsx.py", str(src), str(out))
+        assert result.returncode == 0, result.stderr
+
+        readback = _uv_run_inline(
+            f"""
+import openpyxl
+wb = openpyxl.load_workbook({str(out)!r})
+ws = wb.active
+b2, b3 = ws["B2"], ws["B3"]
+assert b2.value == "=1+1", b2.value
+assert b2.data_type == "s", b2.data_type
+assert b3.value == '=HYPERLINK("http://evil.example","click")', b3.value
+assert b3.data_type == "s", b3.data_type
+print("READBACK_OK")
+""",
+            deps=["openpyxl>=3.1,<4"],
+            tmp_path=tmp_path,
+        )
+        assert readback.returncode == 0, readback.stderr
+        assert "READBACK_OK" in readback.stdout
+
     def test_md_to_pdf_produces_a_pdf_with_a_real_page(self, sample_md, tmp_path):
         out = tmp_path / "out.pdf"
         result = _uv_run(OFFICE_DOCS_SCRIPTS / "md_to_pdf.py", str(sample_md), str(out))
@@ -189,6 +230,51 @@ print("READBACK_OK")
         # Which tier actually ran on this machine — informational, not an
         # assertion: see md_to_pdf.py's own docstring for the fallback order.
         assert "wrote" in result.stdout
+
+    def test_md_to_pdf_reportlab_tier_survives_angle_brackets_and_ampersands(
+        self, tmp_path
+    ):
+        """Round-1 review #1/#2: force the reportlab fallback tier (strip
+        pandoc/LibreOffice off PATH — the shape of a bare CI/dev machine,
+        which is exactly the machine this tier exists for) and prove it
+        survives markdown containing '<', '&', and reportlab's own inline
+        tag names ('<br>') instead of crashing — `plain_text()`'s output
+        used to be handed to reportlab's `Paragraph` unescaped, and
+        `Paragraph` parses its input as mini-HTML."""
+        tricky = tmp_path / "tricky.md"
+        tricky.write_text(
+            "# Q&A Report\n\n"
+            "Wrap the value in <div> and compare a<b in the loop.\n\n"
+            "```\nif (a<b && c) { }\n```\n\n"
+            "Use the <br> tag here.\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "tricky.pdf"
+
+        uv = shutil.which("uv")
+        assert uv, "uv must be on PATH to run this test at all"
+        minimal_path = os.pathsep.join([str(Path(uv).parent), "/usr/bin", "/bin"])
+        env = dict(os.environ, PATH=minimal_path)
+
+        result = _uv_run(OFFICE_DOCS_SCRIPTS / "md_to_pdf.py", str(tricky), str(out), env=env)
+        assert result.returncode == 0, result.stderr
+        assert "via reportlab fallback" in result.stdout, result.stdout
+        assert out.read_bytes()[:5] == b"%PDF-"
+
+        readback = _uv_run_inline(
+            f"""
+import pypdf
+r = pypdf.PdfReader({str(out)!r})
+text = "".join(p.extract_text() or "" for p in r.pages)
+assert "Q&A Report" in text, text
+assert "a<b" in text, text
+print("READBACK_OK")
+""",
+            deps=["pypdf>=4,<6"],
+            tmp_path=tmp_path,
+        )
+        assert readback.returncode == 0, readback.stderr
+        assert "READBACK_OK" in readback.stdout
 
     def test_a_missing_source_file_fails_honestly_and_writes_nothing(self, tmp_path):
         """DEV.md 工程原则 #4: a real failure (bad source path) must exit

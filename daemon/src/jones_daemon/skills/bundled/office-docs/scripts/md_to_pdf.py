@@ -36,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from _shared_md import parse_blocks, plain_text
 
@@ -98,23 +99,27 @@ def _build_reportlab_pdf(markdown_text: str, dst: Path) -> None:
         if kind == "heading":
             level, text = payload
             style = heading_styles[min(level, len(heading_styles) - 1)]
-            story.append(Paragraph(plain_text(text), style))
+            story.append(Paragraph(escape(plain_text(text)), style))
         elif kind == "paragraph":
-            story.append(Paragraph(plain_text(payload), styles["BodyText"]))
+            story.append(Paragraph(escape(plain_text(payload)), styles["BodyText"]))
         elif kind == "bullet_list":
             story.append(ListFlowable(
-                [ListItem(Paragraph(plain_text(i), styles["BodyText"])) for i in payload],
+                [ListItem(Paragraph(escape(plain_text(i)), styles["BodyText"])) for i in payload],
                 bulletType="bullet",
             ))
         elif kind == "ordered_list":
             story.append(ListFlowable(
-                [ListItem(Paragraph(plain_text(i), styles["BodyText"])) for i in payload],
+                [ListItem(Paragraph(escape(plain_text(i)), styles["BodyText"])) for i in payload],
                 bulletType="1",
             ))
         elif kind == "code":
-            story.append(Paragraph(plain_text(payload).replace("\n", "<br/>"), styles["Code"]))
+            # escape() first, THEN turn newlines into <br/> — reversing the
+            # order would re-introduce raw "<"/"&" into the mini-HTML stream
+            # reportlab's Paragraph parses (review round-1, #2).
+            code_text = escape(plain_text(payload)).replace("\n", "<br/>")
+            story.append(Paragraph(code_text, styles["Code"]))
         elif kind == "blockquote":
-            story.append(Paragraph(plain_text(payload), styles["Italic"]))
+            story.append(Paragraph(escape(plain_text(payload)), styles["Italic"]))
         elif kind == "table":
             story.append(Table([[plain_text(c) for c in row] for row in payload]))
         elif kind == "hr":
