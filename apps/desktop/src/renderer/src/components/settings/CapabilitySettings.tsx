@@ -35,8 +35,12 @@ const TIER_LABEL: Record<SkillTier, string> = { project: '项目级', user: '用
  *
  * 评审第 1 轮：`init(transport)` 挪到这里的挂载 effect（之前在 SettingsPage
  * 挂载时无条件调用，见 SettingsPage.tsx 的注释）——只有用户点开这个 tab、
- * 这个组件真的挂载时才设置 transport 并触发下面 session effect 的首次
- * 拉取，不再每次打开设置页就白扫一次。 */
+ * 这个组件真的挂载时才设置 transport 并触发下面几个 effect 的首次拉取，
+ * 不再每次打开设置页就白扫一次。
+ *
+ * 评审第 2 轮：Skill 列表的 effect 是独立的、不带 session 守卫（见下方该
+ * effect 自己的注释）——`capability.list` 需要 session，`skill.list` 不
+ * 需要，两者的加载时机不能绑在一起。 */
 export function CapabilitySettings({ transport }: { transport: RpcTransport }): JSX.Element {
   const sessions = useSessionsStore((s) => s.sessions)
   const init = useCapabilitiesStore((s) => s.init)
@@ -62,18 +66,32 @@ export function CapabilitySettings({ transport }: { transport: RpcTransport }): 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // 评审第 2 轮：Skill 加载不能挂在 session effect 下面——`skill.list` 本身
+  // 不需要 session（`project_id` 可空，daemon 侧 project_id 为 None 时只扫
+  // user+builtin 两层）。挂在下面那个 `if (!selectedSessionId) return` 的
+  // effect 里，会导致全新安装/用户关掉全部会话（sessions 为空）时
+  // loadSkills 一次都不被调用，页面假装"还没有 Skill"。这个 effect 独立
+  // 存在，不带 session 守卫；selectedSessionId 变化（含从 '' 变成真实 id）
+  // 时带上对应 project_id 重新拉取，覆盖项目级 Skill。
   useEffect(() => {
-    if (!selectedSessionId) return
-    void loadCapability(selectedSessionId)
     const session = sessions.find((s) => s.id === selectedSessionId)
     void loadSkills(session?.project_id ?? null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSessionId])
 
+  useEffect(() => {
+    if (!selectedSessionId) return
+    void loadCapability(selectedSessionId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSessionId])
+
+  // Skill 刷新不需要 session（同上），所以按钮本身不再因为没有 session 就
+  // disabled——否则用户在无会话场景下连自救都做不到。装配表的刷新仍然只在
+  // 有 selectedSessionId 时才有意义。
   const refresh = (): void => {
-    if (selectedSessionId) void loadCapability(selectedSessionId)
     const session = sessions.find((s) => s.id === selectedSessionId)
     void loadSkills(session?.project_id ?? null)
+    if (selectedSessionId) void loadCapability(selectedSessionId)
   }
 
   return (
@@ -92,9 +110,7 @@ export function CapabilitySettings({ transport }: { transport: RpcTransport }): 
             ))}
           </select>
         </label>
-        <button onClick={refresh} disabled={!selectedSessionId}>
-          刷新
-        </button>
+        <button onClick={refresh}>刷新</button>
       </div>
 
       {capability && capability.drift.length > 0 && (

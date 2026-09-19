@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { CapabilitySettings } from '../settings/CapabilitySettings'
 import { useCapabilitiesStore } from '../../store/capabilitiesStore'
 import { useSessionsStore } from '../../store/sessionsStore'
+import { MockTransport } from '../../rpc/mockTransport'
 import type { RpcCallResult, RpcTransport } from '../../rpc/transport'
 
 const NOOP_TRANSPORT: RpcTransport = {
@@ -118,5 +119,49 @@ describe('CapabilitySettings', () => {
     })
 
     expect(container.querySelector('.capability-settings__drift-warning')).toBeNull()
+  })
+
+  // 评审第 2 轮回归：修复 #3（去掉 SettingsPage 的重复预取）时把 loadSkills
+  // 的唯一调用点留在了 session effect 里（`if (!selectedSessionId) return`
+  // 之后），sessions 为空（全新安装、或用户关掉了全部会话）时 loadSkills
+  // 从未被调用过，页面假装"还没有 Skill"。这条用例故意不预置任何 session，
+  // 用真实 MockTransport（而不是 NOOP_TRANSPORT）跑一次真正的 skill.list
+  // 往返，断言 Skill 表真的加载出来，不是假空态；并断言「刷新」按钮此时
+  // 仍可点（用户在这个场景下的唯一自救手段）。
+  it('loads skill.list even when there are no sessions at all', async () => {
+    useSessionsStore.setState({
+      transport: NOOP_TRANSPORT,
+      projects: [],
+      sessions: [],
+      selectedSessionId: '',
+      loading: false,
+      error: null
+    })
+    useCapabilitiesStore.setState({
+      transport: null,
+      skills: [],
+      skillsError: null,
+      skillsLoading: false,
+      capability: null,
+      capabilitySessionId: null,
+      capabilityError: null,
+      capabilityLoading: false
+    })
+
+    const transport = new MockTransport({ schedule: (fn) => fn() })
+    container = document.createElement('div')
+    document.body.appendChild(container)
+    await act(async () => {
+      root = createRoot(container)
+      root.render(<CapabilitySettings transport={transport} />)
+    })
+
+    expect(container.textContent).not.toContain('还没有 Skill')
+    expect(useCapabilitiesStore.getState().skills.length).toBeGreaterThan(0)
+
+    const refreshButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === '刷新'
+    ) as HTMLButtonElement | undefined
+    expect(refreshButton?.disabled).toBe(false)
   })
 })
