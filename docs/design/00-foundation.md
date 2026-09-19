@@ -125,7 +125,7 @@ JSON-RPC 标准码 + 应用码：`1001 not_found`、`1002 invalid_state`（如�
 | `permission_decisions` | `step_id, gate, risk, decision, decided_by(rule/model/user), request_json, decided_at` |
 | `queue_items` | `session_id, text, attachments_json, position, state(pending/sent)` |
 | `goals` | `session_id NULL, project_id NULL, title, budget_tokens, spent_tokens, status` |
-| `crons` | `project_id, agent_id, expr, prompt, mode, enabled, last_run_at, next_run_at, fail_count` |
+| `crons` | `project_id, agent_id, name, expr, prompt, mode, enabled, last_run_at, next_run_at, fail_count` |
 | `providers` | `name, has_key BOOL, key_hint, default_model`（Key 本体在 vault，不在库） |
 | `schema_version` | `version INT` |
 
@@ -134,6 +134,11 @@ JSON-RPC 标准码 + 应用码：`1001 not_found`、`1002 invalid_state`（如�
 **追加（W3/#11，2026-09-19）**：`permission_decisions.decided_by` 的取值追加第四个：`timeout`——
 PRD 9.4 审批超时自动拒绝时如实记录，不借用 `rule`（规则闸未参与）或 `user`（无真人）。该列本身是
 无约束 TEXT，非枚举，这条只是补全文档描述，不涉及迁移。详见 `docs/design/02-w3-interfaces.md` §1.2。
+
+**追加（W5/#20，2026-09-19）**：`crons` 追加 `name TEXT NOT NULL DEFAULT ''`（迁移
+`006_crons_name.sql`）——04-w5-interfaces.md §2 的 `SessionService.create(...,
+title=cron 名)` 与失败/完成/停用推回主会话的系统消息都需要一个人可读的名字，原列表
+没有这一列，是本节遗漏，不是故意留白。详见 `docs/design/04-w5-interfaces.md` §2。
 
 ## 6. 路径（PRD 10.2）
 

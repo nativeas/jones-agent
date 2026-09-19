@@ -30,6 +30,7 @@ from jones_daemon.providers import methods as providers_methods
 from jones_daemon.providers.resolver import DaemonProviderResolver
 from jones_daemon.rpc.methods import register_builtin_methods, register_daemon_status
 from jones_daemon.rpc.server import RpcServer
+from jones_daemon.scheduler import methods as scheduler_methods
 from jones_daemon.secrets.vault import build_default_vault
 from jones_daemon.service import maybe_handle_cli
 from jones_daemon.sessions import methods as sessions_methods
@@ -133,6 +134,12 @@ async def _run() -> None:
         session_service = sessions_methods.register(server, ctx)
         register_daemon_status(server, session_service)  # 02-w3-interfaces.md §2 集成收口 #2
         await session_service.startup()
+        # Issue #20 (docs/design/04-w5-interfaces.md §2): built on top of
+        # `session_service`'s own public create/send/get surface, so it must be
+        # constructed (and started) after `startup()` above has ensured the main
+        # session exists.
+        cron_service = scheduler_methods.register(server, ctx, session_service)
+        await cron_service.start()
         await server.start()
         logger.info(
             "daemon listening",
@@ -152,6 +159,10 @@ async def _run() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await serve_task
         await server.stop()
+        # Stop dispatching new cron triggers before tearing `session_service`
+        # down — it dispatches through that service's public methods and must
+        # not still be mid-call into it once `shutdown()` starts closing workers.
+        await cron_service.stop()
         await session_service.shutdown()
         # close() is also a synchronous sqlite3 call bound to the connection's
         # home thread (check_same_thread=True) — it must run there too.
