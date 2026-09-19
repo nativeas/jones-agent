@@ -97,3 +97,44 @@ async def test_skill_list_with_unknown_project_id_errors_instead_of_silently_ign
     res = await _call(server.socket_path, "skill.list", {"project_id": "does-not-exist"})
 
     assert "error" in res  # NOT_FOUND propagates rather than degrading to "no project tier"
+
+
+async def test_skill_list_does_not_block_the_event_loop(server_and_dir, monkeypatch):
+    """评审第 1 轮 #3: `skill_list` used to call `list_skills()` directly on the
+    daemon's single event loop — the same loop the RPC server, ACP
+    `session/update` forwarding, and `server.broadcast()` all share — so a
+    slow scan would stall every session's streaming updates for its duration.
+    Regression test: with a scan slowed down artificially, a concurrent
+    `asyncio.sleep`-driven counter must keep ticking while the RPC call is in
+    flight — proof the scan is not running inline on the loop
+    (`asyncio.to_thread` offloads it)."""
+    import time
+
+    import jones_daemon.skills.methods as methods_module
+
+    def _slow_list_skills(*, project_path):
+        time.sleep(0.3)
+        return []
+
+    monkeypatch.setattr(methods_module, "list_skills", _slow_list_skills)
+
+    server, _tmp_path, _conn = server_and_dir
+
+    ticks = 0
+
+    async def _ticker() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.02)
+            ticks += 1
+
+    ticker_task = asyncio.ensure_future(_ticker())
+    try:
+        res = await _call(server.socket_path, "skill.list", {})
+    finally:
+        ticker_task.cancel()
+
+    assert "error" not in res
+    # A blocked loop would let ~0 ticks happen during the 0.3s scan; a
+    # to_thread-offloaded scan lets the loop keep serving the ticker.
+    assert ticks >= 5

@@ -13,14 +13,30 @@ convention, so nothing here rewrites or reformats a skill.
 byte-for-byte identical to Hermes's own scanner (`agent/skill_utils.py` /
 `tools/skills_tool.py` in the installed `hermes-agent` checkout,
 `/Users/nativeas/.hermes/hermes-agent`, read for this branch): Hermes's real
-scan additionally quarantines project skills via a content scanner
-(`skills_guard`), resolves `plugin:skill` namespaces, and honors
-`skills.disabled`/platform filters. Re-deriving all of that here would be
-exactly the "重写 Hermes 已有工具" DEV.md forbids (工程原则 #1) — the actual
-load-time source of truth is Hermes itself, once `worker_skill_dirs()` below
-hands it the right directories. This scanner only needs to answer "does a
-SKILL.md exist here and does its frontmatter parse" for the settings page;
-edge cases in that differ-from-Hermes list are called out in this PR's report.
+scan resolves `plugin:skill` namespaces and honors `skills.disabled`/platform
+filters. Re-deriving all of that here would be exactly the "重写 Hermes 已有
+工具" DEV.md forbids (工程原则 #1) — the actual load-time source of truth is
+Hermes itself, once `worker_skill_dirs()` below hands it the right
+directories. This scanner only needs to answer "does a SKILL.md exist here
+and does its frontmatter parse" for the settings page; edge cases in that
+differ-from-Hermes list are called out in this PR's report.
+
+**评审第 1 轮 #5 更正**：上一版这里写着"Hermes 的真实扫描还会用
+`skills_guard` 这个内容扫描器隔离项目级 skill"——这句话不对，已核对源码
+改正：`agent/skill_utils.py:337 get_external_skills_dirs()` 对 `external_dirs`
+只做"路径存在且是目录"校验，`iter_skill_index_files()` 照常索引；
+`skills_guard`（`tools/plugin_guard.py`）只在 `hermes skills install` /
+`hermes plugins install` 这两条命令式安装路径上被调用（`tools/skills_hub.py`），
+**不覆盖 `external_dirs` 的运行时扫描**——也就是说 `worker_skill_dirs()` 把
+项目目录写进 `skills.external_dirs` 之后，Hermes 侧对这些项目级 skill 没有
+任何内容扫描或信任门。项目级 skill 来自用户 clone 的仓库，可信度与第三方
+MCP 工具同级；03-w4-interfaces.md §2 / N15 对 MCP 工具的要求是"默认不进
+Agent 白名单，直到用户显式启用"，项目级 skill 目前没有对等处理——这是
+H 接线 `_prepare_hermes_home` 之前需要敲定的点（写 `config.yaml` 是 H 的
+独占文件，不在这条分支的改动范围），这条分支能做的是：① 改正这句错误
+描述，不让下一个读它的人以为已有防护；② 在透明页上把项目级 skill 显式标为
+"来自项目仓库、未经确认"（见 `CapabilitySettings.tsx`）。是否要在
+`worker_skill_dirs()` 或 H 的接入点加一道真正的门，留给评审/H 决定。
 
 ## How a Session's Skill dirs reach the worker (source-checked, not assumed)
 
@@ -66,6 +82,7 @@ not implemented here.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -92,12 +109,21 @@ _EXCLUDED_DIR_NAMES = frozenset({
 
 
 def _iter_skill_md_files(root: Path):
+    """`os.walk` with in-place `dirnames` pruning, not `Path.rglob` — 评审第
+    1 轮 #3: `rglob("SKILL.md")` walks the ENTIRE subtree before
+    `_EXCLUDED_DIR_NAMES` ever gets a look (filtering happened on the
+    *results*, after rglob had already descended into every `node_modules`/
+    `.venv`/`__pycache__` it found), which is the exact noise this exclusion
+    list exists to avoid. Pruning `dirnames` during the walk means an
+    excluded directory is never opened at all."""
     if not root.is_dir():
         return
-    for skill_md in sorted(root.rglob("SKILL.md")):
-        if any(part in _EXCLUDED_DIR_NAMES for part in skill_md.relative_to(root).parts[:-1]):
-            continue
-        yield skill_md
+    hits: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in _EXCLUDED_DIR_NAMES)
+        if "SKILL.md" in filenames:
+            hits.append(Path(dirpath) / "SKILL.md")
+    yield from sorted(hits)
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, str], str | None]:
@@ -188,7 +214,12 @@ def list_skills(*, project_path: str | None) -> list[dict[str, Any]]:
     """
     tiers: list[tuple[Path, str]] = []
     if project_path is not None:
-        tiers.append((paths.project_skills_dir(project_path), "project"))
+        # create=False: this is a read-only scan (paths.py:115-123's contract,
+        # mirrored by agents/store.py) — it must not resurrect
+        # `<project_path>/.jones/skills` for a project directory the user has
+        # since deleted or unmounted (评审第 1 轮 #2). `_iter_skill_md_files`
+        # already treats a non-existent root as "no skills here", not an error.
+        tiers.append((paths.project_skills_dir(project_path, create=False), "project"))
     tiers.append((paths.skills_dir(), "user"))
     tiers.append((BUNDLED_SKILLS_DIR, "builtin"))
 
@@ -222,8 +253,12 @@ def worker_skill_dirs(ctx: Any, session: dict[str, Any]) -> list[Path]:
     first-wins by name, per `tools/skills_tool.py::_find_all_skills` —
     verified against the installed checkout): project dir first (most
     specific), then the user dir, then the builtin dir. Only directories that
-    actually exist are returned (an empty/missing builtin tier in W4 is
-    normal, not an error — see `BUNDLED_SKILLS_DIR`'s comment); the default
+    actually exist are returned — checked with `is_dir()` for every tier
+    (not relied on as a side effect of `mkdir`-on-access: the project tier is
+    resolved with `create=False`, same read-only contract as `list_skills()`,
+    so a deleted/unmounted project directory is genuinely absent here, not
+    silently recreated — 评审第 1 轮 #2). An empty/missing builtin tier in W4
+    is normal, not an error (see `BUNDLED_SKILLS_DIR`'s comment); the default
     Project's project dir is deduplicated against the user dir since they're
     literally the same path (see `list_skills()`'s matching comment).
 
@@ -246,7 +281,12 @@ def worker_skill_dirs(ctx: Any, session: dict[str, Any]) -> list[Path]:
 
     candidates: list[Path] = []
     if project_path is not None:
-        candidates.append(paths.project_skills_dir(project_path))
+        project_dir = paths.project_skills_dir(project_path, create=False)
+        if project_dir.is_dir():
+            candidates.append(project_dir)
+    # skills_dir() always ensures ~/.jones/skills exists (same as every other
+    # user-level accessor in paths.py) — it is not a project path a user can
+    # delete/unmount out from under this scan, so no create=False here.
     candidates.append(paths.skills_dir())
     if BUNDLED_SKILLS_DIR.is_dir():
         candidates.append(BUNDLED_SKILLS_DIR)

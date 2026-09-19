@@ -92,11 +92,65 @@ def test_list_skills_empty_when_no_tier_has_anything(tmp_path, monkeypatch):
     assert service.list_skills(project_path=None) == []
 
 
+def test_list_skills_does_not_recreate_a_deleted_or_unmounted_project_dir(tmp_path, monkeypatch):
+    """评审第 1 轮 #2: a read-only `skill.list` scan must not have the side
+    effect of resurrecting `<project_path>/.jones` (and `.jones/skills`) for a
+    project directory the user has since deleted or unmounted — same contract
+    `paths.py`'s `project_root`/`project_agents_dir` already document, which
+    `project_skills_dir` previously didn't follow (no `create` parameter at
+    all). `project_path` here never exists on disk at any point, mirroring an
+    unmounted volume."""
+    monkeypatch.setenv("JONES_HOME", str(tmp_path / "home"))
+    gone_project = tmp_path / "does-not-exist" / "myproject"
+    assert not gone_project.exists()
+
+    result = service.list_skills(project_path=str(gone_project))
+
+    assert result == []
+    assert not gone_project.exists()  # not even the project root got created
+    assert not (gone_project / ".jones").exists()
+    assert not (gone_project / ".jones" / "skills").exists()
+
+
+def test_list_skills_prunes_excluded_dirs_instead_of_walking_into_them(tmp_path, monkeypatch):
+    """评审第 1 轮 #3: `_iter_skill_md_files` must prune `_EXCLUDED_DIR_NAMES`
+    during the walk (`os.walk` + in-place `dirnames` pruning), not just filter
+    the results of an unpruned `rglob` — a `SKILL.md` nested inside an
+    excluded dir (here: `node_modules`) must not be listed, same as before,
+    but this also asserts the excluded subtree is genuinely never opened."""
+    monkeypatch.setenv("JONES_HOME", str(tmp_path / "home"))
+    _write_skill(paths.skills_dir(), "real-skill")
+    _write_skill(paths.skills_dir() / "node_modules" / "some-pkg", "fake-skill")
+
+    result = service.list_skills(project_path=None)
+
+    assert [e["name"] for e in result] == ["real-skill"]
+
+    visited: list[Path] = []
+    orig_walk = service.os.walk
+
+    def spying_walk(top, *args, **kwargs):
+        for dirpath, dirnames, filenames in orig_walk(top, *args, **kwargs):
+            visited.append(Path(dirpath))
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr(service.os, "walk", spying_walk)
+    list(service._iter_skill_md_files(paths.skills_dir()))
+    assert not any(p.name == "node_modules" or "node_modules" in p.parts for p in visited)
+
+
 def test_worker_skill_dirs_orders_project_before_user_before_builtin(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("JONES_HOME", str(home))
     project_dir = tmp_path / "myproject"
     project_dir.mkdir()
+    # 评审第 1 轮 #2: worker_skill_dirs() now resolves the project tier with
+    # create=False (read-only — must not resurrect a deleted/unmounted
+    # project's `.jones/skills`), so a project directory whose skills dir was
+    # never populated genuinely has no project tier to return. Create it here
+    # (the way a user actually placing a project-level skill would) so this
+    # test still exercises the ordering it's named for.
+    _write_skill(paths.project_skills_dir(str(project_dir)), "proj-skill")
 
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT, name TEXT, "
@@ -176,3 +230,31 @@ def test_worker_skill_dirs_propagates_not_found_for_a_deleted_project(
 
     with pytest.raises(RpcError):
         service.worker_skill_dirs(ctx, {"project_id": "does-not-exist"})
+
+
+def test_worker_skill_dirs_omits_and_does_not_recreate_an_unpopulated_project_dir(
+    tmp_path, monkeypatch
+):
+    """评审第 1 轮 #2: same read-only contract as `list_skills` above, checked
+    through `worker_skill_dirs` this time — the function H writes straight
+    into worker `config.yaml`. A Project whose `.jones/skills` was never
+    created (e.g. it has no project-level skills, or its path is a deleted/
+    unmounted mount point) must neither appear in the returned list nor get
+    its directory created as a side effect of just asking."""
+    monkeypatch.setenv("JONES_HOME", str(tmp_path / "home"))
+    project_dir = tmp_path / "myproject"
+    project_dir.mkdir()
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT, name TEXT, "
+                 "settings_json TEXT, created_at TEXT, updated_at TEXT)")
+    conn.execute(
+        "INSERT INTO projects VALUES ('p1', ?, 'demo', '{}', 't', 't')", (str(project_dir),)
+    )
+    conn.row_factory = sqlite3.Row
+    ctx = SimpleNamespace(db=conn)
+
+    dirs = service.worker_skill_dirs(ctx, {"project_id": "p1"})
+
+    assert dirs == [paths.skills_dir(), service.BUNDLED_SKILLS_DIR]
+    assert not (project_dir / ".jones").exists()

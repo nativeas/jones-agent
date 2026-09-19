@@ -17,9 +17,26 @@ describe('capabilitiesStore', () => {
     })
   })
 
-  it('init() loads skill.list', async () => {
+  // 评审第 1 轮 #3: init() used to eagerly call loadSkills() itself, which is
+  // exactly what made SettingsPage's unconditional mount-time `initCapabilities`
+  // call trigger a full skill.list scan even when the user never opened the
+  // "能力透明" tab. init() now only wires up the transport; the actual fetch
+  // is the caller's job (CapabilitySettings' own mount effect, now the only
+  // caller — see that component).
+  it('init() only sets the transport, does not eagerly fetch skill.list', async () => {
     const transport = new MockTransport({ schedule: (fn) => fn() })
     await useCapabilitiesStore.getState().init(transport)
+
+    const state = useCapabilitiesStore.getState()
+    expect(state.transport).toBe(transport)
+    expect(state.skills).toEqual([])
+    expect(state.skillsLoading).toBe(false)
+  })
+
+  it('loadSkills() fetches skill.list', async () => {
+    const transport = new MockTransport({ schedule: (fn) => fn() })
+    useCapabilitiesStore.setState({ transport })
+    await useCapabilitiesStore.getState().loadSkills()
 
     const state = useCapabilitiesStore.getState()
     expect(state.skills.length).toBeGreaterThan(0)
@@ -70,8 +87,9 @@ describe('capabilitiesStore', () => {
       },
       on: () => () => {}
     }
+    useCapabilitiesStore.setState({ transport })
 
-    await useCapabilitiesStore.getState().init(transport)
+    await useCapabilitiesStore.getState().loadSkills()
 
     const state = useCapabilitiesStore.getState()
     expect(state.skillsLoading).toBe(false)

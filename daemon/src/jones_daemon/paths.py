@@ -141,8 +141,14 @@ def project_agents_dir(project_path: str | os.PathLike[str], *, create: bool = T
     return _ensure(agents) if create else agents
 
 
-def project_skills_dir(project_path: str | os.PathLike[str]) -> Path:
-    return _ensure(project_root(project_path) / "skills")
+def project_skills_dir(project_path: str | os.PathLike[str], *, create: bool = True) -> Path:
+    """`create=False` skips the `mkdir` entirely — same read-only contract as
+    `project_root`/`project_agents_dir` above: a caller only scanning for
+    Skills (e.g. `skills.list_skills`) must not resurrect `<project_path>/.jones/skills`
+    for a project directory the user has since deleted or unmounted."""
+    root = project_root(project_path, create=create)
+    skills = root / "skills"
+    return _ensure(skills) if create else skills
 
 
 def project_memory_dir(project_path: str | os.PathLike[str]) -> Path:

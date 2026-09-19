@@ -83,7 +83,7 @@ describe('CapabilitySettings', () => {
     document.body.appendChild(container)
     act(() => {
       root = createRoot(container)
-      root.render(<CapabilitySettings />)
+      root.render(<CapabilitySettings transport={NOOP_TRANSPORT} />)
     })
 
     const warning = container.querySelector('.capability-settings__drift-warning')
@@ -97,7 +97,7 @@ describe('CapabilitySettings', () => {
     document.body.appendChild(container)
     act(() => {
       root = createRoot(container)
-      root.render(<CapabilitySettings />)
+      root.render(<CapabilitySettings transport={NOOP_TRANSPORT} />)
     })
 
     expect(container.textContent).toContain('read_file')
@@ -114,7 +114,7 @@ describe('CapabilitySettings', () => {
     document.body.appendChild(container)
     act(() => {
       root = createRoot(container)
-      root.render(<CapabilitySettings />)
+      root.render(<CapabilitySettings transport={NOOP_TRANSPORT} />)
     })
 
     expect(container.querySelector('.capability-settings__drift-warning')).toBeNull()
