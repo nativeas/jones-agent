@@ -70,14 +70,20 @@ class FakeConfigResolver:
     always returns empty dicts, which can't exercise `approval_timeout_
     minutes` or a real `permissions.json` merge result."""
 
-    def __init__(self, *, approval_timeout_minutes: float | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        approval_timeout_minutes: float | None = None,
+        permissions_rules: list[dict[str, str]] | None = None,
+    ) -> None:
         self._approval_timeout_minutes = approval_timeout_minutes
+        self._permissions_rules = permissions_rules or []
 
     def settings(self, project_id: str | None) -> dict[str, Any]:
         return {"approval_timeout_minutes": self._approval_timeout_minutes}
 
     def permissions(self, project_id: str | None) -> dict[str, Any]:
-        return {}
+        return {"rules": self._permissions_rules}
 
     def mcp_servers(self, project_id: str | None) -> list[dict[str, Any]]:
         return []
@@ -215,10 +221,15 @@ async def test_task_mode_low_risk_auto_allows_with_no_pending_broadcast_G06(tmp_
 async def test_task_mode_write_action_still_goes_through_the_user_gate_G06(tmp_path, monkeypatch):
     # The other half of PRD 9.1's task-mode row: a WRITE action (something
     # that changes the outside world, not read-only) still gates individually
-    # in task mode regardless of how low-risk it might otherwise look —
-    # `write_file`/`patch` are never `low` by `permissions/review.py::
-    # classify()`'s own rules (see `_classify_write`), so this exercises the
-    # "everything but read-only tools" half task mode is actually about.
+    # in task mode regardless of how low-risk it might otherwise look.
+    # `terminal` is exactly this: round 6 (controller ruling R10) makes a
+    # plain, non-network-egress command like `echo hi` classify `low` again
+    # (see `permissions/review.py::_classify_terminal`'s docstring), but
+    # task mode with no PRE-EXISTING matching `permissions.json`/`remember`
+    # rule still isn't enough to auto-allow a terminal-class tool — only
+    # `auto` mode (or an exact rule match) is (`_decide_terminal_like_
+    # permission`'s eligibility rule) — so this must still reach the user
+    # gate, `low` risk and all.
     service = await _make_service(tmp_path, monkeypatch)
     try:
         session_id = await _new_session(service, mode="task")
@@ -228,10 +239,163 @@ async def test_task_mode_write_action_still_goes_through_the_user_gate_G06(tmp_p
         await service.send(session_id, prompt)
         await _wait_until(lambda: service.ctx.server.events("permission.requested"))
         requested = service.ctx.server.events("permission.requested")[0][1]
-        assert requested["risk"] in ("medium", "high")
+        assert requested["risk"] == "low"
         pending = await service.permission_pending(session_id)
         await service.permission_decide(pending[0]["request_id"], "allow")
         await _wait_until(lambda: service.ctx.server.events("permission.decided"))
+    finally:
+        await service.shutdown()
+
+
+# -- Round 6 (controller ruling R10, final, not overturnable): the daemon --
+# is now the ONLY place a terminal-class tool call can auto-allow ----------
+#
+# `_custom_permission_prompt` bypasses the real plugin entirely (it crafts
+# the ACP `session/request_permission` the worker would send AFTER the
+# plugin already said `approve`) — exactly the right tool for testing
+# `_decide_terminal_like_permission` in isolation, including the "what if
+# the plugin's own classifier had a bug" defense-in-depth scenario no
+# in-process test of the real plugin could ever construct (a genuinely
+# dangerous command never reaches `approve` from a working plugin).
+
+
+async def test_auto_mode_plain_low_terminal_with_no_rule_still_auto_allows(tmp_path, monkeypatch):
+    # R10: "auto 模式下 plain+low 无规则也自动 allow" — no `permissions.json`
+    # rule needed at all in `auto` mode.
+    service = await _make_service(tmp_path, monkeypatch)
+    try:
+        session_id = await _new_session(service, mode="auto")
+        prompt = _custom_permission_prompt("terminal", {"command": "ls -la"}, mode="auto")
+        await service.send(session_id, prompt)
+        await _wait_until(
+            lambda: service.ctx.server.events("permission.decided")
+            or service.ctx.server.events("run.terminated")
+        )
+        assert service.ctx.server.events("permission.requested") == []
+        decided = service.ctx.server.events("permission.decided")
+        assert decided, "expected an instant permission.decided"
+        row = decided[0][1]
+        assert row["decision"] == "allow"
+        assert row["decided_by"] == "rule"
+        assert row["gate"] == "review"
+    finally:
+        await service.shutdown()
+
+
+async def test_task_mode_plain_low_terminal_with_a_matching_rule_auto_allows(
+    tmp_path, monkeypatch
+):
+    # R10: "当且仅当 transparency=plain 且 review=low 且 存在规范化整串相等的
+    # allow 规则 → 自动 allow" — no `auto` mode needed when a
+    # `permissions.json` rule already matches this exact command text.
+    service = await _make_service(
+        tmp_path,
+        monkeypatch,
+        config=FakeConfigResolver(
+            permissions_rules=[{"match": "git  status", "action": "allow"}]
+        ),
+    )
+    try:
+        session_id = await _new_session(service, mode="task")
+        # Extra interior whitespace: `has_normalized_exact_allow` compares
+        # normalized text, not raw strings (same R1 normalization as ever).
+        prompt = _custom_permission_prompt("terminal", {"command": "git status"}, mode="task")
+        await service.send(session_id, prompt)
+        await _wait_until(
+            lambda: service.ctx.server.events("permission.decided")
+            or service.ctx.server.events("run.terminated")
+        )
+        assert service.ctx.server.events("permission.requested") == []
+        decided = service.ctx.server.events("permission.decided")
+        assert decided, "expected an instant permission.decided"
+        row = decided[0][1]
+        assert row["decision"] == "allow"
+        assert row["decided_by"] == "rule"
+    finally:
+        await service.shutdown()
+
+
+async def test_task_mode_plain_low_terminal_with_a_non_matching_rule_still_gates(
+    tmp_path, monkeypatch
+):
+    # The flip side: a rule that matches a DIFFERENT command doesn't count
+    # (`has_normalized_exact_allow` is exact-string, not "some rule
+    # exists") — task mode with no matching rule still gates individually.
+    service = await _make_service(
+        tmp_path,
+        monkeypatch,
+        config=FakeConfigResolver(
+            permissions_rules=[{"match": "npm test", "action": "allow"}]
+        ),
+    )
+    try:
+        session_id = await _new_session(service, mode="task")
+        prompt = _custom_permission_prompt("terminal", {"command": "git status"}, mode="task")
+        await service.send(session_id, prompt)
+        await _wait_until(lambda: service.ctx.server.events("permission.requested"))
+        assert service.ctx.server.events("permission.decided") == []
+    finally:
+        await service.shutdown()
+
+
+async def test_terminal_hard_deny_defense_in_depth_denies_without_asking_the_user(
+    tmp_path, monkeypatch
+):
+    # R10: "daemon _on_request_permission 收到终端请求后，先跑同一份
+    # hard_deny（纵深，命中 → deny + 记录）" — even in `auto` mode with a
+    # blanket allow rule (the plugin's own escape hatch for "trust this
+    # whole tool"), a genuinely hard-denied command reaching the daemon
+    # (simulating a bug in the plugin's own copy of this same check) is
+    # denied outright, never handed to a human and never silently executed.
+    service = await _make_service(
+        tmp_path,
+        monkeypatch,
+        config=FakeConfigResolver(permissions_rules=[{"match": "terminal", "action": "allow"}]),
+    )
+    try:
+        session_id = await _new_session(service, mode="auto")
+        prompt = _custom_permission_prompt(
+            "terminal", {"command": "rm -rf /Users/alice/Documents"}, mode="auto"
+        )
+        await service.send(session_id, prompt)
+        await _wait_until(
+            lambda: service.ctx.server.events("permission.decided")
+            or service.ctx.server.events("run.terminated")
+        )
+        assert service.ctx.server.events("permission.requested") == []
+        decided = service.ctx.server.events("permission.decided")
+        assert decided, "expected an instant permission.decided"
+        row = decided[0][1]
+        assert row["decision"] == "deny"
+        assert row["decided_by"] == "rule"
+        assert row["gate"] == "rule"
+    finally:
+        await service.shutdown()
+
+
+async def test_terminal_opaque_command_never_auto_allows_even_with_a_matching_rule(
+    tmp_path, monkeypatch
+):
+    # R10 defers entirely to R5's "opaque -> never fast-path" invariant:
+    # `transparency(command) == "plain"` is required regardless of risk or
+    # rule match.
+    service = await _make_service(
+        tmp_path,
+        monkeypatch,
+        config=FakeConfigResolver(
+            permissions_rules=[{"match": "npm test && echo done", "action": "allow"}]
+        ),
+    )
+    try:
+        session_id = await _new_session(service, mode="auto")
+        prompt = _custom_permission_prompt(
+            "terminal", {"command": "npm test && echo done"}, mode="auto"
+        )
+        await service.send(session_id, prompt)
+        await _wait_until(lambda: service.ctx.server.events("permission.requested"))
+        requested = service.ctx.server.events("permission.requested")[0][1]
+        assert requested["risk"] == "high"
+        assert service.ctx.server.events("permission.decided") == []
     finally:
         await service.shutdown()
 

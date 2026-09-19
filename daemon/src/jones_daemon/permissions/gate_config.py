@@ -234,6 +234,26 @@ def build(
     }
 
 
+def read(hermes_home: Path) -> dict[str, Any] | None:
+    """Daemon-side counterpart to `kernel/plugin/jones_gate/_config.py::
+    load()` — reads back the SAME `jones_gate.json` snapshot the rule gate
+    read moments earlier for this Turn (controller ruling R10, round 6,
+    final): `sessions/service.py::_on_request_permission`'s defense-in-depth
+    hard-deny/rule-match recheck for terminal-class tools must agree with
+    what the plugin already saw, not a fresh recompute that could race a
+    live `permissions.json` edit mid-Turn — the same "两个 gate 必须对同一份
+    快照达成一致" principle `_extract_tool_call`'s mode hint already follows
+    (see that function's docstring). `None` (never raises) if the file is
+    missing or not valid JSON — callers must fail closed (no `user_root`, no
+    rule match), never assume "nothing configured"."""
+    try:
+        raw = gate_config_path(hermes_home).read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def write(hermes_home: Path, config: dict[str, Any]) -> Path:
     """Atomic (write-temp-then-rename) so `_config.py`'s mtime-cached reader
     in the worker process never observes a half-written file mid-write."""

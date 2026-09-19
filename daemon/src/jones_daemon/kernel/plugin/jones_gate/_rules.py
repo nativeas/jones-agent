@@ -128,6 +128,31 @@ def _actions_for_normalized_command(
     return out
 
 
+def has_normalized_exact_allow(rules: list[dict[str, Any]], command: str) -> bool:
+    """Controller ruling R10 (round 6, final): "存在规范化整串相等的 allow 规则"
+    — used by the DAEMON's terminal-class auto-allow eligibility check
+    (`sessions/service.py::_decide_terminal_like_permission`), not by this
+    plugin's own `decide()` below (which no longer has an allow fast path
+    for terminal-class tools AT ALL, see `__init__.py::_decide` and R10).
+
+    Deliberately narrower than `decide()`'s own `tool_actions`/
+    `command_actions` union: a blanket `{"match": <tool_name>, "action":
+    "allow"}` rule does NOT count here — R10's wording is "整串相等"
+    against the command text specifically, not "trust the whole tool",
+    which rounds 4/5 already spent walking back for terminal calls (a
+    blanket allow no longer even reaches the plugin's own allow branch for
+    these tools). Only an `allow` rule whose own `match`, once normalized,
+    equals the ENTIRE command qualifies — exactly what `remember` writes."""
+    normalized = _normalize(command)
+    return any(
+        isinstance(rule, dict)
+        and rule.get("action") == "allow"
+        and isinstance(rule.get("match"), str)
+        and _normalize(rule["match"]) == normalized
+        for rule in rules
+    )
+
+
 def decide(rules: list[dict[str, Any]], tool_name: str, args: dict[str, Any]) -> Action | None:
     """Return `"deny"`/`"allow"` if this call is covered by a
     `permissions.json` rule, `None` if nothing applies (falls through to the

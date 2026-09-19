@@ -95,6 +95,31 @@ sitting inside an ordinary string a program will just print or search for"
 denied by this scan exactly as if it were real. That specific false-reject
 is intentional and documented (docs/design/02-w3-interfaces.md §1.4's "已知
 误拒" list), not a bug to eventually fix.
+
+## Round 6 (2026-09-19, controller ruling R11/R12 — final, not overturnable)
+
+R11: every check in this module is now **case-insensitive** — `RM -rf`,
+`Rm -Rf`, `SHRED`, `FIND ... -delete`, `GIT PUSH --force` all deny exactly
+like their lowercase spellings (macOS's own filesystem is already
+case-insensitive; `RM` really is `rm` there). All `_RAW_*` regexes below
+carry `re.IGNORECASE`; every token-stream comparison goes through `_prog()`
+(now lowercasing) or an explicit `.lower()` at the comparison site.
+
+R12: the protected-`.jones`-path check is no longer "write/delete verb
+present" (`_WRITE_DELETE_VERBS` and everything built on it — deleted, not
+kept around for compatibility) — it's now a **read-only whitelist**:
+referencing a protected path is denied UNLESS the command is provably
+`plain` (`_transparency.classify`, imported from the sibling module — the
+one exception to "no cross-module understanding" this file's history above
+otherwise holds to, because R12 explicitly asks for it) AND its first
+program is one of a fixed read-only set (`cat`, `ls`, `head`, `tail`,
+`less`, `more`, `wc`, `stat`, `file`, `grep`, `rg`, `diff` without `-i`,
+`find` without `-delete`/`-exec`, `tree`, `du`, `jq`, `yq`) AND the raw text
+carries no redirection at all. No more per-verb enumeration to keep in sync
+with `sed -i`/`tee`/whatever else can write a file — a fixed, auditable
+"safe to read with" list is easier to reason about than an open-ended "not
+yet known to be a writer" one, and it's what `_transparency.classify()`
+already had to build to satisfy R5.
 """
 
 from __future__ import annotations
@@ -102,6 +127,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from . import _transparency
 
 # Characters that end a token AND are discarded (never returned as tokens of
 # their own) — whitespace does the same job but isn't listed here since
@@ -114,42 +141,38 @@ _SHELL_INTERPRETERS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
 _TRASH_PROGRAMS = frozenset({"trash", "rmtrash"})
 _DEFAULT_BRANCHES = frozenset({"main", "master"})
 
-# "同一 token 流出现写/删动词" (controller ruling R2) — programs whose ordinary
-# job is to write or delete something, checked only ever in combination with
-# a token that also names a protected path (see `_protected_path_denied`);
-# deliberately broad (over-inclusive costs one escalation-worthy false
-# positive, never a false negative) but not "every program that could ever
-# conceivably write a file" — that would be every program.
-_WRITE_DELETE_VERBS = frozenset({
-    "rm", "mv", "cp", "dd", "shred", "truncate", "touch", "tee",
-    "chmod", "chown", "sed", "ln", "mkdir", "rmdir", "rsync",
-    "install", "trash", "rmtrash", "git",
+# -- Round 6 (controller ruling R12): the read-only whitelist a command      -
+# referencing a protected `.jones` path must satisfy to NOT be hard-denied
+# -- see `_protected_path_denied` below. Replaces round 1-5's "write/delete
+# verb list" approach entirely (no more verb table to keep in sync).
+_PROTECTED_PATH_NEEDLES = ("~/.jones", "$HOME/.jones", "/.jones/")
+_READONLY_PROTECTED_PATH_PROGRAMS = frozenset({
+    "cat", "ls", "head", "tail", "less", "more", "wc", "stat", "file",
+    "grep", "rg", "diff", "find", "tree", "du", "jq", "yq",
 })
 
 # -- Round 5 (controller ruling R6): raw-text regex scan, alongside the ------
-# token-stream scan above, not instead of it — see the module docstring's
+# token-stream scan above, not instead of it -- see the module docstring's
 # "Round 5 addition" section for why. These run against `_strip_quote_chars`'
 # output (the raw command text with every `'`/`"` character simply deleted,
-# NOT a re-parse) — a deliberate over-approximation, not a second tokenizer.
+# NOT a re-parse) -- a deliberate over-approximation, not a second tokenizer.
+# Round 6 (controller ruling R11): every one of these now carries
+# `re.IGNORECASE` -- `RM -RF`/`SHRED`/`GIT PUSH --FORCE` must deny exactly
+# like their lowercase spellings.
 
 # "\brm\b 后随任意 -r/-R/-rf/-fr/--recursive（不要求相邻）" (controller ruling
-# R6, verbatim) — matched on whatever text follows an `rm` word anywhere
+# R6, verbatim) -- matched on whatever text follows an `rm` word anywhere
 # later in the (quote-stripped) string, not necessarily its own argv.
-_RAW_RM_WORD_RE = re.compile(r"\brm\b")
-_RAW_RECURSIVE_FLAG_RE = re.compile(r"(?:^|\s)-[A-Za-z]*[rR][A-Za-z]*(?:\s|$)|--recursive\b")
-_RAW_SHRED_RE = re.compile(r"\bshred\b")
-_RAW_MKFS_RE = re.compile(r"\bmkfs")
-_RAW_DISKUTIL_ERASE_RE = re.compile(r"\bdiskutil\s+erase")
-_RAW_TRASH_RE = re.compile(r"\btrash\b")
-_RAW_GIT_PUSH_FORCE_MAIN_RE = re.compile(
-    r"\bgit\s+push\b[^\n]*(?:--force\b|-f\b)[^\n]*\b(?:main|master)\b"
+_RAW_RM_WORD_RE = re.compile(r"\brm\b", re.IGNORECASE)
+_RAW_RECURSIVE_FLAG_RE = re.compile(
+    r"(?:^|\s)-[A-Za-z]*[rR][A-Za-z]*(?:\s|$)|--recursive\b", re.IGNORECASE
 )
-# "写/删动词" for the raw-text protected-path check — same set as
-# `_WRITE_DELETE_VERBS` above, compiled once as a single alternation with
-# word boundaries so it can be searched directly against raw text instead of
-# compared token-by-token (see `_raw_protected_path_denied`).
-_RAW_WRITE_DELETE_VERB_RE = re.compile(
-    r"\b(?:" + "|".join(re.escape(v) for v in sorted(_WRITE_DELETE_VERBS)) + r")\b"
+_RAW_SHRED_RE = re.compile(r"\bshred\b", re.IGNORECASE)
+_RAW_MKFS_RE = re.compile(r"\bmkfs", re.IGNORECASE)
+_RAW_DISKUTIL_ERASE_RE = re.compile(r"\bdiskutil\s+erase", re.IGNORECASE)
+_RAW_TRASH_RE = re.compile(r"\btrash\b", re.IGNORECASE)
+_RAW_GIT_PUSH_FORCE_MAIN_RE = re.compile(
+    r"\bgit\s+push\b[^\n]*(?:--force\b|-f\b)[^\n]*\b(?:main|master)\b", re.IGNORECASE
 )
 
 
@@ -188,28 +211,72 @@ def _raw_text_pattern_denied(command: str) -> Verdict:
     return Verdict(False)
 
 
-def _raw_protected_path_denied(
+def _protected_path_referenced(
     command: str, *, user_root: str | None, project_permissions_path: str | None
 ) -> bool:
-    """Raw-text counterpart to `_protected_path_denied` (controller ruling
-    R6): "原文含 ~/.jones、$HOME/.jones、/.jones/（任意 Project 的 .jones）且
-    原文含 > 或 >> 或写删动词 → deny". Unlike the token-stream version, the
-    write/delete verb doesn't need to be its own clean token — a plain
-    substring search on the ORIGINAL (not quote-stripped — a quoted path is
-    still the same path) command text, catching `echo evil >
-    <project>/.jones/permissions.json` under a blanket allow rule, where
-    `echo` (not a write/delete verb) is the only program name and the actual
-    danger is the redirection, not an argv[0] this module recognizes."""
-    needles = ["~/.jones", "$HOME/.jones", "/.jones/"]
+    """Does `command`'s (quote-stripped, per controller ruling R12's own
+    wording — "原文（去引号后）出现...") text mention a protected `.jones`
+    path at all? Just the "does it touch it" half of `_protected_path_denied`
+    — see that function for the round-6 read-only-whitelist half that
+    decides whether touching it is actually denied."""
+    stripped = _strip_quote_chars(command)
+    needles = list(_PROTECTED_PATH_NEEDLES)
     if user_root:
         needles.append(user_root)
     if project_permissions_path:
         needles.append(project_permissions_path)
-    if not any(needle in command for needle in needles):
+    return any(needle in stripped for needle in needles)
+
+
+def _protected_path_readonly_whitelisted(command: str) -> bool:
+    """Controller ruling R12 (round 6, final): a command that references a
+    protected `.jones` path is only NOT hard-denied when it's provably
+    read-only — `plain` (`_transparency.classify`, so any redirection,
+    substitution, operator or indirect-execution program name already
+    disqualifies it on its own) AND its first program is in the fixed
+    read-only whitelist AND (belt and suspenders — `plain` already forbids
+    `<`/`>` on its own, see `_transparency`'s `_OPAQUE_SUBSTRINGS`, but R12
+    names "无重定向" as its own explicit condition) the raw text carries no
+    redirection character at all. `diff` additionally requires no `-i` flag
+    (R12, verbatim: "diff(无 -i)") and `find` no `-delete`/`-exec` (R12:
+    "find(无 -delete/-exec)") — both over-cautious, matching this whole
+    module's "sacrifice completeness for safety" tradeoff (`find -delete`/
+    `-exec` already makes the command `opaque` on its own via
+    `_transparency`'s own find-flag check, so that half is redundant in
+    practice; kept explicit anyway because R12 names it by name)."""
+    if _transparency.classify(command) != "plain":
         return False
-    if ">" in command:
-        return True
-    return bool(_RAW_WRITE_DELETE_VERB_RE.search(command))
+    if "<" in command or ">" in command:
+        return False
+    tokens = tokenize(command)
+    if not tokens:
+        return False
+    first = _prog(tokens[0])
+    if first not in _READONLY_PROTECTED_PATH_PROGRAMS:
+        return False
+    rest = tokens[1:]
+    if first == "diff" and any(t.lower() == "-i" or t.lower().startswith("-i") for t in rest):
+        return False
+    if first == "find" and any(t in ("-delete", "-exec") for t in rest):
+        return False
+    return True
+
+
+def _protected_path_denied(
+    command: str, *, user_root: str | None, project_permissions_path: str | None
+) -> bool:
+    """Controller ruling R12 (round 6, final; supersedes round 4/5's
+    write/delete-verb-based `_protected_path_denied`/
+    `_raw_protected_path_denied` pair, both deleted): a command referencing
+    `~/.jones`/`$HOME/.jones`/`/.jones/` (any Project's `.jones`, or the
+    resolved `user_root`/`project_permissions_path`) is denied UNLESS it's
+    one of a fixed read-only whitelist of commands — no more write/delete
+    verb table to keep in sync."""
+    if not _protected_path_referenced(
+        command, user_root=user_root, project_permissions_path=project_permissions_path
+    ):
+        return False
+    return not _protected_path_readonly_whitelisted(command)
 
 
 @dataclass(frozen=True)
@@ -292,8 +359,11 @@ def _prog(tok: str) -> str:
     at the point of a program-name comparison, never to every token in the
     stream, because doing that to a path ARGUMENT (e.g. `/Users/alice/
     .jones/x`) would throw away the directory components a protected-path
-    check needs to see."""
-    return Path(tok).name
+    check needs to see. Lowercased (controller ruling R11, round 6, final):
+    `RM`/`Rm`/`SHRED` must be caught exactly like their lowercase spellings
+    — macOS's own filesystem is already case-insensitive, so `RM` really is
+    `rm` there."""
+    return Path(tok).name.lower()
 
 
 def _is_recursive_flag(tok: str) -> bool:
@@ -329,7 +399,9 @@ def _rm_denied(tokens: list[str]) -> bool:
 
 
 def _find_delete_denied(tokens: list[str]) -> bool:
-    return any(_prog(t) == "find" for t in tokens) and any(t == "-delete" for t in tokens)
+    return any(_prog(t) == "find" for t in tokens) and any(
+        t.lower() == "-delete" for t in tokens
+    )
 
 
 def _trash_denied(tokens: list[str]) -> bool:
@@ -354,15 +426,16 @@ def _diskutil_erase_denied(tokens: list[str]) -> bool:
 
 
 def _git_push_force_denied(tokens: list[str]) -> bool:
-    if not any(_prog(t) == "git" for t in tokens) or "push" not in tokens:
+    lowered = [t.lower() for t in tokens]
+    if not any(_prog(t) == "git" for t in tokens) or "push" not in lowered:
         return False
     force = any(
         t in ("--force", "-f", "--force-with-lease") or t.startswith("--force-with-lease=")
-        for t in tokens
+        for t in lowered
     )
     if not force:
         return False
-    push_idx = tokens.index("push")
+    push_idx = lowered.index("push")
     refs = [t for t in tokens[push_idx + 1 :] if not t.startswith("-")]
     if len(refs) >= 2:
         target = refs[-1].split(":")[-1]
@@ -374,38 +447,7 @@ def _git_push_force_denied(tokens: list[str]) -> bool:
         # conservatively treated as the default branch (unchanged from
         # round 1's heuristic, only the token-stream plumbing around it).
         target = None
-    return target is None or target in _DEFAULT_BRANCHES
-
-
-def _protected_path_tokens(
-    tokens: list[str], *, user_root: str | None, project_permissions_path: str | None
-) -> list[str]:
-    # `user_root` (`jones_gate.json`'s field of the same name, written by
-    # `paths.user_root()`) is already the resolved absolute path TO `~/.jones`
-    # itself (e.g. `/Users/alice/.jones`), not the home directory it lives
-    # under — so it's used as a needle directly, not `<user_root>/.jones`.
-    needles = ["~/.jones"]
-    if user_root:
-        needles.append(user_root)
-    if project_permissions_path:
-        needles.append(project_permissions_path)
-    return [tok for tok in tokens if any(needle in tok for needle in needles)]
-
-
-def _protected_path_denied(
-    tokens: list[str], *, user_root: str | None, project_permissions_path: str | None
-) -> bool:
-    """"任一 token 含 ~/.jones 或 <project>/.jones/permissions.json 路径且同一
-    token 流出现写/删动词 → deny" (controller ruling R2). A plain substring
-    check on the raw token text — no path resolution, matching this whole
-    module's "no filesystem understanding" premise; `user_root`/
-    `project_permissions_path` are the already-resolved absolute paths
-    `jones_gate.json` carries (see `_config.py`'s schema)."""
-    if not _protected_path_tokens(
-        tokens, user_root=user_root, project_permissions_path=project_permissions_path
-    ):
-        return False
-    return any(_prog(t) in _WRITE_DELETE_VERBS for t in tokens)
+    return target is None or target.lower() in _DEFAULT_BRANCHES
 
 
 def _shell_dash_c_payloads(tokens: list[str]) -> list[str]:
@@ -425,7 +467,7 @@ def _shell_dash_c_payloads(tokens: list[str]) -> list[str]:
         if flag.startswith("--") or not flag.startswith("-"):
             continue
         letters = flag[1:]
-        if letters and letters.isalpha() and letters[-1] == "c" and i + 2 < len(tokens):
+        if letters and letters.isalpha() and letters[-1].lower() == "c" and i + 2 < len(tokens):
             payloads.append(tokens[i + 2])
     return payloads
 
@@ -433,10 +475,14 @@ def _shell_dash_c_payloads(tokens: list[str]) -> list[str]:
 def _scan(
     tokens: list[str],
     *,
-    user_root: str | None,
-    project_permissions_path: str | None,
     depth: int,
 ) -> Verdict:
+    # Round 6 (controller ruling R12): the protected-`.jones`-path check
+    # moved OUT of this token-stream scan and into `classify_command`
+    # itself, run once on the raw command text before tokenizing at all —
+    # it needs `_transparency.classify()` (whole-command reasoning) and the
+    # FIRST program specifically, neither of which fits this flat,
+    # order-blind token scan. See `_protected_path_denied` above.
     if _rm_denied(tokens):
         return Verdict(True, "rm -r/-rf (or --recursive) is never allowed (PRD 5.7)")
     if _find_delete_denied(tokens):
@@ -453,23 +499,12 @@ def _scan(
         return Verdict(True, "diskutil erase* is never allowed (PRD 5.7)")
     if _git_push_force_denied(tokens):
         return Verdict(True, "git push --force to the default branch is never allowed (PRD 5.7)")
-    if _protected_path_denied(
-        tokens, user_root=user_root, project_permissions_path=project_permissions_path
-    ):
-        return Verdict(
-            True, "this command writes/deletes Jones's own data under ~/.jones/ (PRD 10.4, N10)"
-        )
     if depth > 0:
         for payload in _shell_dash_c_payloads(tokens):
             inner = tokenize(payload)
             if inner is None:
                 continue
-            verdict = _scan(
-                inner,
-                user_root=user_root,
-                project_permissions_path=project_permissions_path,
-                depth=depth - 1,
-            )
+            verdict = _scan(inner, depth=depth - 1)
             if verdict.denied:
                 return verdict
     return Verdict(False)
@@ -488,27 +523,28 @@ def classify_command(
     attempting to tokenize — it needs no successful tokenization to work,
     and an unparseable command (an unterminated quote) is exactly the kind
     of input the token-stream scan below has to skip; the raw-text scan
-    still gets a look at it. Either scan denying is enough."""
+    still gets a look at it. Either scan denying is enough.
+
+    Round 6 (controller ruling R12): the protected-`.jones`-path check runs
+    next, also on the raw command text — same "no successful tokenization
+    needed" reasoning, plus it needs `_transparency.classify()`'s whole-
+    command judgment, which doesn't fit inside the flat token-stream scan
+    below (see `_protected_path_denied`'s docstring)."""
     raw_verdict = _raw_text_pattern_denied(command)
     if raw_verdict.denied:
         return raw_verdict
-    if _raw_protected_path_denied(
+    if _protected_path_denied(
         command, user_root=user_root, project_permissions_path=project_permissions_path
     ):
         return Verdict(
             True,
-            "this command writes/deletes Jones's own data under ~/.jones/ "
-            "(PRD 10.4, N10, controller ruling R6 raw-text scan)",
+            "this command references Jones's own protected .jones path and isn't one of the "
+            "read-only commands allowed to touch it (PRD 10.4, N10, controller ruling R12)",
         )
     tokens = tokenize(command)
     if tokens is None:
         return Verdict(False)  # unparseable -> not hard-denied by the token scan, see tokenize()
-    return _scan(
-        tokens,
-        user_root=user_root,
-        project_permissions_path=project_permissions_path,
-        depth=_MAX_SHELL_C_DEPTH,
-    )
+    return _scan(tokens, depth=_MAX_SHELL_C_DEPTH)
 
 
 def is_protected_path(

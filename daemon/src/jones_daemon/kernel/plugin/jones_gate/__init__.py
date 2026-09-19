@@ -83,6 +83,25 @@ RULE_GATE_BLOCK_PREFIX = "JONES RULE GATE: "
 # module docstring's "write_file/patch special case".
 _EDIT_APPROVAL_TOOLS = frozenset({"write_file", "patch"})
 
+# Controller ruling R10 (round 6, final, not overturnable): every tool that
+# runs a command (today: `terminal`; Hermes's own toolset also names
+# `process_manage`/`execute_code` — W4 scope, not yet wired to real args
+# here, included by name so this set is already right when they are) never
+# takes this plugin's `allow` fast path, no matter what `permissions.json`
+# says — see `_decide`'s "N13 / review finding #1 & #10" comment below for
+# where that's enforced. Root cause this closes (round 5's post-mortem,
+# 02-w3-interfaces.md's round-6 section): the plugin classifier is the ONE
+# link in this whole chain that can never be independently rechecked by
+# anything else before a call executes — a bug in ITS OWN opacity/hard-deny
+# reasoning was, until this ruling, equivalent to zero-gate execution. With
+# this set carved out of the fast path, that same bug now costs one extra
+# `approve`, because the daemon (`sessions/service.py::_on_request_
+# permission`) independently reruns hard-deny/transparency/review before
+# ever auto-allowing a terminal-class call itself — see that function's
+# docstring. Public (no leading underscore): the daemon imports this name
+# directly, same precedent as `PROBE_TOOL_NAME`/`RULE_GATE_BLOCK_PREFIX`.
+TERMINAL_LIKE_TOOLS = frozenset({"terminal", "process_manage", "execute_code"})
+
 _VALID_MODES = frozenset({"chat", "task", "auto"})
 
 
@@ -198,7 +217,11 @@ def _decide(tool_name: str, args: dict | None, tool_call_id: str) -> dict | None
     if allowlist and tool_name not in allowlist:
         return _block(f"tool {tool_name!r} is not in this session's Agent tool whitelist")
 
-    if rule_verdict == "allow" and not config.get("rules_degraded"):
+    if (
+        rule_verdict == "allow"
+        and not config.get("rules_degraded")
+        and tool_name not in TERMINAL_LIKE_TOOLS
+    ):
         # A degraded permissions.json (existed but failed to parse
         # somewhere — see `_config.py`'s schema comment) can't be trusted
         # for a direct-allow bypass: the merge that produced `rules` may be
@@ -207,6 +230,16 @@ def _decide(tool_name: str, args: dict | None, tool_call_id: str) -> dict | None
         # `rule_verdict` as if it were `None`, i.e. still skipping the
         # `deny` branch above) is the fail-closed choice — never widen,
         # only ever narrow what escalates.
+        #
+        # Controller ruling R10 (round 6, final): a terminal-class tool
+        # (`TERMINAL_LIKE_TOOLS`) never takes this branch at all, degraded
+        # or not — `permissions.json`'s `allow` rules for these tools are no
+        # longer a plugin-side bypass, they're now a DAEMON-side auto-
+        # approve condition (`sessions/service.py::_on_request_permission`,
+        # via `_rules.has_normalized_exact_allow`). This function's only two
+        # possible outcomes for a terminal-class call are therefore `block`
+        # (hard-deny/rule-deny/chat-mode/whitelist, all above this line) or
+        # `approve` (below) — never a silent zero-IPC allow.
         return None  # 直接放行，零 IPC
 
     if tool_name in _EDIT_APPROVAL_TOOLS:

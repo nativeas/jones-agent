@@ -53,7 +53,13 @@ from jones_daemon.config.jsonfile import read_json, write_json
 from jones_daemon.context import DaemonContext
 from jones_daemon.kernel.acp_client import AcpError, AcpProtocolError
 from jones_daemon.kernel.ids import new_ulid
-from jones_daemon.kernel.plugin.jones_gate import _review_payload, _rules
+from jones_daemon.kernel.plugin.jones_gate import (
+    TERMINAL_LIKE_TOOLS,
+    _hard_deny,
+    _review_payload,
+    _rules,
+    _transparency,
+)
 from jones_daemon.logging import get_logger
 from jones_daemon.permissions import gate_config, review
 from jones_daemon.projects.service import ProjectService
@@ -1173,6 +1179,116 @@ class SessionService:
                 extra={"detail": {"run_id": run_id, "step_id": step_id, "seq": seq}},
             )
 
+    async def _decide_terminal_like_permission(
+        self,
+        *,
+        session_id: str,
+        decision_id: str,
+        step_id: str | None,
+        tool_args: dict[str, Any],
+        mode: str,
+        risk: review.Risk,
+        params: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Controller ruling R10 (round 6, final, not overturnable): the
+        daemon is now the ONLY place a terminal-class tool call (`kernel/
+        plugin/jones_gate::TERMINAL_LIKE_TOOLS`) can ever be allowed to run
+        without a human — the rule gate never returns `allow` for these any
+        more (see that package's `_decide` docstring), only `block`/
+        `approve`. Every such call that reaches here is therefore
+        re-classified from scratch, in depth, before this function even
+        considers auto-approving it:
+
+          1. the SAME hard-deny scan the plugin already ran
+             (`_hard_deny.classify_command`, re-read from the identical
+             `jones_gate.json` snapshot the plugin used for this Turn — see
+             `permissions/gate_config.py::read`'s docstring for why a fresh
+             snapshot, not a re-read, would be the wrong thing here) — a
+             defense-in-depth RECHECK, never a trust of whatever the plugin
+             already decided. A hit here is `deny`, recorded and broadcast
+             exactly like a real user rejection would be, never silently
+             dropped.
+          2. `transparency(command)` (`_transparency.classify`) must be
+             `plain` — an `opaque` command can never auto-allow here
+             regardless of anything else, mirroring the plugin's own R5
+             invariant.
+          3. only then does risk matter: `review.classify()` must also say
+             `low` (round 6 makes that achievable again for a `terminal`
+             call — see `permissions/review.py::_classify_terminal`'s
+             docstring for why the old `medium` floor is gone).
+
+        Auto-allow fires only when (2) and (3) both hold AND EITHER a
+        `permissions.json`/`remember` rule's `match` normalizes to exactly
+        this command text (`_rules.has_normalized_exact_allow` — the ONLY
+        thing a terminal `allow` rule still means, now that the plugin
+        can't act on it directly — see 02-w3-interfaces.md §1.1's "决策模型
+        v6"), OR the session is in `auto` mode (already means "act without
+        asking for anything the review gate doesn't flag" — no rule
+        required). Every other combination returns `None`, falling through
+        to the caller's normal pending/user-gate flow with the SAME
+        `risk`/`decision_id` this function was handed — never
+        re-classified twice.
+
+        Only `terminal` has a real `command` argument today (`process_
+        manage`/`execute_code` — Hermes's other two terminal-class tools,
+        W4 scope — have no established arg shape here yet); for those,
+        `tool_args.get("command")` is `None` and this function always
+        returns `None` (defer to the caller), which is the conservative
+        choice — `review.classify()` never classifies an unrecognized tool
+        name `low` either (its own fail-closed catch-all), so they always
+        land on the user gate regardless."""
+        command = tool_args.get("command") if isinstance(tool_args, dict) else None
+        if not isinstance(command, str) or not command:
+            return None
+
+        hermes_home = gate_config.hermes_home_for(self.ctx.paths.user_root(), session_id)
+        snapshot = gate_config.read(hermes_home) or {}
+        user_root = snapshot.get("user_root")
+        project_permissions_path = snapshot.get("project_permissions_path")
+        rules = snapshot.get("rules") if isinstance(snapshot.get("rules"), list) else []
+
+        hard = _hard_deny.classify_command(
+            command,
+            user_root=user_root if isinstance(user_root, str) else None,
+            project_permissions_path=(
+                project_permissions_path if isinstance(project_permissions_path, str) else None
+            ),
+        )
+        if hard.denied:
+            await run_in_db_thread(
+                queries.insert_permission_decision,
+                self.ctx.db, decision_id=decision_id, step_id=step_id,
+                gate="rule", risk=risk.level, request=params,
+            )
+            row = await run_in_db_thread(
+                queries.decide_permission, self.ctx.db, decision_id,
+                decision="deny", decided_by="rule",
+            )
+            await self.ctx.server.broadcast(session_id, "permission.decided", row)
+            option_id = _select_permission_option(params.get("options") or [], "deny", None)
+            return {"outcome": {"outcome": "selected", "optionId": option_id}}
+
+        eligible = (
+            _transparency.classify(command) == "plain"
+            and risk.level == "low"
+            and (_rules.has_normalized_exact_allow(rules, command) or mode == "auto")
+        )
+        if not eligible:
+            return None
+
+        await run_in_db_thread(
+            queries.insert_permission_decision,
+            self.ctx.db, decision_id=decision_id, step_id=step_id,
+            gate="review", risk=risk.level, request=params,
+        )
+        row = await run_in_db_thread(
+            queries.decide_permission, self.ctx.db, decision_id,
+            decision="allow", decided_by="rule",
+        )
+        await self.ctx.server.broadcast(session_id, "permission.decided", row)
+        option_id = _select_permission_option(params.get("options") or [], "allow", None)
+        return {"outcome": {"outcome": "selected", "optionId": option_id}}
+
     async def _on_request_permission(
         self, session_id: str, params: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1210,6 +1326,24 @@ class SessionService:
             shape specifically, by Hermes's OWN hardcoded 60s timeout on
             that channel (see the `_EDIT_APPROVAL_HERMES_TIMEOUT_SECONDS`
             comment below — review finding #5).
+
+        Round 6 (controller ruling R10, 2026-09-19, final, not overturnable)
+        carves a THIRD, stricter branch out of the above for terminal-class
+        tools (`kernel/plugin/jones_gate::TERMINAL_LIKE_TOOLS`): the rule
+        gate no longer has an `allow` fast path for these at all (see that
+        package's `_decide` docstring), so every one of them reaching this
+        function is re-classified from scratch, in depth, by
+        `_decide_terminal_like_permission` BEFORE either of the two
+        branches above ever runs for it — see that method's own docstring
+        for the exact eligibility rule. Its possible outcomes are `deny`
+        (a hard-deny hit the plugin's own copy should already have caught —
+        this is defense in depth, not trust of what the plugin decided),
+        `allow` (only when provably safe AND either an exact matching
+        `permissions.json`/`remember` rule exists or the session is in
+        `auto` mode), or `None` — meaning "fall through to the pending/
+        user-gate flow below exactly as if this branch didn't exist",
+        reusing the SAME `risk`/`decision_id` already computed, never
+        re-classifying twice.
 
         The MODE used for the branch above is deliberately not always a
         fresh database read (review finding #13, 2026-09-19): `_extract_
@@ -1253,7 +1387,14 @@ class SessionService:
         )
         risk = review.classify(tool_name, tool_args, cwd=cwd)
 
-        if risk.level == "low" and mode in ("auto", "task"):
+        if tool_name in TERMINAL_LIKE_TOOLS:
+            decided = await self._decide_terminal_like_permission(
+                session_id=session_id, decision_id=decision_id, step_id=step_id,
+                tool_args=tool_args, mode=mode, risk=risk, params=params,
+            )
+            if decided is not None:
+                return decided
+        elif risk.level == "low" and mode in ("auto", "task"):
             await run_in_db_thread(
                 queries.insert_permission_decision,
                 self.ctx.db, decision_id=decision_id, step_id=step_id,

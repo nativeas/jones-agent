@@ -14,6 +14,20 @@ today (`sessions/service.py::_on_request_permission`, per 02-w3-interfaces.md
 to have a real middle ground to show, and so a future W4+ model-classifier
 swap-in has somewhere to land results that are elevated-but-not-alarming
 without changing the binary gating rule above it.
+
+## Round 6 (2026-09-19, controller ruling R10 — final, not overturnable)
+
+`terminal` (and every other tool in `kernel/plugin/jones_gate/__init__.py::
+TERMINAL_LIKE_TOOLS`) no longer follows the generic decision tree above —
+R10 removed the plugin-side allow fast path for these tools entirely
+(§1.1's rule gate can now only `block`/`approve` a terminal-class call), so
+`sessions/service.py::_on_request_permission` gates them through its own,
+stricter rule instead: `low` alone is no longer sufficient to auto-allow —
+it also needs `transparency(command) == "plain"` AND (a `permissions.json`/
+`remember` rule whose `match` normalizes to the exact command, OR `auto`
+mode). `_classify_terminal` below is what makes `low` achievable again for
+a `terminal` call (round 4/5 had it floor at `medium` — see that function's
+own docstring for why that floor is gone now, not merely widened).
 """
 
 from __future__ import annotations
@@ -189,19 +203,37 @@ def _classify_write(path: Any, *, cwd: str | None) -> Risk:
 
 
 def _classify_terminal(args: dict[str, Any]) -> Risk:
-    # Round 5 (controller ruling R5/R7, 2026-09-19, final): the FIRST thing
-    # this function does is the same `transparency(command)` judgment the
-    # rule gate's allow fast path uses (`kernel/plugin/jones_gate/_rules.py`)
-    # — R5, verbatim: "opaque 命令...永不被审查闸判 low/medium，直接 high →
-    # 用户闸". This supersedes round 4's narrower "a terminal call never
-    # classifies below `medium`" floor (still true below, but no longer the
-    # strongest guarantee this function makes): an opaque command skips
-    # `medium` entirely and goes straight to `high`, in every mode, because
-    # this codebase cannot prove by static analysis alone that its literal
-    # text is what actually runs (quoting that could hide a substitution, an
-    # indirect-execution program name, ... — see `_transparency.py`'s
-    # docstring for the full trigger list and the round-4 re-review bypasses
-    # this closes: a double-quoted `$(...)`, `$'rm'` ANSI-C quoting).
+    # Round 5 (controller ruling R5/R7, 2026-09-19): the FIRST thing this
+    # function does is the same `transparency(command)` judgment the rule
+    # gate's allow fast path uses (`kernel/plugin/jones_gate/_rules.py`) —
+    # R5, verbatim: "opaque 命令...永不被审查闸判 low/medium，直接 high →
+    # 用户闸". An opaque command skips `low`/`medium` entirely and goes
+    # straight to `high`, in every mode, because this codebase cannot prove
+    # by static analysis alone that its literal text is what actually runs
+    # (quoting that could hide a substitution, an indirect-execution program
+    # name, ... — see `_transparency.py`'s docstring for the full trigger
+    # list).
+    #
+    # Round 6 (controller ruling R10, 2026-09-19, final): round 4/5's
+    # `medium` FLOOR for a `plain`, non-network-egress command is gone — it
+    # now classifies `low`. That floor existed only because, pre-R10, the
+    # PLUGIN's own allow fast path already handled a trusted, non-opaque
+    # command with zero daemon involvement — this function only ever saw a
+    # `terminal` call that had ALREADY failed to zero-IPC-allow, so treating
+    # "no specific risk signal" as `medium` (never quite trusted) was the
+    # safety net for whatever the plugin's own matching had gotten wrong.
+    # R10 removes that plugin-side bypass entirely for terminal-class tools
+    # (`kernel/plugin/jones_gate/__init__.py::TERMINAL_LIKE_TOOLS`) and
+    # makes the DAEMON (`sessions/service.py::_on_request_permission`) the
+    # only place such a call can ever auto-allow — which needs this
+    # function to genuinely be able to say `low` again, otherwise R10's
+    # "transparency=plain 且 review=low 且 存在匹配的 allow 规则（或 auto 模
+    # 式）→ 自动 allow" condition could never fire for anything. `medium`
+    # still exists for the UI's "标红" (unchanged tools below still use it);
+    # for `terminal` specifically, its only remaining source is an
+    # unparseable-but-not-opaque command, which can't happen (an
+    # unparseable command IS opaque, see `_transparency.classify`) — kept as
+    # a defensive fallback, not a reachable path.
     command = args.get("command")
     if not isinstance(command, str) or not command:
         return _high("terminal call with no command text to analyze")
@@ -221,11 +253,15 @@ def _classify_terminal(args: dict[str, Any]) -> Risk:
     tokens = _hard_deny.tokenize(command)
     if tokens is None:
         return _high("could not parse this command for risk analysis")
-    programs = {Path(t).name for t in tokens}
+    # Round 6 (controller ruling R11): lowercased — `CURL`/`Wget` must be
+    # flagged exactly like their lowercase spellings.
+    programs = {Path(t).name.lower() for t in tokens}
     hit = programs & _NETWORK_EGRESS_PROGRAMS
     if hit:
         return _high(f"command includes a network-egress tool: {', '.join(sorted(hit))}")
-    return _medium("terminal command, no specific risk signal matched")
+    return _low(
+        "plain terminal command with no network-egress signal (controller ruling R10, round 6)"
+    )
 
 
 def _classify_browser_evaluate(args: dict[str, Any]) -> Risk:

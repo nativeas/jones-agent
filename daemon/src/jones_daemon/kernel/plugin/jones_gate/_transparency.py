@@ -55,6 +55,17 @@ than re-implementing the same rules — R7's "两处 import 同一份": the daem
 process can import this package as an ordinary Python package (it already
 does, for `_review_payload`/`_hard_deny`), it's only the WORKER's copy of it
 that has to be dependency-free.
+
+## Round 6 (2026-09-19, controller ruling R11 — final, not overturnable)
+
+Every interpreter/indirect-execution program-name trigger below is now
+case-insensitive: `BASH script.sh`/`PYTHON3 -c ...` are `opaque` exactly
+like their lowercase spellings, via `_hard_deny._prog()`'s own lowercasing
+plus an explicit `.lower()` at each comparison site that also checks the
+raw token. The operator/quoting substrings (`$(`, `` ` ``, `;`, `&`, `|`,
+redirection, …) and `$IFS`/`${IFS` are untouched — they're punctuation and
+a real (case-sensitive by shell convention) environment variable name, not
+program-name spelling variance.
 """
 
 from __future__ import annotations
@@ -117,12 +128,12 @@ def _has_quoted_dollar_or_backtick(command: str) -> bool:
 
 
 def _has_find_delete_or_exec(tokens: list[str], index: int) -> bool:
-    rest = tokens[index + 1 :]
+    rest = [t.lower() for t in tokens[index + 1 :]]
     return "-delete" in rest or "-exec" in rest
 
 
 def _has_sed_in_place(tokens: list[str], index: int) -> bool:
-    rest = tokens[index + 1 :]
+    rest = [t.lower() for t in tokens[index + 1 :]]
     return any(
         t == "-i" or t.startswith("-i") or t == "--in-place" or t.startswith("--in-place")
         for t in rest
@@ -147,10 +158,15 @@ def _has_leading_dot_source(tokens: list[str]) -> bool:
 
 def _has_opaque_program_token(tokens: list[str]) -> bool:
     for index, tok in enumerate(tokens):
+        # `_hard_deny._prog()` already lowercases (controller ruling R11,
+        # round 6, final) — `tok.lower()` alongside it catches a raw token
+        # that isn't itself a bare program name (e.g. carries a path) but
+        # still happens to equal one of these names case-insensitively.
         name = _hard_deny._prog(tok)
-        if name in _OPAQUE_PROGRAM_NAMES or tok in _OPAQUE_PROGRAM_NAMES:
+        lowered_tok = tok.lower()
+        if name in _OPAQUE_PROGRAM_NAMES or lowered_tok in _OPAQUE_PROGRAM_NAMES:
             return True
-        if name.startswith("python") or tok.startswith("python"):
+        if name.startswith("python") or lowered_tok.startswith("python"):
             return True
         if (name == "find" or tok == "find") and _has_find_delete_or_exec(tokens, index):
             return True
