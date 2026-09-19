@@ -100,6 +100,34 @@ def runtime_dir() -> Path:
     return _ensure(user_root() / "runtime", mode=0o700)
 
 
+def worker_home_dir(root: Path, session_id: str) -> Path:
+    """`<root>/runtime/workers/<session-id>/` — per-Session worker state:
+    `workers/manager.py`'s isolated `HERMES_HOME` lives one level under this
+    (`.../hermes/`) — `config.yaml` (MCP server credentials among its contents,
+    `capabilities/mcp_config.py`), the `jones_gate` plugin copy,
+    `jones_tools.json`. PRD 10.2's `runtime/` entry already documents "worker
+    注册表" as living there; this names that leaf explicitly instead of
+    `workers/manager.py` inventing its own undocumented top-level `workers/`
+    sibling — an entry the PRD-vs-disk directory audit
+    (`test_storage_paths_audit.py`) structurally could not catch, since it only
+    ever enumerates `paths.py`'s own accessors against a fresh tmp home nothing
+    has spawned a worker in yet (round-2 review, Issue #23).
+
+    Takes an explicit `root` rather than reading `user_root()` itself:
+    `WorkerManager` is constructed with its own `user_root: Path` (tests
+    routinely pass a bare `tmp_path` without also setting `JONES_HOME` — see
+    `test_workers_manager.py::_make_manager`), and every `store/maintenance.py`
+    delete function already takes `user_root` the same way — calling
+    `user_root()` here would silently resolve to the real `~/.jones` for both
+    of those callers instead of the root they were actually given. No `mkdir`
+    here (unlike most accessors above): `workers/manager.py::
+    _prepare_hermes_home` already creates (and `chmod`s 0700) the one leaf
+    under this path that actually needs to exist (`.../hermes/`), and
+    `store/maintenance.py::delete_session` only ever reads this path to check
+    existence before purging it."""
+    return root / "runtime" / "workers" / session_id
+
+
 def runs_dir() -> Path:
     _ensure_root()
     return _ensure(user_root() / "runs")

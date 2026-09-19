@@ -464,6 +464,25 @@ async def test_recent_response_samples_is_bounded(server):
     assert ids[-1] == str(RECENT_RESPONSES_MAXLEN + 4)
 
 
+async def test_recent_response_samples_are_truncated_not_the_full_body(server):
+    # Round-2 review: a large response (e.g. `run.payload` with `limit=None`,
+    # 04-w5-interfaces.md §5) used to be sampled here in full — up to
+    # MAX_LINE_BYTES (16MB) per entry, times RECENT_RESPONSES_MAXLEN (100)
+    # retained. The self-check that consumes this buffer only needs an 8-byte
+    # substring match, not the whole body.
+    from jones_daemon.rpc.server import RECENT_RESPONSE_SAMPLE_MAX_CHARS
+
+    async def _big_handler(params, conn):
+        return {"blob": "x" * (RECENT_RESPONSE_SAMPLE_MAX_CHARS * 4)}
+
+    server.register("test.big", _big_handler)
+    await _roundtrip(server.socket_path, {"jsonrpc": "2.0", "id": "1", "method": "test.big"})
+
+    samples = server.recent_response_samples()
+    assert len(samples) == 1
+    assert len(samples[0]) == RECENT_RESPONSE_SAMPLE_MAX_CHARS
+
+
 async def test_broadcast_to_a_connection_that_already_disconnected_does_not_raise(server):
     class DeadConnLikeWriter:
         async def notify(self, method, params):

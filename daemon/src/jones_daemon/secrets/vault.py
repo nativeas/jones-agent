@@ -201,6 +201,17 @@ class Vault:
     def names(self) -> list[str]:
         return list(self._read_entries())
 
+    def entries(self) -> dict[str, str]:
+        """Every configured entry, `{name: secret_value}`, from one `_read_entries()`
+        call. `store/maintenance.py`'s redaction self-check (round-2 review, Issue
+        #23) used to call `get()` once per configured provider name — each call
+        independently re-reads and re-decrypts the whole vault file, so N
+        configured providers meant N redundant full-vault decrypts every single
+        pass of an hourly-forever loop. `names()`/`get()` remain the normal
+        per-key API for everything else; this is for a caller that genuinely
+        needs every value at once."""
+        return dict(self._read_entries())
+
     def reset(self, entries: dict[str, str]) -> None:
         """Discard whatever is on disk — even if it's corrupt JSON or no longer decrypts with the
         current data key — and start a brand new vault containing exactly `entries`. Unlike

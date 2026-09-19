@@ -16,7 +16,7 @@ from jones_daemon.providers.catalog import VENDORS
 from jones_daemon.providers.methods import _clear_provider_key, _write_provider_key, register
 from jones_daemon.rpc.errors import INVALID_PARAMS, NOT_FOUND, PROVIDER_ERROR, RpcError
 from jones_daemon.rpc.server import RpcServer
-from jones_daemon.secrets.vault import Vault, VaultError
+from jones_daemon.secrets.vault import Vault, VaultError, VaultKeyMismatchError
 from jones_daemon.store.db import connect, run_in_db_thread
 from jones_daemon.store.migrator import apply_pending
 
@@ -212,6 +212,55 @@ async def test_delete_key_on_unreadable_vault_returns_provider_error_not_interna
     list_response = await _call(server.socket_path, "provider.list")
     row = next(r for r in list_response["result"] if r["provider"] == "anthropic")
     assert row["has_key"] is False
+
+
+# --- round 2 review: `vault_key_mismatch` must be distinguishable from a merely-corrupt ---------
+# --- vault (Issue #23/G19: "不同 key 解密失败必须是显式 vault_key_mismatch 错误") --------------
+
+
+class _KeyMismatchVault(Vault):
+    """Stands in for a real machine-migration scenario: `_read_entries()` raises
+    `VaultKeyMismatchError` specifically (not the generic `VaultError` the
+    `_corrupt_the_vault` fixture above produces), the way a genuinely wrong data
+    key does (see `secrets/vault.py::Vault._read_entries`)."""
+
+    def set(self, name, value):
+        raise VaultKeyMismatchError("simulated: wrong data key for this vault file")
+
+    def delete(self, name):
+        raise VaultKeyMismatchError("simulated: wrong data key for this vault file")
+
+
+async def test_write_provider_key_reports_vault_key_mismatch_distinctly(conn):
+    with pytest.raises(RpcError) as excinfo:
+        await run_in_db_thread(
+            _write_provider_key,
+            conn,
+            _KeyMismatchVault(Path("/unused")),
+            "anthropic",
+            "sk-ant-doesnotmatter",
+        )
+    assert excinfo.value.code == PROVIDER_ERROR
+    assert excinfo.value.detail["vault_key_mismatch"] is True
+
+
+async def test_clear_provider_key_reports_vault_key_mismatch_distinctly(conn):
+    def _seed(c):
+        c.execute(
+            "INSERT INTO providers (id, name, has_key, key_hint, default_model, "
+            "created_at, updated_at) VALUES ('provider_anthropic', 'anthropic', 1, 'abcd', "
+            "'x', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')"
+        )
+        c.commit()
+
+    await run_in_db_thread(_seed, conn)
+
+    with pytest.raises(RpcError) as excinfo:
+        await run_in_db_thread(
+            _clear_provider_key, conn, _KeyMismatchVault(Path("/unused")), "anthropic"
+        )
+    assert excinfo.value.code == PROVIDER_ERROR
+    assert excinfo.value.detail["vault_key_mismatch"] is True
 
 
 # --- round 2 review: force=True must not leave a dangling transaction on the shared connection -

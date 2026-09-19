@@ -67,7 +67,10 @@ async def test_ensure_started_passes_self_check_and_isolates_hermes_home(tmp_pat
     try:
         worker = await manager.ensure_started("s1", cwd="/tmp")
         assert worker.acp_session_id == "fake-session-1"
-        assert worker.hermes_home == tmp_path / "workers" / "s1" / "hermes"
+        # Round-2 review: moved under `runtime/` (PRD 10.2's `runtime/` entry
+        # already documents "worker 注册表") instead of a new undocumented
+        # top-level `workers/` sibling — see `paths.worker_home_dir`.
+        assert worker.hermes_home == tmp_path / "runtime" / "workers" / "s1" / "hermes"
         assert (worker.hermes_home / "plugins" / "jones_gate" / "plugin.yaml").exists()
         assert (worker.hermes_home / "config.yaml").exists()
         config_text = (worker.hermes_home / "config.yaml").read_text()

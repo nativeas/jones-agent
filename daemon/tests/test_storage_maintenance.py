@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
+from pathlib import Path
 
 import pytest
 
@@ -13,7 +14,7 @@ from jones_daemon import paths
 from jones_daemon.replay import store as replay_store
 from jones_daemon.rpc.errors import RpcError
 from jones_daemon.sessions import queries
-from jones_daemon.store import apply_pending, connect, maintenance
+from jones_daemon.store import apply_pending, connect, maintenance, run_in_db_thread
 
 
 @pytest.fixture
@@ -23,6 +24,22 @@ def conn(tmp_path, monkeypatch) -> sqlite3.Connection:
     apply_pending(c)
     yield c
     c.close()
+
+
+@pytest.fixture
+async def scan_conn(conn):
+    """A second connection to the same `jones.db`, opened ON the dedicated DB-
+    thread executor (`store.run_in_db_thread`) — unlike the `conn` fixture
+    above (opened on the pytest test thread for the many synchronous tests in
+    this file that call `maintenance.*` directly). `startup_key_redaction_self_
+    check`'s own DB scan goes through `run_in_db_thread` internally (it must,
+    in production, since the daemon's real shared connection is born on that
+    same executor thread — `store/db.py`'s `check_same_thread=True`), so a
+    connection born on a different thread would trip that same guard here. The
+    two connections see the same committed rows (WAL, same file on disk)."""
+    c = await run_in_db_thread(connect, paths.db_path())
+    yield c
+    await run_in_db_thread(c.close)
 
 
 def _seed_session(conn, *, session_id="s1", is_main=False, parent_id=None) -> None:
@@ -116,6 +133,41 @@ def test_delete_session_refuses_when_a_run_is_still_running(conn):
 def test_delete_session_raises_not_found_for_an_unknown_id(conn):
     with pytest.raises(RpcError):
         maintenance.delete_session(conn, paths.user_root(), "does-not-exist")
+
+
+def test_delete_session_purges_the_worker_home_directory(conn):
+    # Round-2 review: `workers/manager.py::_hermes_home_for` materializes real
+    # per-session state (config.yaml, the jones_gate plugin copy,
+    # jones_tools.json — MCP credentials among them) under
+    # `paths.worker_home_dir(user_root, session_id)`; nothing purged it before.
+    _seed_session(conn, session_id="s1")
+    worker_home = paths.worker_home_dir(paths.user_root(), "s1")
+    (worker_home / "hermes").mkdir(parents=True)
+    (worker_home / "hermes" / "config.yaml").write_text("mcp_servers: {}")
+
+    maintenance.delete_session(conn, paths.user_root(), "s1")
+
+    assert not worker_home.exists()
+
+
+def test_delete_session_raises_partial_delete_error_when_worker_home_purge_fails(
+    conn, monkeypatch
+):
+    _seed_session(conn, session_id="s1")
+    worker_home = paths.worker_home_dir(paths.user_root(), "s1")
+    worker_home.mkdir(parents=True)
+
+    def _boom(path):
+        raise OSError("simulated purge failure")
+
+    monkeypatch.setattr(maintenance.shutil, "rmtree", _boom)
+
+    with pytest.raises(maintenance.PartialDeleteError) as exc_info:
+        maintenance.delete_session(conn, paths.user_root(), "s1")
+
+    assert exc_info.value.detail["stage"] == "purge_worker_home"
+    assert exc_info.value.detail["fully_deleted"] is False
+    assert conn.execute("SELECT 1 FROM sessions WHERE id='s1'").fetchone() is None
 
 
 def test_delete_session_does_not_touch_an_unrelated_session(conn):
@@ -359,6 +411,57 @@ def test_delete_project_rolls_back_and_leaves_no_open_transaction_on_failure(con
     assert conn.in_transaction is False
 
 
+def test_delete_project_raises_partial_delete_error_when_attachments_purge_fails(
+    conn, tmp_path, monkeypatch
+):
+    # Round-2 review: `delete_project` never had `delete_session`/`delete_run`'s
+    # own `PartialDeleteError` contract for the two steps that run after its
+    # `DELETE FROM projects` has already committed (04-w5-interfaces.md §6
+    # "诚实失败") — a bare `OSError` used to reach `rpc/server.py::_dispatch`'s
+    # generic `except Exception` as an opaque INTERNAL_ERROR with no
+    # `daemon.error` broadcast.
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    from jones_daemon.projects.service import ProjectService
+
+    project = ProjectService(conn).create(str(workdir))
+    attachments = paths.project_attachments_dir(project["id"])
+    (attachments / "f.txt").write_text("x")
+
+    def _boom(path):
+        raise OSError("simulated purge failure")
+
+    monkeypatch.setattr(maintenance.shutil, "rmtree", _boom)
+
+    with pytest.raises(maintenance.PartialDeleteError) as exc_info:
+        maintenance.delete_project(conn, paths.user_root(), project["id"])
+
+    assert exc_info.value.detail["stage"] == "purge_attachments"
+    assert exc_info.value.detail["fully_deleted"] is False
+    assert conn.execute("SELECT 1 FROM projects WHERE id=?", (project["id"],)).fetchone() is None
+
+
+def test_delete_project_partial_delete_error_marked_fully_deleted_on_checkpoint_busy(
+    conn, tmp_path, monkeypatch
+):
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    from jones_daemon.projects.service import ProjectService
+
+    project = ProjectService(conn).create(str(workdir))
+
+    def _always_busy(conn, **kwargs):
+        raise maintenance.CheckpointBusyError("simulated busy")
+
+    monkeypatch.setattr(maintenance, "checkpoint_truncate_or_raise", _always_busy)
+
+    with pytest.raises(maintenance.PartialDeleteError) as exc_info:
+        maintenance.delete_project(conn, paths.user_root(), project["id"])
+
+    assert exc_info.value.detail["fully_deleted"] is True
+    assert conn.execute("SELECT 1 FROM projects WHERE id=?", (project["id"],)).fetchone() is None
+
+
 # --- export_session ----------------------------------------------------------------
 
 
@@ -399,6 +502,50 @@ def test_export_session_delete_after_deletes_only_once_the_file_is_written(conn)
     path = maintenance.export_session(conn, paths.user_root(), "s1", delete_after=True)
 
     assert path.exists()
+    assert conn.execute("SELECT 1 FROM sessions WHERE id='s1'").fetchone() is None
+
+
+def test_export_session_writes_durably_via_fsync_not_a_plain_write_text(conn, monkeypatch):
+    # Round-2 review: the docstring promises "fully written" before
+    # `delete_after` can ever run — `Path.write_text` alone doesn't back that
+    # promise (bytes can still be in the page cache on crash). This proves the
+    # actual write path goes through `os.fsync`, the same technique
+    # `secrets/vault.py::Vault._write_entries` uses.
+    _seed_session(conn, session_id="s1")
+    fsync_calls = []
+    real_fsync = maintenance.os.fsync
+    monkeypatch.setattr(
+        maintenance.os, "fsync", lambda fd: (fsync_calls.append(fd), real_fsync(fd))[1]
+    )
+
+    path = maintenance.export_session(conn, paths.user_root(), "s1")
+
+    assert path.exists()
+    assert path.read_text()  # real content landed
+    # One fsync for the tmp file's data, one for the containing directory.
+    assert len(fsync_calls) == 2
+
+
+def test_export_session_delete_after_partial_failure_still_reports_the_export_path(
+    conn, monkeypatch
+):
+    # Round-2 review: `delete_after=True`'s inner `delete_session` can itself
+    # raise `PartialDeleteError` — the export file is already durably on disk
+    # at that point (written before `delete_session` is ever called), so the
+    # exception must carry the export path forward rather than losing it.
+    _seed_session(conn, session_id="s1")
+
+    def _always_busy(conn, **kwargs):
+        raise maintenance.CheckpointBusyError("simulated busy")
+
+    monkeypatch.setattr(maintenance, "checkpoint_truncate_or_raise", _always_busy)
+
+    with pytest.raises(maintenance.PartialDeleteError) as exc_info:
+        maintenance.export_session(conn, paths.user_root(), "s1", delete_after=True)
+
+    assert exc_info.value.detail["fully_deleted"] is True
+    export_path = Path(exc_info.value.detail["export_path"])
+    assert export_path.exists()
     assert conn.execute("SELECT 1 FROM sessions WHERE id='s1'").fetchone() is None
 
 
@@ -456,6 +603,36 @@ def test_rotate_logs_deletes_only_files_older_than_the_retention_window(tmp_path
 
 def test_rotate_logs_on_a_missing_directory_is_a_noop(tmp_path):
     assert maintenance.rotate_logs(tmp_path / "does-not-exist") == 0
+
+
+def test_rotate_logs_never_deletes_a_file_an_active_handler_still_has_open(tmp_path):
+    # Round-2 review: a quiet daemon that goes `retention_days` without logging
+    # a single line lets `daemon.log`'s mtime cross the cutoff while
+    # `logging.py::configure_logging`'s `TimedRotatingFileHandler` still holds
+    # an open fd on it — this sweep must never unlink a file a handler on the
+    # `jones_daemon` logger is still writing to, regardless of mtime.
+    import logging
+
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    active_path = logs_dir / "daemon.log"
+    handler = logging.FileHandler(active_path)
+    logger = logging.getLogger("jones_daemon")
+    logger.addHandler(handler)
+    try:
+        active_path.write_text("still being written")
+        old_ts = time.time() - 8 * 86400
+        import os
+
+        os.utime(active_path, (old_ts, old_ts))
+
+        removed = maintenance.rotate_logs(logs_dir, retention_days=7)
+
+        assert removed == 0
+        assert active_path.exists()
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
 
 
 # --- clear_cache ---------------------------------------------------------------------
@@ -565,8 +742,13 @@ class _FakeVault:
     def get(self, name: str) -> str:
         return self._keys[name]
 
+    def entries(self) -> dict[str, str]:
+        return dict(self._keys)
 
-async def test_startup_key_redaction_self_check_reads_real_logs_and_calls_on_hit(tmp_path):
+
+async def test_startup_key_redaction_self_check_reads_real_logs_and_calls_on_hit(
+    scan_conn, tmp_path
+):
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir()
     (logs_dir / "daemon.log").write_text("leaked: sk-ant-abcdef1234567890 in the clear")
@@ -579,6 +761,8 @@ async def test_startup_key_redaction_self_check_reads_real_logs_and_calls_on_hit
     hits = await maintenance.startup_key_redaction_self_check(
         vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
         logs_dir=logs_dir,
+        conn=scan_conn,
+        runs_dir=tmp_path / "runs",
         recent_response_samples=[],
         on_hit=on_hit,
     )
@@ -590,7 +774,7 @@ async def test_startup_key_redaction_self_check_reads_real_logs_and_calls_on_hit
     assert detail == {"providers": ["anthropic"]}
 
 
-async def test_startup_key_redaction_self_check_scans_response_samples_too(tmp_path):
+async def test_startup_key_redaction_self_check_scans_response_samples_too(scan_conn, tmp_path):
     logs_dir = tmp_path / "logs"  # left empty — the hit must come from responses alone
     logs_dir.mkdir()
     hit_calls = []
@@ -601,6 +785,8 @@ async def test_startup_key_redaction_self_check_scans_response_samples_too(tmp_p
     hits = await maintenance.startup_key_redaction_self_check(
         vault=_FakeVault({"openai": "sk-oa-abcdef1234567890"}),
         logs_dir=logs_dir,
+        conn=scan_conn,
+        runs_dir=tmp_path / "runs",
         recent_response_samples=[b'{"result":"sk-oa-abcdef1234567890 leaked here"}'],
         on_hit=on_hit,
     )
@@ -609,7 +795,9 @@ async def test_startup_key_redaction_self_check_scans_response_samples_too(tmp_p
     assert len(hit_calls) == 1
 
 
-async def test_startup_key_redaction_self_check_does_not_call_on_hit_when_clean(tmp_path):
+async def test_startup_key_redaction_self_check_does_not_call_on_hit_when_clean(
+    scan_conn, tmp_path
+):
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir()
     (logs_dir / "daemon.log").write_text("nothing sensitive here")
@@ -620,13 +808,76 @@ async def test_startup_key_redaction_self_check_does_not_call_on_hit_when_clean(
     hits = await maintenance.startup_key_redaction_self_check(
         vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
         logs_dir=logs_dir,
+        conn=scan_conn,
+        runs_dir=tmp_path / "runs",
         recent_response_samples=[],
         on_hit=on_hit,
     )
     assert hits == []
 
 
-async def test_run_redaction_self_check_loop_runs_immediately_then_on_every_interval(tmp_path):
+# --- round-2 review: G03's own "全文 grep" also covers the replay sinks (jones.db's ------
+# --- steps.args_json/messages.content_json, and runs/<id>/ payload files) --------------
+
+
+async def test_startup_key_redaction_self_check_scans_recent_step_args(conn, scan_conn, tmp_path):
+    _seed_session(conn, session_id="s1")
+    _seed_full_run(conn, session_id="s1", run_id="r1")
+    conn.execute(
+        "UPDATE steps SET args_json = ? WHERE id = 'r1-step1'",
+        ('{"header": "Authorization: Bearer sk-ant-abcdef1234567890"}',),
+    )
+    conn.commit()
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()  # left empty — the hit must come from the DB alone
+
+    hit_calls = []
+
+    async def on_hit(code, message, detail):
+        hit_calls.append(detail)
+
+    hits = await maintenance.startup_key_redaction_self_check(
+        vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
+        logs_dir=logs_dir,
+        conn=scan_conn,
+        runs_dir=tmp_path / "runs",
+        recent_response_samples=[],
+        on_hit=on_hit,
+    )
+
+    assert hits == ["anthropic"]
+    assert hit_calls == [{"providers": ["anthropic"]}]
+
+
+async def test_startup_key_redaction_self_check_scans_recent_run_payload_files(scan_conn, tmp_path):
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()  # left empty — the hit must come from the payload file alone
+    runs_dir = tmp_path / "runs"
+    replay_store.write_payload(
+        tmp_path, "r1", 1, b"curl -H 'Authorization: Bearer sk-ant-abcdef1234567890'", "txt"
+    )
+
+    hit_calls = []
+
+    async def on_hit(code, message, detail):
+        hit_calls.append(detail)
+
+    hits = await maintenance.startup_key_redaction_self_check(
+        vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
+        logs_dir=logs_dir,
+        conn=scan_conn,
+        runs_dir=runs_dir,
+        recent_response_samples=[],
+        on_hit=on_hit,
+    )
+
+    assert hits == ["anthropic"]
+    assert hit_calls == [{"providers": ["anthropic"]}]
+
+
+async def test_run_redaction_self_check_loop_runs_immediately_then_on_every_interval(
+    scan_conn, tmp_path
+):
     # Round-1 review: a one-shot call at process startup can never see a real
     # RPC response (the server hasn't accepted a client yet at that instant) —
     # this proves the loop (a) checks right away, not after the first sleep, and
@@ -652,6 +903,8 @@ async def test_run_redaction_self_check_loop_runs_immediately_then_on_every_inte
         maintenance.run_redaction_self_check_loop(
             vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
             logs_dir=logs_dir,
+            conn=scan_conn,
+            runs_dir=tmp_path / "runs",
             recent_response_samples=_samples,
             on_hit=on_hit,
             interval_s=0.01,
@@ -681,12 +934,12 @@ async def test_run_redaction_self_check_loop_runs_immediately_then_on_every_inte
             await task
 
 
-async def test_run_redaction_self_check_loop_survives_a_failing_pass(tmp_path):
+async def test_run_redaction_self_check_loop_survives_a_failing_pass(scan_conn, tmp_path):
     # A malfunctioning check (e.g. vault access blows up) must be logged and
     # skipped, not crash the loop — DEV.md 诚实失败 applies to the guard's own
     # plumbing too, but a broken self-check must not itself take the daemon down.
     class _BoomVault:
-        def names(self):
+        def entries(self):
             raise RuntimeError("vault unavailable")
 
     passes = 0
@@ -703,6 +956,8 @@ async def test_run_redaction_self_check_loop_survives_a_failing_pass(tmp_path):
         maintenance.run_redaction_self_check_loop(
             vault=_BoomVault(),
             logs_dir=tmp_path / "logs",
+            conn=scan_conn,
+            runs_dir=tmp_path / "runs",
             recent_response_samples=_samples,
             on_hit=_noop,
             interval_s=0.01,

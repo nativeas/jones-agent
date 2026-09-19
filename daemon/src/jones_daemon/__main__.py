@@ -181,6 +181,8 @@ async def _run() -> None:
             maintenance.run_redaction_self_check_loop(
                 vault=vault,
                 logs_dir=paths.logs_dir(),
+                conn=conn,
+                runs_dir=paths.runs_dir(),
                 recent_response_samples=server.recent_response_samples,
                 on_hit=_on_redaction_hit,
             )

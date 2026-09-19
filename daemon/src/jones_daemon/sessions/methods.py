@@ -167,17 +167,27 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
         return await service.run_payload(_require_str(params, "ref"), offset=offset, limit=limit)
 
     async def session_delete(params: dict[str, Any], conn: Connection) -> Any:
-        # Issue #23 (04-w5-interfaces.md §5, G20 真删) — calls straight into
-        # `store/maintenance.py` rather than through `SessionService`: this
-        # branch's contract only grants it `sessions/methods.py`, not
-        # `sessions/service.py` (04-w5-interfaces.md §1's per-branch ownership
-        # table), so the cascade-delete + refusal rules live entirely in
-        # `maintenance.delete_session` and this handler is a thin
-        # params -> call translation, same shape as every other handler here.
+        # Issue #23 (04-w5-interfaces.md §5, G20 真删): the cascade-delete +
+        # refusal rules still live entirely in `maintenance.delete_session`,
+        # this handler is still a thin params -> call translation. Round-2
+        # review: the DB-only "is a Run running" check inside
+        # `maintenance.delete_session` races `SessionService`'s own in-memory
+        # authority on that same question (`_active_turns`/`_turn_tasks` under
+        # `self._lock(session_id)`) — closing that race needs the session lock
+        # itself, which only `SessionService` holds, hence `service.
+        # delete_guard` (04-w5-interfaces.md §1 grants this branch
+        # `sessions/service.py` access for exactly this — see that method's
+        # own docstring).
         session_id = _require_str(params, "id")
         user_root = ctx.paths.user_root()
-        return await _run_delete_honestly(
-            server, maintenance.delete_session, ctx.db, user_root, session_id
+        return await service.delete_guard(
+            session_id,
+            _run_delete_honestly,
+            server,
+            maintenance.delete_session,
+            ctx.db,
+            user_root,
+            session_id,
         )
 
     async def session_export(params: dict[str, Any], conn: Connection) -> Any:
@@ -187,13 +197,35 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
             raise RpcError(
                 INVALID_PARAMS, "'delete_after' must be a boolean", {"params": params}
             )
-        path = await run_in_db_thread(
-            maintenance.export_session,
-            ctx.db,
-            ctx.paths.user_root(),
-            session_id,
-            delete_after=delete_after,
-        )
+        try:
+            path = await run_in_db_thread(
+                maintenance.export_session,
+                ctx.db,
+                ctx.paths.user_root(),
+                session_id,
+                delete_after=delete_after,
+            )
+        except maintenance.PartialDeleteError as exc:
+            # Round-2 review: `delete_after=True`'s inner `delete_session` call
+            # can raise this exact same `PartialDeleteError` `session.delete`
+            # does — this handler used to let it fall straight through to
+            # `rpc/server.py::_dispatch`'s generic `except Exception`, an opaque
+            # `INTERNAL_ERROR` with no `daemon.error` broadcast, the identical
+            # bug round-1 review already fixed for `session.delete`/`run.delete`
+            # via `_run_delete_honestly` just never reached here.
+            await server.broadcast_all(
+                "daemon.error",
+                {"code": "delete_partially_failed", "message": str(exc), "detail": exc.detail},
+            )
+            if not exc.detail.get("fully_deleted"):
+                raise RpcError(INVALID_STATE, str(exc), exc.detail) from exc
+            # fully_deleted True: the export file, the session's rows, and every
+            # run's payload are all genuinely gone — only the trailing WAL
+            # checkpoint stayed busy. `export_session` stashes the export path
+            # into `exc.detail` for exactly this branch (see its docstring) so
+            # the caller still gets a normal success response instead of losing
+            # an export that is, in fact, sitting durably on disk.
+            return {"path": exc.detail["export_path"]}
         return {"path": str(path)}
 
     async def run_delete(params: dict[str, Any], conn: Connection) -> Any:

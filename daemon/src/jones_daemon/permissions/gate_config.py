@@ -53,12 +53,15 @@ _FILE_NAME = "jones_gate.json"
 
 def hermes_home_for(user_root: Path, session_id: str) -> Path:
     """Same path formula as `workers/manager.py::WorkerManager._hermes_home_for`
-    (same session -> same HERMES_HOME) — duplicated by hand rather than
-    imported: that method is private and this branch's shared-file allowance
-    for `workers/manager.py` doesn't include adding a public accessor (see
-    the PR report's "契约变更" section). Keep in sync if that formula ever
-    changes."""
-    return user_root / "workers" / session_id / "hermes"
+    (same session -> same HERMES_HOME) — this module's own docstring already
+    warned "keep in sync if that formula ever changes", and round-2 review
+    (Issue #23) is exactly that: `workers/manager.py` used to hand-roll
+    `user_root / "workers" / session_id / "hermes"` too (an undocumented
+    top-level directory PRD 10.2 never listed and `session.delete`'s real-delete
+    pass never purged), and both call sites now go through the one named
+    accessor, `paths.worker_home_dir`, instead of two independently-hand-rolled
+    copies of the same join."""
+    return paths.worker_home_dir(user_root, session_id) / "hermes"
 
 
 def gate_config_path(hermes_home: Path) -> Path:

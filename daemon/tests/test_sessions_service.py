@@ -18,6 +18,7 @@ import pytest
 from jones_daemon.context import DaemonContext, NullConfigResolver, NullProviderResolver
 from jones_daemon.context import ProviderResolver as ProviderResolverProtocol
 from jones_daemon.projects.bootstrap import bootstrap_projects_and_agents
+from jones_daemon.rpc.errors import INVALID_STATE, RpcError
 from jones_daemon.sessions import queries
 from jones_daemon.sessions.service import DEFAULT_AGENT_ID, DEFAULT_PROJECT_ID, SessionService
 from jones_daemon.store import apply_pending, connect, run_in_db_thread
@@ -300,6 +301,72 @@ async def test_permission_request_and_decide_round_trip(tmp_path, monkeypatch):
             (await service.get(session_id))["latest_turn"]["run_id"]
         )
         assert run_row["status"] == "completed"
+    finally:
+        await service.shutdown()
+
+
+async def test_delete_guard_refuses_while_a_turn_is_actively_running(tmp_path, monkeypatch):
+    # Round-2 review: `session.delete`'s own DB-only "is a Run running" check
+    # can miss a Turn that's genuinely in flight (the window between
+    # `_start_turn`'s `create_task` and `_run_turn` actually reaching
+    # `queries.create_run`, or — as exercised here — a Turn parked on a
+    # pending permission request, which never shows up as `runs.status=
+    # 'running'` failing to have started yet). `delete_guard` must see this
+    # via the service's own in-memory authority (`_active_turns`/
+    # `_turn_tasks`) instead.
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "NEEDS_PERMISSION do the risky thing")
+        await _wait_until(lambda: len(service.ctx.server.events("permission.requested")) >= 1)
+
+        called = False
+
+        async def _fn():
+            nonlocal called
+            called = True
+
+        with pytest.raises(RpcError) as exc_info:
+            await service.delete_guard(session_id, _fn)
+        assert exc_info.value.code == INVALID_STATE
+        assert called is False
+
+        # Clean up: let the parked Turn actually finish so shutdown() below
+        # doesn't have to wait out its own bounded timeout for nothing.
+        pending = await service.permission_pending(session_id)
+        await service.permission_decide(pending[0]["request_id"], "allow")
+        await _wait_until(
+            lambda: any(m == "message.completed" for _sid, m, _p in service.ctx.server.broadcasts),
+            timeout=5,
+        )
+    finally:
+        await service.shutdown()
+
+
+async def test_delete_guard_stops_the_worker_then_calls_fn_when_idle(tmp_path, monkeypatch):
+    # Round-2 review: without this, a deleted session's worker (and the
+    # credentials under its HERMES_HOME) would sit alive for up to
+    # `workers/manager.py`'s `DEFAULT_IDLE_TIMEOUT_S` (600s) after the Session
+    # it belongs to no longer exists.
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "hello")
+        await _wait_until(
+            lambda: any(m == "message.completed" for _sid, m, _p in service.ctx.server.broadcasts),
+            timeout=5,
+        )
+        assert service.worker_manager.get(session_id) is not None
+
+        async def _fn():
+            return "fn-result"
+
+        result = await service.delete_guard(session_id, _fn)
+
+        assert result == "fn-result"
+        assert service.worker_manager.get(session_id) is None
     finally:
         await service.shutdown()
 

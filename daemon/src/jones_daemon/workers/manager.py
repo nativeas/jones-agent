@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from jones_daemon import paths
 from jones_daemon.capabilities import mcp_config
 from jones_daemon.kernel.acp_client import AcpClient, AcpError, AcpProtocolError
 from jones_daemon.logging import get_logger
@@ -339,7 +340,15 @@ class WorkerManager:
     # -- internals ------------------------------------------------------------
 
     def _hermes_home_for(self, session_id: str) -> Path:
-        return self._user_root / "workers" / session_id / "hermes"
+        # Round-2 review, Issue #23: this used to hand-join `self._user_root /
+        # "workers" / session_id / "hermes"` — a top-level `workers/` directory
+        # PRD 10.2's tree never documented and no `paths.py` accessor covered,
+        # so `session.delete`'s real-delete pass (04-w5-interfaces.md §5 G20)
+        # had nowhere it knew to look and left it on disk forever, credentials
+        # and all. `paths.worker_home_dir` is the one place this path is
+        # spelled out now — see its own docstring for why it lives under
+        # `runtime/` instead.
+        return paths.worker_home_dir(self._user_root, session_id) / "hermes"
 
     async def _spawn_and_check(
         self, session_id: str, *, cwd: str, mcp_servers: list[dict[str, Any]] | None = None

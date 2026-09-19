@@ -23,7 +23,7 @@ from jones_daemon.providers.catalog import VENDORS
 from jones_daemon.providers.resolver import DaemonProviderResolver, ProviderNotConfiguredError
 from jones_daemon.rpc.errors import INVALID_PARAMS, NOT_FOUND, PROVIDER_ERROR, RpcError
 from jones_daemon.rpc.server import Connection, RpcServer
-from jones_daemon.secrets.vault import Vault, VaultError, build_default_vault
+from jones_daemon.secrets.vault import Vault, VaultError, VaultKeyMismatchError, build_default_vault
 from jones_daemon.store import run_in_db_thread
 
 _MAX_KEY_LENGTH = 4096
@@ -107,7 +107,20 @@ def _write_provider_key(
                 "encryption key no longer matches. Resubmit provider.set_key with force=true to "
                 "discard it and start a fresh vault — every previously stored provider key will "
                 "need to be re-entered",
-                {"vendor": vendor, "vault_unreadable": True},
+                # Round-2 review, Issue #23/G19: `vault_unreadable` alone doesn't
+                # let a caller tell "file is corrupt" apart from "this is a
+                # different machine, the data key doesn't match" — the specific
+                # case 04-w5-interfaces.md §5 calls out ("~/.jones/ 复制到另一台
+                # 机器 ... 不同 key 解密失败必须是显式 vault_key_mismatch 错误").
+                # `VaultKeyMismatchError` already carries that distinction (see
+                # its own docstring); this is what makes it visible past this
+                # RPC boundary instead of collapsing into the same generic flag
+                # as every other `VaultError`.
+                {
+                    "vendor": vendor,
+                    "vault_unreadable": True,
+                    "vault_key_mismatch": isinstance(exc, VaultKeyMismatchError),
+                },
             ) from exc
         try:
             vault.reset({vendor: key})
@@ -119,7 +132,11 @@ def _write_provider_key(
                 "its data encryption key itself is unavailable (e.g. the OS keychain backend "
                 "cannot be reached), which force cannot recover from — no provider keys were "
                 "changed",
-                {"vendor": vendor, "vault_unreadable": True},
+                {
+                    "vendor": vendor,
+                    "vault_unreadable": True,
+                    "vault_key_mismatch": isinstance(reset_exc, VaultKeyMismatchError),
+                },
             ) from reset_exc
         # Only now that the fresh vault (holding only `vendor`'s key) is actually on disk does
         # `providers` get to agree with it — every other provider's `has_key` must drop to 0, or
@@ -174,7 +191,11 @@ def _clear_provider_key(conn: sqlite3.Connection, vault: Vault, vendor: str) -> 
             f"provider marked as not configured, but its stored key could not be removed from "
             f"the credential vault ({exc}); the leftover entry is harmless on its own — set a new "
             "key for any provider with force=true to discard the vault entirely",
-            {"vendor": vendor, "vault_unreadable": True},
+            {
+                "vendor": vendor,
+                "vault_unreadable": True,
+                "vault_key_mismatch": isinstance(exc, VaultKeyMismatchError),
+            },
         ) from exc
 
 

@@ -58,7 +58,16 @@ _EXPECTED_PROJECT_LEVEL: dict[str, str] = {
 # under `<project>/.jones/`) are real accessors this module exports that aren't
 # entries *inside* the project-level tree — tracked separately so the "every
 # public function is accounted for" sweep below doesn't flag them as unexpected.
-_OTHER_KNOWN_ACCESSORS = {"user_root", "project_root", "project_attachments_dir"}
+_OTHER_KNOWN_ACCESSORS = {
+    "user_root",
+    "project_root",
+    "project_attachments_dir",
+    # Resolves under `runtime_dir()` (PRD 10.2's `runtime/` entry: "worker 注册
+    # 表"), keyed by session id rather than a fixed leaf name — same footing as
+    # `project_attachments_dir` above, not a top-level tree entry of its own
+    # (round-2 review, Issue #23; see `worker_home_dir`'s own docstring).
+    "worker_home_dir",
+}
 
 
 def _public_functions() -> dict[str, object]:
@@ -136,3 +145,14 @@ def test_project_attachments_dir_matches_the_user_level_projects_leaf(tmp_path, 
     # create=False must not resurrect a deleted Project's attachments directory.
     paths.project_attachments_dir("proj_x").rmdir()
     assert not paths.project_attachments_dir("proj_y", create=False).exists()
+
+
+def test_worker_home_dir_resolves_under_the_runtime_dir_prd_entry(tmp_path, monkeypatch):
+    """Round-2 review: `workers/manager.py` used to materialize a whole new
+    top-level `<user_root>/workers/` directory not in PRD 10.2's tree and not
+    covered by any `paths.py` accessor — this asserts the fix landed where the
+    PRD already said worker state belongs (`runtime/`'s "worker 注册表"), not a
+    new sibling."""
+    monkeypatch.setenv("JONES_HOME", str(tmp_path / "home"))
+    root = paths.user_root()
+    assert paths.worker_home_dir(root, "sess1") == paths.runtime_dir() / "workers" / "sess1"

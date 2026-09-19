@@ -67,6 +67,18 @@ MAX_INFLIGHT_GLOBAL = 64
 # periodically instead, so it actually gets read while it holds real data.
 RECENT_RESPONSES_MAXLEN = 100
 
+# Round-2 review: this buffer used to hold each response's *entire* serialized
+# body — `run.payload`'s own `limit` is allowed to be `None` (read to EOF), and
+# `MAX_LINE_BYTES` allows a 16MB line, so 100 entries of that could pin
+# hundreds of MB to 1.6GB in a desktop daemon that's supposed to be idle-cheap
+# (DEV.md 工程原则 #3), just to satisfy an 8-byte substring scan. The redaction
+# scan only ever needs a bounded prefix of each response to do its job — a
+# truncated sample still contains any leaked key that isn't itself split across
+# the truncation boundary, the same trade every other bound in this self-check
+# already makes (`store/maintenance.py::MAX_SCAN_BYTES_PER_FILE`/
+# `MAX_HAYSTACK_CHARS`).
+RECENT_RESPONSE_SAMPLE_MAX_CHARS = 4096
+
 
 def _peek_request_id(line: bytes) -> Any:
     """Best-effort extraction of `id` from a line we're rejecting without a full
@@ -99,9 +111,16 @@ class Connection:
         self.subscriptions: set[str] = set()
 
     async def _send(self, obj: dict[str, Any]) -> None:
-        line = json.dumps(obj, ensure_ascii=False) + "\n"
+        await self._send_line(json.dumps(obj, ensure_ascii=False))
+
+    async def _send_line(self, line: str) -> None:
+        """Write an already-serialized response line. Split out of `_send` (round-2
+        review) so `RpcServer._dispatch`/`_respond_error` can serialize a response
+        exactly once and reuse that same string both to write to the socket and
+        to sample into `_recent_responses`, instead of `json.dumps`-ing the same
+        object twice per response — once here, once for the sample."""
         async with self._lock:
-            self._writer.write(line.encode("utf-8"))
+            self._writer.write((line + "\n").encode("utf-8"))
             await self._writer.drain()
 
     async def notify(self, method: str, params: Any = None) -> None:
@@ -128,10 +147,12 @@ class RpcServer:
         # set: connections add themselves in `_handle_client` and remove
         # themselves in its `finally`, both on the event loop thread.
         self._connections: set[Connection] = set()
-        # Additive, Issue #23 (04-w5-interfaces.md §5): the last
-        # RECENT_RESPONSES_MAXLEN response bodies (success or error) this server
-        # sent, fed to the startup Key-redaction self-check
-        # (`store/maintenance.py::startup_key_redaction_self_check`). A `deque`
+        # Additive, Issue #23 (04-w5-interfaces.md §5): a bounded-size prefix
+        # (RECENT_RESPONSE_SAMPLE_MAX_CHARS) of the last RECENT_RESPONSES_MAXLEN
+        # response bodies (success or error) this server sent, fed to the
+        # startup Key-redaction self-check (`store/maintenance.py::
+        # startup_key_redaction_self_check`) — not the full body (round-2
+        # review, see RECENT_RESPONSE_SAMPLE_MAX_CHARS's comment). A `deque`
         # with `maxlen` set drops the oldest entry itself on overflow — no
         # separate trim step, and no unbounded growth for a long-lived daemon.
         self._recent_responses: deque[str] = deque(maxlen=RECENT_RESPONSES_MAXLEN)
@@ -335,8 +356,7 @@ class RpcServer:
 
         if req_id is not None:
             response = {"jsonrpc": "2.0", "id": req_id, "result": result}
-            self._recent_responses.append(json.dumps(response, ensure_ascii=False))
-            await conn._send(response)
+            await self._sample_and_send(conn, response)
 
     async def _respond_error(
         self,
@@ -350,5 +370,14 @@ class RpcServer:
         if detail is not None:
             error["data"] = detail
         response = {"jsonrpc": "2.0", "id": req_id, "error": error}
-        self._recent_responses.append(json.dumps(response, ensure_ascii=False))
-        await conn._send(response)
+        await self._sample_and_send(conn, response)
+
+    async def _sample_and_send(self, conn: Connection, response: dict[str, Any]) -> None:
+        """Serialize `response` exactly once — reused both as the wire line and
+        as the (truncated) redaction-scan sample, instead of `json.dumps`-ing
+        the same object twice per response on the event loop thread (round-2
+        review; see `RECENT_RESPONSE_SAMPLE_MAX_CHARS`'s comment for the size
+        bound)."""
+        line = json.dumps(response, ensure_ascii=False)
+        self._recent_responses.append(line[:RECENT_RESPONSE_SAMPLE_MAX_CHARS])
+        await conn._send_line(line)

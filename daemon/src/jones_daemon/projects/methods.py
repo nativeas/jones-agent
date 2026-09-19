@@ -12,6 +12,15 @@ from typing import Any
 from jones_daemon.projects.service import ProjectService
 from jones_daemon.rpc.errors import INVALID_PARAMS, RpcError
 from jones_daemon.rpc.server import Connection, RpcServer
+
+# Round-2 review, Issue #23: `store/maintenance.py::delete_project` gained the
+# same `PartialDeleteError` post-commit-failure contract `delete_session`/
+# `delete_run` already have (04-w5-interfaces.md §6 "诚实失败") — reused here
+# rather than re-implemented, since `sessions/methods.py::_run_delete_honestly`
+# already is exactly "run a maintenance delete on the DB thread, translate
+# `PartialDeleteError` into `daemon.error` + the right RPC-visible outcome",
+# with nothing session-specific in it.
+from jones_daemon.sessions.methods import _run_delete_honestly
 from jones_daemon.store import run_in_db_thread
 
 
@@ -38,8 +47,7 @@ def register(server: RpcServer, ctx: Any) -> None:
         project_id = params.get("id")
         if not project_id:
             raise RpcError(INVALID_PARAMS, "id is required")
-        await run_in_db_thread(service.delete, project_id)
-        return {"deleted": True}
+        return await _run_delete_honestly(server, service.delete, project_id)
 
     server.register("project.list", project_list)
     server.register("project.create", project_create)
