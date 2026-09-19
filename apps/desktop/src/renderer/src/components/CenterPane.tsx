@@ -35,6 +35,10 @@ export function CenterPane({ transport }: CenterPaneProps): JSX.Element {
   const removeQueueItem = useChatStore((s) => s.removeQueueItem)
   const reorderQueue = useChatStore((s) => s.reorderQueue)
   const error = useChatStore((s) => s.error)
+  // Round-2 review #2/#6: per-card in-flight guard + "already used" marker,
+  // threaded down to TerminationCard via MessageList.
+  const pendingTerminations = useChatStore((s) => s.pendingTerminations)
+  const handledTerminations = useChatStore((s) => s.handledTerminations)
   // Issue #22 (04-w5-interfaces.md §4): the "换模型" card action needs a real
   // provider/model list — only providers with a configured Key are offered
   // (picking one without a Key would just fail `session.retry` the same way
@@ -102,6 +106,8 @@ export function CenterPane({ transport }: CenterPaneProps): JSX.Element {
           onRetry={(turnId) => void retryTermination(turnId)}
           onSwitchModel={(turnId, override) => void switchModelTermination(turnId, override)}
           onAbandon={(turnId) => void abandonTermination(turnId)}
+          pendingTerminations={pendingTerminations}
+          handledTerminations={handledTerminations}
         />
       </div>
       <QueuePanel items={queue} onRemove={removeQueueItem} onReorder={reorderQueue} />

@@ -150,22 +150,53 @@ def test_user_stop_passes_through_untouched():
 def test_build_card_shape_matches_the_04_w5_contract():
     card = classify.build_card(ErrorKind.NETWORK, reason="Connection refused", step_seq=3)
     d = card.to_dict()
-    assert set(d) == {"kind", "title", "message", "step_seq", "raw_excerpt", "actions", "retryable"}
+    assert set(d) == {
+        "kind",
+        "title",
+        "message",
+        "step_seq",
+        "raw_excerpt",
+        "actions",
+        "retryable",
+        "budget",
+    }
     assert d["kind"] == "network"
     assert d["step_seq"] == 3
     assert d["retryable"] is True
     assert "retry" in d["actions"]
+    assert d["budget"] is None
 
 
-def test_provider_auth_and_quota_never_offer_a_bare_retry():
+def test_switch_model_never_appears_in_any_kinds_actions():
+    # Round-2 review fix (#1, critical): `switch_model` is a structural no-op
+    # today (`session.retry`'s `model_override` never reaches the spawned
+    # worker — see `_ACTIONS`'s module comment) — offering it anywhere would
+    # tell a user an action "succeeded" while doing nothing to fix the actual
+    # failure. No `ErrorKind`, including the 限流 rate-limit override branch
+    # below, may offer it until a future branch actually wires
+    # `ProviderBinding` into worker spawn/restart.
+    for kind in ErrorKind:
+        card = classify.build_card(kind, reason="x", step_seq=None)
+        assert "switch_model" not in card.actions, kind
+    rate_limited = classify.build_card(
+        ErrorKind.PROVIDER_QUOTA, reason="429 rate limit exceeded", step_seq=None
+    )
+    assert "switch_model" not in rate_limited.actions
+
+
+def test_provider_auth_and_quota_and_budget_offer_only_abandon_with_an_honest_hint():
     # Retrying with the exact same (invalid/exhausted) key can't succeed —
-    # offering "retry" there would be dishonest (DEV.md 工程原则 #4).
+    # offering "retry" there would be dishonest (DEV.md 工程原则 #4) — and
+    # `switch_model` is withdrawn repo-wide (see the test above), so these
+    # three kinds are left with exactly one action: "abandon". A card with
+    # only "放弃" and nothing else to click needs to actually say what to do
+    # instead (round-2 review #1's fallback option), so `message` must carry
+    # the hint rather than leaving the user with a dead end.
     for kind in (ErrorKind.PROVIDER_AUTH, ErrorKind.PROVIDER_QUOTA, ErrorKind.BUDGET):
         card = classify.build_card(kind, reason="x", step_seq=None)
-        assert "retry" not in card.actions
+        assert card.actions == ("abandon",)
         assert card.retryable is False
-        assert "switch_model" in card.actions
-        assert "abandon" in card.actions
+        assert "去设置页换 Key / 换默认模型后重发" in card.message
 
 
 def test_build_user_card_has_no_actions():

@@ -108,6 +108,19 @@ export type CardAction = 'retry' | 'switch_model' | 'abandon'
  * shape (empty `actions`), so this one interface covers every `card.card`
  * value `run.terminated` can carry, no separate "budget card"/"error card"
  * union needed. */
+/** Round-2 review #4: PRD 9.3's 预算终止 row requires "显式卡片说明是哪个预算、用
+ * 了多少、上限多少" — this is that structured slot. Optional/nullable because
+ * no call site has real numbers to put here yet (`errors/classify.py::
+ * ErrorCard`'s docstring explains why); present so the renderer can show it
+ * the moment a daemon build does populate it, without another interface
+ * change. */
+export interface BudgetDetail {
+  name?: string
+  used?: number
+  limit?: number
+  unit?: string
+}
+
 export interface ErrorCard {
   kind: ErrorKind | 'user'
   title: string
@@ -116,6 +129,7 @@ export interface ErrorCard {
   raw_excerpt: string
   actions: CardAction[]
   retryable: boolean
+  budget?: BudgetDetail | null
 }
 
 export interface TerminationCard {

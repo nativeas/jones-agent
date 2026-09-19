@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { MockTransport } from '../../rpc/mockTransport'
 import type { RpcCallResult, RpcTransport } from '../../rpc/transport'
 import { useChatStore } from '../chatStore'
@@ -18,6 +18,8 @@ function resetStore(): void {
     runToSession: new Map(),
     unsubscribers: [],
     bindGeneration: 0,
+    pendingTerminations: new Set(),
+    handledTerminations: new Map(),
     // fresh batcher per test so a leftover scheduled flush from a previous
     // test's real rAF/timeout can never leak state into the next one. Only
     // used to drain buffered deltas between tests — the store's own flush
@@ -138,13 +140,52 @@ describe('chatStore', () => {
     if (userMessages[1]?.kind === 'message') expect(userMessages[1].message.content.text).toBe('/error 网络中断')
   })
 
-  it('retryTermination() surfaces an error when the daemon rejects a stale/unknown turn_id', async () => {
+  it('retryTermination() surfaces a friendly error, not the raw RpcError text, when the daemon rejects a stale/unknown turn_id', async () => {
+    // Round-2 review #2: the daemon's own RpcError message ("turn not found",
+    // "turn ... is not in a retryable state (status=...)") is an internal
+    // state-machine string that must never reach the UI verbatim.
     const transport = new MockTransport({ schedule: (fn) => fn() })
     await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
 
     await useChatStore.getState().retryTermination('turn_does_not_exist')
 
-    expect(useChatStore.getState().error).toBeTruthy()
+    const error = useChatStore.getState().error
+    expect(error).toBeTruthy()
+    expect(error).not.toMatch(/turn not found|turn_does_not_exist/)
+  })
+
+  it('round-2 review #6: retrying the same card twice back-to-back only sends one session.retry', async () => {
+    const transport = new MockTransport({ schedule: (fn) => fn() })
+    await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
+    await useChatStore.getState().send('/error 网络中断')
+    const card = useChatStore.getState().timeline.find((e) => e.kind === 'termination')
+    const turnId = card?.kind === 'termination' ? card.card.turn_id : undefined
+    expect(turnId).toBeDefined()
+
+    const callSpy = vi.spyOn(transport, 'call')
+    // Deliberately not awaited — this is the double-click case: the second
+    // call must see the pending guard the first call already set (both run
+    // synchronously up to their first `await`, so there's no race to win).
+    const first = useChatStore.getState().retryTermination(turnId!)
+    const second = useChatStore.getState().retryTermination(turnId!)
+    await Promise.all([first, second])
+
+    const retryCalls = callSpy.mock.calls.filter(([method]) => method === 'session.retry')
+    expect(retryCalls).toHaveLength(1)
+  })
+
+  it('round-2 review #2/#6: a successful retry marks the original card handled', async () => {
+    const transport = new MockTransport({ schedule: (fn) => fn() })
+    await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
+    await useChatStore.getState().send('/error 网络中断')
+    const card = useChatStore.getState().timeline.find((e) => e.kind === 'termination')
+    const turnId = card?.kind === 'termination' ? card.card.turn_id : undefined
+    expect(turnId).toBeDefined()
+
+    await useChatStore.getState().retryTermination(turnId!)
+
+    expect(useChatStore.getState().handledTerminations.get(turnId!)).toBe('retry')
+    expect(useChatStore.getState().pendingTerminations.has(turnId!)).toBe(false)
   })
 
   it('abandonTermination() clears the pending queue via session.retry (Issue #22 FR14 "放弃")', async () => {
@@ -175,6 +216,11 @@ describe('chatStore', () => {
     // §4 / PRD FR06: 错误卡片本身进入 Session 记录，可回放. Abandoning clears
     // the queue and the server-side Turn status, it doesn't hide the card.
     expect(useChatStore.getState().timeline.some((e) => e.kind === 'termination')).toBe(true)
+    // Round-2 review #2: even when the queue was already empty (the most
+    // common case, not exercised by this particular scenario since it does
+    // have a queued item), "放弃" needs SOME visible confirmation — marking
+    // the card handled is what drives that in TerminationCard.
+    expect(useChatStore.getState().handledTerminations.get(turnId!)).toBe('abandon')
   })
 
   it('removeQueueItem drops the item from the queue panel', async () => {

@@ -1,5 +1,5 @@
 import type { TimelineEntry } from '../../store/chatStore'
-import type { Model, Provider } from '../../domain/types'
+import type { CardAction, Model, Provider } from '../../domain/types'
 import { VirtualList } from '../common/VirtualList'
 import { StepCard } from './StepCard'
 import { TerminationCard } from './TerminationCard'
@@ -20,6 +20,10 @@ interface MessageListProps {
   onRetry?: (turnId: string) => void
   onSwitchModel?: (turnId: string, override: { provider: string; model: string }) => void
   onAbandon?: (turnId: string) => void
+  /** Round-2 review #6: turn_ids currently awaiting a `session.retry` round-trip. */
+  pendingTerminations?: Set<string>
+  /** Round-2 review #2/#6: turn_id → which action already completed for it. */
+  handledTerminations?: Map<string, CardAction>
 }
 
 function renderEntry(entry: TimelineEntry, props: MessageListProps): JSX.Element {
@@ -47,6 +51,8 @@ function renderEntry(entry: TimelineEntry, props: MessageListProps): JSX.Element
       onRetry={props.onRetry ? () => props.onRetry!(turnId) : undefined}
       onSwitchModel={props.onSwitchModel ? (override) => props.onSwitchModel!(turnId, override) : undefined}
       onAbandon={props.onAbandon ? () => props.onAbandon!(turnId) : undefined}
+      pending={props.pendingTerminations?.has(turnId)}
+      handled={props.handledTerminations?.get(turnId)}
     />
   )
 }

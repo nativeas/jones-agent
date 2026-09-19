@@ -173,6 +173,72 @@ describe('TerminationCard', () => {
     }
   })
 
+  it('round-2 review #6: `pending` disables every action button', () => {
+    const card = errorCard()
+    const clicks = { retry: 0 }
+    const { container, unmount } = mount(
+      <TerminationCard
+        card={card}
+        providers={providers}
+        models={models}
+        pending
+        onRetry={() => (clicks.retry += 1)}
+      />
+    )
+    try {
+      const buttons = Array.from(container.querySelectorAll('.termination-card__actions button')) as HTMLButtonElement[]
+      expect(buttons.every((b) => b.disabled)).toBe(true)
+      act(() => buttons[0]!.click())
+      // jsdom still fires click on a disabled button's handler only if the
+      // button isn't actually disabled — assert the handler saw nothing,
+      // which is the behavior that actually matters here.
+      expect(clicks.retry).toBe(0)
+    } finally {
+      unmount()
+    }
+  })
+
+  it('round-2 review #2/#6: `handled` replaces the action buttons with a status line', () => {
+    const card = errorCard()
+    const { container, unmount } = mount(
+      <TerminationCard card={card} providers={providers} models={models} handled="retry" />
+    )
+    try {
+      expect(container.querySelectorAll('.termination-card__actions button')).toHaveLength(0)
+      expect(container.textContent).toContain('已重试，新的对话已经开始。')
+    } finally {
+      unmount()
+    }
+  })
+
+  it('round-2 review #2: an abandoned card says so even with nothing else to show', () => {
+    const card = errorCard({ actions: ['abandon'], retryable: false })
+    const { container, unmount } = mount(
+      <TerminationCard card={card} providers={providers} models={models} handled="abandon" />
+    )
+    try {
+      expect(container.textContent).toContain('已放弃，这条消息与排队中的后续指令已清空。')
+    } finally {
+      unmount()
+    }
+  })
+
+  it('round-2 review #4: renders budget detail when the daemon supplies it', () => {
+    const card = errorCard({
+      kind: 'budget',
+      title: '已达预算上限',
+      actions: ['abandon'],
+      retryable: false,
+      budget: { name: 'Goal token 预算', used: 950000, limit: 1000000, unit: 'tokens' }
+    })
+    const { container, unmount } = mount(<TerminationCard card={card} providers={providers} models={models} />)
+    try {
+      expect(container.textContent).toContain('Goal token 预算：950000 / 1000000 tokens')
+    } finally {
+      unmount()
+    }
+  })
+
   it('N16: never white-screens on a partial/older card shape missing optional fields', () => {
     const card = {
       run_id: 'run_1',

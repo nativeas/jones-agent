@@ -110,17 +110,44 @@ _TITLES: dict[ErrorKind, str] = {
 # "retry" for kinds where retrying unchanged (same key, same quota) would just
 # fail identically — offering it there would be dishonest ("重试" implying it
 # might work when it structurally can't).
+#
+# Round-2 review fix (#1, critical): `switch_model` never appears here anymore.
+# `session.retry`'s `model_override` only ever reaches `ctx.providers.resolve()`
+# — a pre-flight check `_run_turn` runs before spawning/reusing a worker — and
+# is then discarded; the worker subprocess itself is spawned by
+# `WorkerManager._spawn_and_check` via `_worker_env(hermes_home)` with no
+# `extra_env`, and `ensure_started` returns the SAME already-running worker for
+# a session that has one, never restarting it. So the process that actually
+# runs the next Turn keeps using the Agent's original provider/model no matter
+# what the user picked — for `PROVIDER_AUTH`/`PROVIDER_QUOTA`/`BUDGET`,
+# `switch_model` used to be the *only* action on the card, i.e. the one thing
+# a user could click that daemon reports as "succeeded" while doing nothing to
+# fix the actual failure (re-runs the same bad Key/quota). That is worse than
+# offering no action — see 04-w5-interfaces.md §4.2 for the two options this
+# was weighed against and why this repo picked "remove it" over "wire
+# `ProviderBinding` into the spawn path", which is A/#10's territory, not
+# N/#22's. The `model_override` RPC parameter itself is left in place
+# (`session.retry` still accepts and threads it through `_run_turn`'s resolver
+# pre-check) — only the UI affordance is withdrawn — so re-enabling this is a
+# one-line change here once a future branch actually wires the resolved
+# binding into worker spawn/restart.
 _ACTIONS: dict[ErrorKind, tuple[str, ...]] = {
-    ErrorKind.NETWORK: ("retry", "switch_model", "abandon"),
-    ErrorKind.PROVIDER_AUTH: ("switch_model", "abandon"),
-    ErrorKind.PROVIDER_QUOTA: ("switch_model", "abandon"),
-    ErrorKind.PROVIDER_ERROR: ("retry", "switch_model", "abandon"),
-    ErrorKind.TOOL_EXCEPTION: ("retry", "switch_model", "abandon"),
+    ErrorKind.NETWORK: ("retry", "abandon"),
+    ErrorKind.PROVIDER_AUTH: ("abandon",),
+    ErrorKind.PROVIDER_QUOTA: ("abandon",),
+    ErrorKind.PROVIDER_ERROR: ("retry", "abandon"),
+    ErrorKind.TOOL_EXCEPTION: ("retry", "abandon"),
     ErrorKind.WORKER_CRASH: ("retry", "abandon"),
     ErrorKind.APPROVAL_TIMEOUT: ("retry", "abandon"),
-    ErrorKind.BUDGET: ("switch_model", "abandon"),
+    ErrorKind.BUDGET: ("abandon",),
     ErrorKind.INTERNAL: ("retry", "abandon"),
 }
+
+# Kinds whose ONLY action is now "abandon" (round-2 review #1) get an explicit
+# hint appended to `card.message` — otherwise a user sees just a title +
+# message + one "放弃" button with no indication of what to actually do about
+# it. Written once here rather than duplicated per-kind in `_TITLES`/renderer.
+_ONLY_ABANDON_HINT = "去设置页换 Key / 换默认模型后重发。"
 
 
 def _actions_for(kind: ErrorKind) -> tuple[str, ...]:
@@ -143,7 +170,23 @@ _MAX_MESSAGE_CHARS = 240
 @dataclass(frozen=True)
 class ErrorCard:
     """Exactly the shape 04-w5-interfaces.md §4 specifies: `{kind, title,
-    message, step_seq?, raw_excerpt(≤2KB, 已脱敏), actions, retryable}`."""
+    message, step_seq?, raw_excerpt(≤2KB, 已脱敏), actions, retryable}`, plus
+    an optional `budget` detail (round-2 review #4).
+
+    `budget`: PRD 9.3's 预算终止 row requires "显式卡片说明是哪个预算、用了多少、
+    上限多少" — `{name, used, limit, unit}` — but nothing in this repo today
+    has that structured data to hand (the two call sites that can produce
+    `kind="budget"` are: a caller passing it explicitly, which no call site
+    does yet — 11.2's Step/时长 upper bounds have no trigger wired anywhere,
+    see 04-w5-interfaces.md §4.2 — and this module's own text-based upgrade of
+    a rate-limit/quota `reason` string, which is free text from a provider
+    exception, not a structured API response with numbers to parse out
+    reliably). Left `None` in both cases rather than guessing — this field
+    exists so a *future* caller that does have real numbers (once 11.2's
+    triggers are wired, or a provider error body is parsed instead of just its
+    message) has somewhere to put them, and the renderer already knows how to
+    show it when present; that is the "structural, not deferred" fix the
+    review asked for, without fabricating numbers this module doesn't have."""
 
     kind: str  # ErrorKind.value, or "user" for the non-error pass-through card
     title: str
@@ -152,6 +195,7 @@ class ErrorCard:
     raw_excerpt: str
     actions: tuple[str, ...]
     retryable: bool
+    budget: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -162,6 +206,7 @@ class ErrorCard:
             "raw_excerpt": self.raw_excerpt,
             "actions": list(self.actions),
             "retryable": self.retryable,
+            "budget": self.budget,
         }
 
 
@@ -388,11 +433,19 @@ def build_card(kind: ErrorKind, *, reason: str, step_seq: int | None) -> ErrorCa
         and not _match_any(lowered, _QUOTA_EXHAUSTED_MARKERS)
     ):
         title = "请求过于频繁，请稍后再试"
-        actions = ("retry", "switch_model", "abandon")
+        actions = ("retry", "abandon")
+    message = _truncate(redacted, _MAX_MESSAGE_CHARS)
+    # Round-2 review fix (#1): a card whose only action is "abandon" (see
+    # `_ACTIONS`'s round-2 comment) needs to actually say what to do instead of
+    # leaving the user staring at one button — append the hint rather than
+    # replace `message`, so the original (redacted) error text is still there
+    # for anyone who wants it.
+    if actions == ("abandon",):
+        message = f"{message} {_ONLY_ABANDON_HINT}" if message else _ONLY_ABANDON_HINT
     return ErrorCard(
         kind=kind.value,
         title=title,
-        message=_truncate(redacted, _MAX_MESSAGE_CHARS),
+        message=message,
         step_seq=step_seq,
         raw_excerpt=_truncate(redacted, _MAX_EXCERPT_CHARS),
         actions=actions,

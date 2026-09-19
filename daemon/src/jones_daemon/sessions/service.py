@@ -2183,30 +2183,51 @@ class SessionService:
             f"{_WORKER_CRASH_GRACE_S}s; force-terminating the Run (N07)",
             extra={"detail": {"session_id": session_id, "returncode": returncode}},
         )
-        task = self._turn_tasks.get(session_id)
-        if task is not None and not task.done():
-            # Cancelling (rather than awaiting) `_run_turn`'s own stuck task is
-            # what still lets its `finally: await self._advance_queue(...)` run
-            # and unstick the session's queue — `asyncio.CancelledError` isn't
-            # caught by that function's `except Exception`, so this can never
-            # race a second `_terminate_run` call from that same task (and
-            # `_terminate_run`'s own idempotency guard covers the remaining,
-            # much narrower race against the in-flight prompt() call's error
-            # path finishing at almost the same instant this deadline expires).
-            task.cancel()
-        # Round-1 review fix (#7): every other termination path (`_run_turn`'s
-        # own `except (AcpError, AcpProtocolError)` and its catch-all backstop)
-        # calls this before `_terminate_run` — streamed `message.delta` text
-        # only lives on `ctx_turn` until finalized, so skipping it here (as
-        # this watchdog path used to) meant a Run force-terminated by N07 could
-        # drop assistant text the user had already watched stream past,
-        # forever, from the `messages` table (FR06 replay). Cancelling
-        # `_run_turn`'s task raises `CancelledError` in it — a `BaseException`,
-        # not caught by that function's `except Exception` — so it could never
-        # reach its own finalize call either; this watchdog has to do it.
+        # Round-2 review fix (#7): this watchdog's own finalize+terminate now
+        # run BEFORE `task.cancel()`, not after. Round-1's fix closed only half
+        # the race: `current_run["status"]` above is read with no `await`
+        # before the (old) `task.cancel()` call, so nothing could invalidate
+        # *that* read in between — but by the time this deadline fires, the
+        # in-flight `prompt()` call's own `_terminate_run` may already be PAST
+        # its own idempotency check and genuinely blocked awaiting
+        # `run_in_db_thread(queries.mark_run_terminated, ...)` (a real
+        # `ThreadPoolExecutor` future — `store/db.py`'s single DB worker
+        # thread). Cancelling `_run_turn`'s task at that exact point doesn't
+        # stop the write (the callable is already running on the DB thread and
+        # keeps going to completion/commit) — it only raises `CancelledError`
+        # in the coroutine the instant that awaited future resolves, which
+        # lands *before* that call's own `run.terminated` broadcast. This
+        # watchdog would then reach ITS OWN `_terminate_run` call and find the
+        # idempotency guard already sees `status != 'running'` (the other
+        # call's write did land) and skip out as a no-op too — net result: DB
+        # says terminated, `run.terminated` broadcasts zero times, UI stuck on
+        # "运行中" forever (exactly what N07 exists to prevent), recoverable
+        # only by restarting the daemon.
+        #
+        # Doing our own finalize+terminate first guarantees at least one
+        # `run.terminated` for this Run no matter how that race resolves — the
+        # worst case is now a rare *duplicate* broadcast (this call's, plus the
+        # interrupted call's own if `task.cancel()` below doesn't manage to
+        # interrupt it before its broadcast either), which the renderer already
+        # handles fine (`chatStore.ts`'s `upsertTimeline` keys termination
+        # entries by `run_id`, so a repeat just replaces the same entry) — a
+        # strictly better failure mode than "never at all".
         await self._finalize_streamed_messages(ctx_turn)
         await self._terminate_run(
             ctx_turn,
             kind="error",
             reason=f"worker process exited unexpectedly (code {returncode})",
         )
+        task = self._turn_tasks.get(session_id)
+        if task is not None and not task.done():
+            # Still cancel the stuck task afterward — this is what lets its own
+            # `finally: await self._advance_queue(...)` run (or, if it's
+            # currently blocked on the now-already-written DB call above,
+            # short-circuits it before a redundant/racing second write) and
+            # unsticks the session's queue if `_run_turn` is truly hung rather
+            # than just momentarily slow. `asyncio.CancelledError` isn't caught
+            # by that function's `except Exception`, so this can never turn
+            # into a second uncontrolled `_terminate_run` call from that task —
+            # at worst that task's own call, if it gets there first, no-ops via
+            # the idempotency guard this function already passed above.
+            task.cancel()

@@ -413,6 +413,17 @@ body {
   margin-top: 8px;
 }
 
+.termination-card__actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.termination-card__handled {
+  font-size: 12px;
+  opacity: 0.75;
+  margin-top: 8px;
+}
+
 .termination-card__raw {
   margin-top: 6px;
   font-size: 12px;

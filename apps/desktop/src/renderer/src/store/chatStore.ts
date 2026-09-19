@@ -1,6 +1,14 @@
 import { create } from 'zustand'
 import type { RpcTransport } from '../rpc/transport'
-import type { Message, PermissionRequest, QueueItem, Session, Step, TerminationCard } from '../domain/types'
+import type {
+  CardAction,
+  Message,
+  PermissionRequest,
+  QueueItem,
+  Session,
+  Step,
+  TerminationCard
+} from '../domain/types'
 import { createDeltaBatcher, type DeltaBatcher } from './deltaBatcher'
 
 export type TimelineEntry =
@@ -34,6 +42,17 @@ interface ChatState {
    * first `session.subscribe` round-trip returned) detect it's stale and
    * back out instead of overwriting a newer bind's state/listeners. */
   bindGeneration: number
+  /** turn_id currently awaiting a `session.retry` round-trip (round-2 review
+   * #6) — guards `retryTermination`/`switchModelTermination`/
+   * `abandonTermination` against a second click firing a second real RPC (and
+   * a second real Turn/model call) before the first resolves, and lets
+   * `TerminationCard` disable its buttons while true. */
+  pendingTerminations: Set<string>
+  /** turn_id → which action already completed successfully (round-2 review
+   * #2/#6) — once a termination card's action has been used, it renders inert
+   * (no buttons, a status line instead) rather than staying clickable forever
+   * (the bug that let one card spawn unlimited Turns). */
+  handledTerminations: Map<string, CardAction>
 
   bindSession(transport: RpcTransport, sessionId: string): Promise<void>
   unbindSession(): void
@@ -79,6 +98,29 @@ function upsertTimeline(timeline: TimelineEntry[], entry: TimelineEntry): Timeli
   return next
 }
 
+/** Round-2 review #2: `session.retry`'s `RpcError` text (`turn ... is not in
+ * a retryable state (status=...)`, `turn not found`, ...) is an internal
+ * state-machine string that was leaking straight into `CenterPane`'s error
+ * banner via `res.message` — never meant for an end user, and the main
+ * process's `ipcMain.handle('rpc:call', ...)` catch (`apps/desktop/src/main/
+ * index.ts`, outside this branch's touch list) drops the RpcError `code`
+ * before it reaches this transport, so there is no structured field to switch
+ * on here — only substring matching against the known daemon-side messages
+ * (`sessions/service.py::retry`). Anything unrecognized falls back to one
+ * generic line rather than ever showing the raw text again. */
+function friendlyTerminationError(message: string | undefined): string {
+  if (message && /not in a retryable state/.test(message)) {
+    return '这条错误卡片已经处理过了，请刷新查看最新状态。'
+  }
+  if (message && /turn not found/.test(message)) {
+    return '找不到这条消息了，可能已经被处理。'
+  }
+  if (message && /session not found/.test(message)) {
+    return '会话不存在，请刷新页面。'
+  }
+  return '操作未成功，请稍后再试。'
+}
+
 export const useChatStore = create<ChatState>()((set, get) => ({
   transport: null,
   activeSessionId: null,
@@ -90,6 +132,8 @@ export const useChatStore = create<ChatState>()((set, get) => ({
   runToSession: new Map(),
   unsubscribers: [],
   bindGeneration: 0,
+  pendingTerminations: new Set(),
+  handledTerminations: new Map(),
   batcher: createDeltaBatcher((updates) => {
     set((state) => {
       let timeline = state.timeline
@@ -132,7 +176,9 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       running: false,
       error: null,
       runToSession: new Map(),
-      bindGeneration: generation
+      bindGeneration: generation,
+      pendingTerminations: new Set(),
+      handledTerminations: new Map()
     })
 
     const isActive = (): boolean => get().activeSessionId === sessionId && get().bindGeneration === generation
@@ -338,70 +384,122 @@ export const useChatStore = create<ChatState>()((set, get) => ({
   },
 
   async retryTermination(turnId) {
-    const { transport, activeSessionId, timeline } = get()
+    const { transport, activeSessionId, timeline, pendingTerminations } = get()
     if (!transport || !activeSessionId) return
-    const originalText = findUserMessageText(timeline, turnId)
-    const res = await transport.call<{ turn_id: string; queued: boolean }>('session.retry', {
-      id: activeSessionId,
-      turn_id: turnId,
-      action: 'retry'
-    })
-    if (!res.ok || !res.result) {
-      set({ error: res.message ?? '重试失败' })
-      return
-    }
-    // Same optimistic local echo as send() (see its own comment) — the daemon
-    // has no "message created" notification for the user's own turn even when
-    // that turn was started by session.retry rather than session.send.
-    if (!res.result.queued && originalText) {
-      const message: Message = {
-        id: `local_${res.result.turn_id}`,
-        session_id: activeSessionId,
-        turn_id: res.result.turn_id,
-        role: 'user',
-        content: { kind: 'text', text: originalText },
-        seq: get().timeline.length
+    // Round-2 review #6: a second click before the first round-trip resolves
+    // (or a second click after `handled` should already have hidden the
+    // button, in case some caller ignores that) must not fire a second real
+    // Turn — no-op instead of re-entering.
+    if (pendingTerminations.has(turnId)) return
+    set((state) => ({ pendingTerminations: new Set(state.pendingTerminations).add(turnId) }))
+    try {
+      const originalText = findUserMessageText(timeline, turnId)
+      const res = await transport.call<{ turn_id: string; queued: boolean }>('session.retry', {
+        id: activeSessionId,
+        turn_id: turnId,
+        action: 'retry'
+      })
+      if (!res.ok || !res.result) {
+        set({ error: friendlyTerminationError(res.message) })
+        return
       }
-      set((state) => ({ timeline: upsertTimeline(state.timeline, { kind: 'message', message }) }))
+      // Same optimistic local echo as send() (see its own comment) — the daemon
+      // has no "message created" notification for the user's own turn even when
+      // that turn was started by session.retry rather than session.send.
+      if (!res.result.queued && originalText) {
+        const message: Message = {
+          id: `local_${res.result.turn_id}`,
+          session_id: activeSessionId,
+          turn_id: res.result.turn_id,
+          role: 'user',
+          content: { kind: 'text', text: originalText },
+          seq: get().timeline.length
+        }
+        set((state) => ({ timeline: upsertTimeline(state.timeline, { kind: 'message', message }) }))
+      }
+      // Round-2 review #2/#6: mark the ORIGINAL failed turn's card inert —
+      // it already spawned a new Turn, retrying it again would spawn another.
+      set((state) => ({
+        handledTerminations: new Map(state.handledTerminations).set(turnId, 'retry')
+      }))
+    } finally {
+      set((state) => {
+        const next = new Set(state.pendingTerminations)
+        next.delete(turnId)
+        return { pendingTerminations: next }
+      })
     }
   },
 
   async switchModelTermination(turnId, override) {
-    const { transport, activeSessionId, timeline } = get()
+    const { transport, activeSessionId, timeline, pendingTerminations } = get()
     if (!transport || !activeSessionId) return
-    const originalText = findUserMessageText(timeline, turnId)
-    const res = await transport.call<{ turn_id: string; queued: boolean }>('session.retry', {
-      id: activeSessionId,
-      turn_id: turnId,
-      action: 'retry',
-      model_override: override
-    })
-    if (!res.ok || !res.result) {
-      set({ error: res.message ?? '换模型重试失败' })
-      return
-    }
-    if (!res.result.queued && originalText) {
-      const message: Message = {
-        id: `local_${res.result.turn_id}`,
-        session_id: activeSessionId,
-        turn_id: res.result.turn_id,
-        role: 'user',
-        content: { kind: 'text', text: originalText },
-        seq: get().timeline.length
+    if (pendingTerminations.has(turnId)) return
+    set((state) => ({ pendingTerminations: new Set(state.pendingTerminations).add(turnId) }))
+    try {
+      const originalText = findUserMessageText(timeline, turnId)
+      const res = await transport.call<{ turn_id: string; queued: boolean }>('session.retry', {
+        id: activeSessionId,
+        turn_id: turnId,
+        action: 'retry',
+        model_override: override
+      })
+      if (!res.ok || !res.result) {
+        set({ error: friendlyTerminationError(res.message) })
+        return
       }
-      set((state) => ({ timeline: upsertTimeline(state.timeline, { kind: 'message', message }) }))
+      if (!res.result.queued && originalText) {
+        const message: Message = {
+          id: `local_${res.result.turn_id}`,
+          session_id: activeSessionId,
+          turn_id: res.result.turn_id,
+          role: 'user',
+          content: { kind: 'text', text: originalText },
+          seq: get().timeline.length
+        }
+        set((state) => ({ timeline: upsertTimeline(state.timeline, { kind: 'message', message }) }))
+      }
+      set((state) => ({
+        handledTerminations: new Map(state.handledTerminations).set(turnId, 'switch_model')
+      }))
+    } finally {
+      set((state) => {
+        const next = new Set(state.pendingTerminations)
+        next.delete(turnId)
+        return { pendingTerminations: next }
+      })
     }
   },
 
   async abandonTermination(turnId) {
-    const { transport, activeSessionId } = get()
+    const { transport, activeSessionId, pendingTerminations } = get()
     if (!transport || !activeSessionId) return
-    const res = await transport.call('session.retry', {
-      id: activeSessionId,
-      turn_id: turnId,
-      action: 'abandon'
-    })
-    if (!res.ok) set({ error: res.message ?? '放弃失败' })
+    if (pendingTerminations.has(turnId)) return
+    set((state) => ({ pendingTerminations: new Set(state.pendingTerminations).add(turnId) }))
+    try {
+      const res = await transport.call('session.retry', {
+        id: activeSessionId,
+        turn_id: turnId,
+        action: 'abandon'
+      })
+      if (!res.ok) {
+        set({ error: friendlyTerminationError(res.message) })
+        return
+      }
+      // Round-2 review #2: this used to leave the card exactly as it was —
+      // with an empty queue (the common case) that's zero visible change, so
+      // a user had no way to tell "放弃" actually did anything. Mark it
+      // handled so the card swaps its actions for a "已放弃" status line.
+      set((state) => ({
+        handledTerminations: new Map(state.handledTerminations).set(turnId, 'abandon')
+      }))
+    } finally {
+      set((state) => {
+        const next = new Set(state.pendingTerminations)
+        next.delete(turnId)
+        return { pendingTerminations: next }
+      })
+    }
   },
 
   async stop() {

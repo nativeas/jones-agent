@@ -10,6 +10,15 @@ interface TerminationCardProps {
   onRetry?: () => void
   onSwitchModel?: (override: { provider: string; model: string }) => void
   onAbandon?: () => void
+  /** Round-2 review #6: awaiting this card's `session.retry` round-trip —
+   * disable every action button so a second click can't fire a second real
+   * Turn/model call before the first resolves. */
+  pending?: boolean
+  /** Round-2 review #2/#6: which action already completed successfully for
+   * this card, if any — renders a status line instead of live buttons so a
+   * used-up card can never be actioned again, and so "放弃" has a visible
+   * effect even when the queue it cleared was already empty. */
+  handled?: CardAction
 }
 
 /** Issue #22 (FR14, 04-w5-interfaces.md §4) — daemon classifies, this only
@@ -33,6 +42,13 @@ const ACTION_LABEL: Record<CardAction, string> = {
   retry: '重试',
   switch_model: '换模型',
   abandon: '放弃'
+}
+
+/** Round-2 review #2/#6: what a used-up card says instead of its buttons. */
+const HANDLED_LABEL: Record<CardAction, string> = {
+  retry: '已重试，新的对话已经开始。',
+  switch_model: '已换模型重试，新的对话已经开始。',
+  abandon: '已放弃，这条消息与排队中的后续指令已清空。'
 }
 
 function ModelPicker({
@@ -108,7 +124,9 @@ export function TerminationCard({
   models,
   onRetry,
   onSwitchModel,
-  onAbandon
+  onAbandon,
+  pending,
+  handled
 }: TerminationCardProps): JSX.Element {
   const [picking, setPicking] = useState(false)
   const [expanded, setExpanded] = useState(false)
@@ -141,13 +159,25 @@ export function TerminationCard({
         <div className="termination-card__detail">发生在第 {inner.step_seq} 步</div>
       )}
       <div className="termination-card__body">{inner.message || card.reason}</div>
+      {/* Round-2 review #4: PRD 9.3 "显式卡片说明是哪个预算、用了多少、上限多少" —
+       * only rendered when the daemon actually sent structured numbers
+       * (`errors/classify.py::ErrorCard.budget`'s docstring: nothing does yet,
+       * this is the structural slot for when something does). */}
+      {inner.budget && (
+        <div className="termination-card__detail">
+          {inner.budget.name ?? '预算'}：{inner.budget.used ?? '?'} / {inner.budget.limit ?? '?'}{' '}
+          {inner.budget.unit ?? ''}
+        </div>
+      )}
       {rawExcerpt && (
         <details className="termination-card__raw" open={expanded} onToggle={(e) => setExpanded(e.currentTarget.open)}>
           <summary>查看原始错误</summary>
           <pre>{rawExcerpt}</pre>
         </details>
       )}
-      {picking ? (
+      {handled ? (
+        <div className="termination-card__handled">{HANDLED_LABEL[handled]}</div>
+      ) : picking ? (
         <ModelPicker
           providers={providers}
           models={models}
@@ -159,11 +189,21 @@ export function TerminationCard({
         />
       ) : (
         <div className="termination-card__actions">
-          {actions.includes('retry') && <button onClick={onRetry}>{ACTION_LABEL.retry}</button>}
-          {actions.includes('switch_model') && (
-            <button onClick={() => setPicking(true)}>{ACTION_LABEL.switch_model}</button>
+          {actions.includes('retry') && (
+            <button disabled={pending} onClick={onRetry}>
+              {ACTION_LABEL.retry}
+            </button>
           )}
-          {actions.includes('abandon') && <button onClick={onAbandon}>{ACTION_LABEL.abandon}</button>}
+          {actions.includes('switch_model') && (
+            <button disabled={pending} onClick={() => setPicking(true)}>
+              {ACTION_LABEL.switch_model}
+            </button>
+          )}
+          {actions.includes('abandon') && (
+            <button disabled={pending} onClick={onAbandon}>
+              {ACTION_LABEL.abandon}
+            </button>
+          )}
         </div>
       )}
     </div>

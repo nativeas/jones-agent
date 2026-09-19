@@ -1,7 +1,10 @@
 """`SessionService` integration tests for Issue #22 (FR14 错误面板, 04-w5-
 interfaces.md §4): `_terminate_run`'s ErrorCard classification, `_on_worker_
-crash`'s N07 5s watchdog, and the `session.retry` RPC (retry/switch_model/
-abandon). Follows `test_sessions_service.py`'s fixture pattern (own local copy,
+crash`'s N07 5s watchdog, and the `session.retry` RPC (retry/model_override/
+abandon — `switch_model` as a card action was withdrawn round-2, see
+`errors/classify.py::_ACTIONS`'s comment; `model_override` is still a valid
+`session.retry` RPC parameter, just not offered via any card's `actions`
+today). Follows `test_sessions_service.py`'s fixture pattern (own local copy,
 not a cross-file import — see that file's module docstring for the underlying
 `fake_acp_agent.py` this also drives).
 
@@ -139,7 +142,10 @@ async def test_g08_network_fault_produces_a_network_card_and_no_crash(tmp_path, 
         assert card["kind"] == "error"  # network is NOT a budget-flavored kind
         assert "turn_id" in card and card["turn_id"]
         assert card["card"]["kind"] == ErrorKind.NETWORK.value
-        assert set(card["card"]["actions"]) == {"retry", "switch_model", "abandon"}
+        # Round-2 review fix (#1): `switch_model` is withdrawn repo-wide (see
+        # `errors/classify.py::_ACTIONS`'s comment) — it never reaches the
+        # spawned worker, so offering it would be a no-op dressed up as a fix.
+        assert set(card["card"]["actions"]) == {"retry", "abandon"}
         assert card["card"]["retryable"] is True
         # No worker was ever even spawned for this fault — UI never showed
         # "running" against anything real to begin with (N07's stronger claim is
@@ -167,9 +173,13 @@ async def test_g08_key_invalid_fault_produces_a_provider_auth_card(tmp_path, mon
         assert card["kind"] == "error"
         assert card["card"]["kind"] == ErrorKind.PROVIDER_AUTH.value
         # Retrying unchanged can't succeed — a bare "retry" would be dishonest.
-        assert "retry" not in card["card"]["actions"]
+        # Round-2 review fix (#1): nor is `switch_model` offered any more (it
+        # never reaches the spawned worker) — this card's only action is
+        # "abandon", with an honest hint in `message` telling the user what to
+        # actually do (go change the Key/model in settings).
+        assert card["card"]["actions"] == ["abandon"]
         assert card["card"]["retryable"] is False
-        assert "switch_model" in card["card"]["actions"]
+        assert "去设置页换 Key / 换默认模型后重发" in card["card"]["message"]
         # G03/N02: the raw excerpt must never carry a real key verbatim even
         # though this stub's message happens not to include one — the
         # `raw_excerpt` field itself must always be present and bounded.
@@ -308,6 +318,15 @@ async def test_worker_crash_watchdog_force_terminates_when_the_prompt_call_never
         service._turn_tasks[session_id] = stuck_task
 
         await service._on_worker_crash(session_id, 137)
+        # Round-2 review fix (#7) moved `task.cancel()` to the very last thing
+        # this function does (after its own finalize+terminate, see that
+        # function's comment) — `cancel()` only *schedules* delivery of
+        # `CancelledError`, it doesn't synchronously run it, so with nothing
+        # left to `await` afterward inside `_on_worker_crash`, the event loop
+        # hasn't necessarily had a turn to actually mark the task cancelled by
+        # the time this coroutine resumes here. Yield once so it does — a test
+        # concern only; production code has no such ordering dependency.
+        await asyncio.sleep(0)
 
         assert len(_terminated(service)) == 1
         card = _terminated(service)[0]
@@ -317,6 +336,90 @@ async def test_worker_crash_watchdog_force_terminates_when_the_prompt_call_never
         assert stuck_task.cancelled() or stuck_task.done()
     finally:
         hung.cancel()
+        await service.shutdown()
+
+
+async def test_worker_crash_watchdog_broadcasts_before_cancelling_the_stuck_task(
+    tmp_path, monkeypatch
+):
+    """Round-2 review fix (#7), the actual contract: no matter what asyncio
+    scheduling does to the stuck task, this watchdog's own finalize+terminate
+    (and therefore its `run.terminated` broadcast) must happen BEFORE it calls
+    `task.cancel()` on the stuck task — not after. Verified by call order, not
+    by trying to win a real race against `store/db.py`'s single DB thread
+    (the failure mode this fix closes needs the interrupted task to be blocked
+    genuinely inside a `run_in_executor` future at the moment of cancellation,
+    which isn't something a test can force deterministically without invasive
+    mocking of the DB thread itself — the order guarantee this test checks is
+    what makes that scenario safe regardless of exact timing)."""
+    monkeypatch.setattr(service_module, "_WORKER_CRASH_GRACE_S", 0.2)
+    monkeypatch.setattr(service_module, "_WORKER_CRASH_POLL_INTERVAL_S", 0.02)
+    service = await _make_service(tmp_path, monkeypatch)
+    order: list[str] = []
+    try:
+        session_id = await _new_session(service, title="s1")
+        run_id = "run_order01"
+        turn_id = "turn_order01"
+        await run_in_db_thread(
+            service_module.queries.create_turn_and_user_message,
+            service.ctx.db,
+            turn_id=turn_id,
+            message_id="msg_order01",
+            session_id=session_id,
+            text="hello",
+            queued=False,
+        )
+        await run_in_db_thread(
+            service_module.queries.create_run,
+            service.ctx.db,
+            run_id=run_id,
+            turn_id=turn_id,
+            session_id=session_id,
+        )
+        ctx_turn = service_module._TurnContext(
+            turn_id=turn_id, run_id=run_id, session_id=session_id
+        )
+        service._active_turns[session_id] = ctx_turn
+
+        hung = asyncio.get_running_loop().create_future()
+        stuck_task = asyncio.create_task(asyncio.wait_for(hung, timeout=None))
+
+        # `asyncio.Task` is a C (`_asyncio`) type — its `cancel` can't be
+        # monkeypatched, per-instance or on the class. `_on_worker_crash` only
+        # ever calls `.done()`/`.cancel()` on whatever it finds in
+        # `self._turn_tasks[session_id]` (it never `isinstance`-checks that
+        # it's a real `Task`, and this direct-call test style — like the other
+        # watchdog tests above — sets that dict entry itself rather than going
+        # through `_start_turn`), so a thin duck-typed proxy recording call
+        # order is enough, without needing a real Task to be patchable.
+        class _OrderTrackingTaskProxy:
+            def done(self) -> bool:
+                return stuck_task.done()
+
+            def cancel(self, *args: Any, **kwargs: Any) -> bool:
+                order.append("cancel")
+                return stuck_task.cancel(*args, **kwargs)
+
+        service._turn_tasks[session_id] = _OrderTrackingTaskProxy()  # type: ignore[assignment]
+
+        original_terminate = service._terminate_run
+
+        async def _spy_terminate(*args: Any, **kwargs: Any) -> None:
+            await original_terminate(*args, **kwargs)
+            order.append("terminate")
+
+        monkeypatch.setattr(service, "_terminate_run", _spy_terminate)
+
+        await service._on_worker_crash(session_id, 137)
+
+        assert order == ["terminate", "cancel"]
+    finally:
+        hung.cancel()
+        stuck_task.cancel()
+        # `shutdown()` awaits every task still in `_turn_tasks` — replace the
+        # proxy with the real (already-cancelled) task before that, or it
+        # blows up on the proxy missing `add_done_callback`.
+        service._turn_tasks[session_id] = stuck_task
         await service.shutdown()
 
 
@@ -537,7 +640,14 @@ async def test_retry_creates_a_new_turn_reusing_the_original_user_message(tmp_pa
 async def test_retry_with_model_override_is_consumed_by_the_new_turn(tmp_path, monkeypatch):
     """First `resolve()` call fails (producing a retryable, terminated Turn);
     the second — driven by `retry()`'s `model_override` — must see exactly the
-    override dict, not the Agent's normal (absent, in this test) `model_pref`."""
+    override dict, not the Agent's normal (absent, in this test) `model_pref`.
+
+    Round-2 review (#1): this only proves `_run_turn`'s resolver PRE-CHECK
+    receives the override — it is NOT evidence that "换模型" actually changes
+    what the worker runs (it doesn't; see the companion test right below and
+    `errors/classify.py::_ACTIONS`'s comment for why `switch_model` was
+    withdrawn from every card's `actions` rather than left looking like it
+    works)."""
 
     class _FirstFailsThenRecordsResolver(ProviderResolverProtocol):
         def __init__(self) -> None:
@@ -573,6 +683,48 @@ async def test_retry_with_model_override_is_consumed_by_the_new_turn(tmp_path, m
         assert result["queued"] is False
         await _wait_until(lambda: len(resolver.calls) >= 2)
         assert resolver.calls[-1] == {"provider": "openai", "model": "gpt-override"}
+    finally:
+        await service.shutdown()
+
+
+async def test_model_override_does_not_restart_or_change_the_actual_worker_process(
+    tmp_path, monkeypatch
+):
+    """Round-2 review (#1, critical): the concrete, process-level proof behind
+    `errors/classify.py::_ACTIONS`'s decision to withdraw `switch_model` — a
+    session with an already-running worker keeps that EXACT worker process
+    (same pid) across a `retry(model_override=...)` call, because
+    `WorkerManager.ensure_started` returns the existing worker for a session
+    that has one (never respawns), and `_spawn_and_check`'s `_worker_env` call
+    is never even reached a second time here. Whatever provider/model that
+    worker was originally started with is what still runs the retried Turn —
+    "换模型" changes nothing at the process level, no matter what
+    `ctx.providers.resolve()` (the companion test above) says."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "TOOL_EXCEPTION please")
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        failed_turn_id = _terminated(service)[0]["turn_id"]
+
+        worker_before = service.worker_manager.get(session_id)
+        assert worker_before is not None
+        pid_before = worker_before.process.pid
+
+        result = await service.retry(
+            session_id,
+            failed_turn_id,
+            action="retry",
+            model_override={"provider": "openai", "model": "gpt-override"},
+        )
+        assert result["queued"] is False
+        await _wait_until(lambda: len(_terminated(service)) >= 2, timeout=5)
+
+        worker_after = service.worker_manager.get(session_id)
+        assert worker_after is not None
+        assert worker_after.process.pid == pid_before
+        assert worker_after is worker_before
     finally:
         await service.shutdown()
 
