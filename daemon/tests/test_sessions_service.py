@@ -98,6 +98,32 @@ async def test_send_when_idle_runs_immediately_and_completes(tmp_path, monkeypat
         await service.shutdown()
 
 
+async def test_tool_call_is_recorded_as_a_step_and_broadcast(tmp_path, monkeypatch):
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        result = await service.send(session_id, "please USE_TOOL now")
+        await _wait_until(lambda: len(service.ctx.server.events("step.completed")) >= 1)
+
+        started = service.ctx.server.events("step.started")
+        completed = service.ctx.server.events("step.completed")
+        assert started and started[0][1]["tool"] == "demo_tool"
+        assert completed[0][1]["status"] == "completed"
+
+        run_id = (await service.get(session_id))["latest_turn"]["run_id"]
+        # `send()`'s own response already carries this Turn's run — fall back to
+        # it if the DB read raced ahead of `create_run` (it shouldn't, but keep
+        # the assertion from being flaky over a stronger ordering guarantee).
+        if run_id is None:
+            run_id = completed[0][1]["run_id"]
+        steps = await service.run_steps(run_id)
+        assert any(s["tool"] == "demo_tool" and s["status"] == "completed" for s in steps)
+        assert result["queued"] is False
+    finally:
+        await service.shutdown()
+
+
 async def test_send_while_running_is_queued_then_auto_advances(tmp_path, monkeypatch):
     service = await _make_service(tmp_path, monkeypatch)
     await service.worker_manager.start()
