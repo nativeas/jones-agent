@@ -14,7 +14,7 @@ N01–N18 的验收结果由 Issue #24（P）产出，本文档只引用，不�
 本分支的自动化数字在 **Apple M4 / 32GB / macOS 27.0** 上实测——不是参考机，数字
 仅供方向性参考（`perf-<date>.json` 的 `machine.is_prd_reference_machine` 字段如实
 标 `false`）。发布前必须在真实参考机（或至少一台 M1）上重跑
-`cd daemon && make check-daemon` + `cd apps/desktop && pnpm run perf`，并核对
+`JONES_PERF_RECORD=1 cd daemon && uv run pytest -q tests/perf` + `JONES_PERF_RECORD=1 pnpm run perf`（不设该变量时只断言阈值、不写文件；`make check` 不产生工作区改动），并核对
 `docs/acceptance/v1.0/perf-<date>.json` 里的 `all_passed` 与各项数字。
 
 最近一次本机实测结果：见 `docs/acceptance/v1.0/perf-<date>.json`（生成于本分支

@@ -128,6 +128,8 @@ function machineInfo() {
 // metric `name`, matching the merge-not-overwrite fix on the pytest side
 // (daemon/tests/perf/conftest.py's own round-1 fix).
 function mergePerfReport(newMetrics) {
+  // Controller ruling (W6 merge): only persist when explicitly recording a release artifact.
+  if (process.env.JONES_PERF_RECORD !== '1') return
   fs.mkdirSync(REPORT_DIR, { recursive: true })
   const dateStr = new Date().toISOString().slice(0, 10)
   const outPath = path.join(REPORT_DIR, `perf-${dateStr}.json`)

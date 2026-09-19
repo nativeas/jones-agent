@@ -167,6 +167,11 @@ def _load_existing_report(out_path: Path) -> dict[str, Any] | None:
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:  # noqa: ARG001
     if not _collected:
         return
+    # Controller ruling (W6 merge): the committed perf-<date>.json is a release
+    # artifact owned by #24/#25, not a side effect of every `make check`. Only
+    # record when explicitly asked; thresholds are still asserted either way.
+    if os.environ.get("JONES_PERF_RECORD") != "1":
+        return
     _REPORT_DIR.mkdir(parents=True, exist_ok=True)
     date_str = time.strftime("%Y-%m-%d", time.gmtime())
     out_path = _REPORT_DIR / f"perf-{date_str}.json"
