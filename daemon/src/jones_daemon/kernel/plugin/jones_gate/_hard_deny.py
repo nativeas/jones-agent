@@ -219,12 +219,15 @@ def _protected_path_referenced(
     path at all? Just the "does it touch it" half of `_protected_path_denied`
     — see that function for the round-6 read-only-whitelist half that
     decides whether touching it is actually denied."""
-    stripped = _strip_quote_chars(command)
-    needles = list(_PROTECTED_PATH_NEEDLES)
+    # R11 applies here too: macOS's filesystem is case-insensitive, so
+    # `~/.JONES/permissions.json` IS `~/.jones/permissions.json`. Compare
+    # lower-cased haystack against lower-cased needles.
+    stripped = _strip_quote_chars(command).lower()
+    needles: list[str] = [n.lower() for n in _PROTECTED_PATH_NEEDLES]
     if user_root:
-        needles.append(user_root)
+        needles.append(user_root.lower())
     if project_permissions_path:
-        needles.append(project_permissions_path)
+        needles.append(project_permissions_path.lower())
     return any(needle in stripped for needle in needles)
 
 
@@ -257,7 +260,7 @@ def _protected_path_readonly_whitelisted(command: str) -> bool:
     rest = tokens[1:]
     if first == "diff" and any(t.lower() == "-i" or t.lower().startswith("-i") for t in rest):
         return False
-    if first == "find" and any(t in ("-delete", "-exec") for t in rest):
+    if first == "find" and any(t.lower() in ("-delete", "-exec") for t in rest):
         return False
     return True
 

@@ -202,6 +202,18 @@ def _classify_write(path: Any, *, cwd: str | None) -> Risk:
     return _high(f"path {path!r} escapes the project workspace ({cwd!r})")
 
 
+_PRIVILEGE_ESCALATION_PROGRAMS = frozenset({"sudo", "doas", "su", "pkexec"})
+_MUTATING_PROGRAMS = frozenset({
+    "chmod", "chown", "chgrp", "dd", "kill", "pkill", "killall", "launchctl", "systemctl",
+    "brew", "npm", "pnpm", "yarn", "pip", "pip3", "uv", "cargo", "apt", "apt-get", "yum", "dnf",
+    "mv", "cp", "ln", "mkdir", "rmdir", "touch", "truncate", "install", "crontab", "defaults",
+})
+_GIT_MUTATING_SUBCOMMANDS = frozenset({
+    "push", "reset", "clean", "rebase", "checkout", "switch", "restore", "stash", "branch",
+    "tag", "commit", "merge", "cherry-pick", "revert", "am", "apply",
+})
+
+
 def _classify_terminal(args: dict[str, Any]) -> Risk:
     # Round 5 (controller ruling R5/R7, 2026-09-19): the FIRST thing this
     # function does is the same `transparency(command)` judgment the rule
@@ -259,8 +271,22 @@ def _classify_terminal(args: dict[str, Any]) -> Risk:
     hit = programs & _NETWORK_EGRESS_PROGRAMS
     if hit:
         return _high(f"command includes a network-egress tool: {', '.join(sorted(hit))}")
+    # Controller adjudication after round 6: R10 made `low` reachable again, but
+    # "plain and not egress" is not the same as "harmless". Privilege escalation
+    # is `high`; programs that mutate the filesystem / processes / installed
+    # software / git history keep a `medium` floor so auto mode never runs them
+    # without either an exact-match allow rule or the user gate.
+    esc = programs & _PRIVILEGE_ESCALATION_PROGRAMS
+    if esc:
+        return _high(f"command escalates privileges: {', '.join(sorted(esc))}")
+    mut = programs & _MUTATING_PROGRAMS
+    if mut:
+        return _medium(f"command mutates state: {', '.join(sorted(mut))}")
+    if "git" in programs and programs & _GIT_MUTATING_SUBCOMMANDS:
+        return _medium("git command rewrites history or remote state")
     return _low(
-        "plain terminal command with no network-egress signal (controller ruling R10, round 6)"
+        "plain terminal command with no network-egress or state-mutation signal "
+        "(controller ruling R10, round 6)"
     )
 
 
