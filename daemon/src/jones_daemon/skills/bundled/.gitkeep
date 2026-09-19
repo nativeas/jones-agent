@@ -1,4 +1,0 @@
-Intentionally empty for W4 (issue #18 备注: "内置 Skill（办公文档、媒体生成）在 W5
-单独 Issue"). `jones_daemon/skills/service.py::BUNDLED_SKILLS_DIR` points here so
-the builtin tier exists as a real (currently empty) directory rather than a
-future path that doesn't exist yet.

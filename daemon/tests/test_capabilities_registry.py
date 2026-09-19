@@ -137,7 +137,7 @@ def test_reconcile_does_not_flag_drift_when_hidden_mcp_server_loaded_anyway():
         # hides MCP by default -> "echo" is expected disabled.
         mcp_servers=[registry.McpServerState(name="echo")],
     )
-    # Full builtin schema too, or every one of the 36 `BUILTIN_TOOLS` names
+    # Full builtin schema too, or every one of the `BUILTIN_TOOLS` names
     # would show up as "expected enabled but never loaded" drift — unrelated
     # noise for a test about the MCP-hidden-but-loaded direction specifically.
     result = registry.reconcile(expected, [*registry.BUILTIN_TOOLS, "mcp__echo__ping"])
