@@ -123,16 +123,16 @@ def project_root(project_path: str | os.PathLike[str], *, create: bool = True) -
     return _ensure(path) if create else path
 
 
-def project_settings_path(project_path: str | os.PathLike[str]) -> Path:
-    return project_root(project_path) / "settings.json"
+def project_settings_path(project_path: str | os.PathLike[str], *, create: bool = True) -> Path:
+    return project_root(project_path, create=create) / "settings.json"
 
 
-def project_permissions_path(project_path: str | os.PathLike[str]) -> Path:
-    return project_root(project_path) / "permissions.json"
+def project_permissions_path(project_path: str | os.PathLike[str], *, create: bool = True) -> Path:
+    return project_root(project_path, create=create) / "permissions.json"
 
 
-def project_mcp_path(project_path: str | os.PathLike[str]) -> Path:
-    return project_root(project_path) / "mcp.json"
+def project_mcp_path(project_path: str | os.PathLike[str], *, create: bool = True) -> Path:
+    return project_root(project_path, create=create) / "mcp.json"
 
 
 def project_agents_dir(project_path: str | os.PathLike[str], *, create: bool = True) -> Path:

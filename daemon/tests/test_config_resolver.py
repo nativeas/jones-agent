@@ -174,3 +174,45 @@ def test_mcp_servers_project_entry_overrides_user_entry_of_the_same_name(conn, p
     assert "extra" in servers
     # User-level view is unaffected by the project override.
     assert resolver.mcp_servers(None) == user_servers["servers"]
+
+
+# -- read paths must not resurrect a deleted project's .jones/ ----------------
+#
+# Review round 2, finding #5 (follow-up to round 1's #5, which only fixed
+# AgentStore): project_settings_path/project_permissions_path/project_mcp_path
+# used to call project_root(create=True) unconditionally, so these three purely
+# read-only resolver methods would recreate <project>/.jones for a project
+# directory the user had already deleted.
+
+
+def test_settings_does_not_resurrect_deleted_project_dir(conn, project):
+    import shutil
+
+    shutil.rmtree(project["path"])
+    assert not (paths.project_root(project["path"], create=False)).exists()
+
+    DefaultConfigResolver(conn).settings(project["id"])
+
+    assert not (paths.project_root(project["path"], create=False)).exists()
+
+
+def test_permissions_does_not_resurrect_deleted_project_dir(conn, project):
+    import shutil
+
+    shutil.rmtree(project["path"])
+    assert not (paths.project_root(project["path"], create=False)).exists()
+
+    DefaultConfigResolver(conn).permissions(project["id"])
+
+    assert not (paths.project_root(project["path"], create=False)).exists()
+
+
+def test_mcp_servers_does_not_resurrect_deleted_project_dir(conn, project):
+    import shutil
+
+    shutil.rmtree(project["path"])
+    assert not (paths.project_root(project["path"], create=False)).exists()
+
+    DefaultConfigResolver(conn).mcp_servers(project["id"])
+
+    assert not (paths.project_root(project["path"], create=False)).exists()

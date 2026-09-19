@@ -132,7 +132,9 @@ class DefaultConfigResolver:
         merged.update(read_json(paths.config_dir() / "settings.json", {}))
         project_path = self._project_path(project_id)
         if project_path is not None:
-            merged.update(read_json(paths.project_settings_path(project_path), {}))
+            merged.update(
+                read_json(paths.project_settings_path(project_path, create=False), {})
+            )
         return merged
 
     def permissions(self, project_id: str | None) -> Permissions:
@@ -150,7 +152,7 @@ class DefaultConfigResolver:
         project_ok = True
         if project_path is not None:
             project_data, project_ok = read_json_result(
-                paths.project_permissions_path(project_path)
+                paths.project_permissions_path(project_path, create=False)
             )
             project_rules = (project_data or {}).get("rules", [])
 
@@ -181,7 +183,9 @@ class DefaultConfigResolver:
         project_path = self._project_path(project_id)
         if project_path is None:
             return list(user_servers)
-        project_servers = read_json(paths.project_mcp_path(project_path), {}).get("servers", [])
+        project_servers = read_json(
+            paths.project_mcp_path(project_path, create=False), {}
+        ).get("servers", [])
         # Not a permission — no tightening constraint. Project entries override a
         # user entry of the same name, new names are appended.
         by_name: dict[str, dict[str, Any]] = {s["name"]: s for s in user_servers}

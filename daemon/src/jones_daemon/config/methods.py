@@ -41,17 +41,17 @@ def register(server: RpcServer, ctx: Any) -> None:
     """
     projects = ProjectService(ctx.db)
 
-    def _settings_path(scope: str, project_id: str | None):
+    def _settings_path(scope: str, project_id: str | None, *, create: bool = True):
         if scope == "user":
             return paths.config_dir() / "settings.json"
         project = projects.get(project_id)  # raises RpcError(not_found)
-        return paths.project_settings_path(project["path"])
+        return paths.project_settings_path(project["path"], create=create)
 
     async def settings_get(params: dict[str, Any], conn: Connection) -> dict[str, Any]:
         scope, project_id = _validate_scope(params)
 
         def _do() -> dict[str, Any]:
-            return read_json(_settings_path(scope, project_id), {})
+            return read_json(_settings_path(scope, project_id, create=False), {})
 
         return await run_in_db_thread(_do)
 
