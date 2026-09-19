@@ -11,6 +11,8 @@ as a regression guard proving this branch didn't accidentally weaken them.
 
 from __future__ import annotations
 
+import time
+
 from jones_daemon.permissions.review import classify
 
 
@@ -124,3 +126,103 @@ def test_ls_stays_low_risk():
 
 def test_git_status_stays_low_risk():
     assert _terminal("git status") == "low"
+
+
+# ---------------------------------------------------------------------------
+# Round 2 review fixes (2026-09-19)
+# ---------------------------------------------------------------------------
+
+# -- finding #4 (critical): an unquoted $HOME/${HOME} doesn't trip
+#    `_transparency`'s opaque check, so it used to resolve as a nonsense
+#    relative path (`$HOME/$HOME/.ssh/id_rsa`) that never matched anything.
+
+
+def test_terminal_cat_ssh_key_via_dollar_home_is_high_risk(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _terminal("cat $HOME/.ssh/id_rsa") == "high"
+
+
+def test_terminal_cat_ssh_key_via_braced_dollar_home_is_high_risk(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _terminal("cat ${HOME}/.ssh/id_rsa") == "high"
+
+
+# -- findings #2/#5 (important): the sensitive-path check only caught a
+#    command that names a sensitive root DIRECTLY — not one that recursively
+#    walks a directory that merely CONTAINS one (default Project cwd = $HOME).
+
+
+def test_grep_recursive_from_home_tilde_is_not_low(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("terminal", {"command": "grep -rn PRIVATE ~"}, cwd=str(tmp_path))
+    assert risk.level != "low"
+
+
+def test_grep_recursive_from_home_cwd_dot_is_not_low(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("terminal", {"command": "grep -rn PRIVATE ."}, cwd=str(tmp_path))
+    assert risk.level != "low"
+
+
+def test_find_from_home_tilde_is_not_low(tmp_path, monkeypatch):
+    # `find` recurses by default, no `-r`/`-R` flag needed at all.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("terminal", {"command": "find ~ -name 'id_*'"}, cwd=str(tmp_path))
+    assert risk.level != "low"
+
+
+def test_tar_packing_home_cwd_is_not_low(tmp_path, monkeypatch):
+    # `tar cf` on a directory archives it recursively, no `-r` flag needed.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("terminal", {"command": "tar cf /tmp/h.tar ."}, cwd=str(tmp_path))
+    assert risk.level != "low"
+
+
+def test_grep_recursive_absolute_home_path_is_not_low(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("terminal", {"command": f"grep -r ssh-rsa {tmp_path}"}, cwd=str(tmp_path))
+    assert risk.level != "low"
+
+
+def test_grep_recursive_over_an_unrelated_dir_stays_low(tmp_path, monkeypatch):
+    # Regression guard: the ancestor check only fires when a sensitive root
+    # is actually reachable underneath the resolved directory token — an
+    # ordinary project directory with no relationship to $HOME's sensitive
+    # roots must stay `low`, not become a blanket "any -r is non-low" rule.
+    monkeypatch.setenv("HOME", str(tmp_path / "unrelated-home"))
+    project = tmp_path / "project"
+    project.mkdir()
+    risk = classify("terminal", {"command": "grep -rn TODO ."}, cwd=str(project))
+    assert risk.level == "low"
+
+
+def test_non_recursive_command_over_home_stays_unaffected_by_ancestor_check(tmp_path, monkeypatch):
+    # `ls` has no recursive/traversal semantics — the ancestor check must not
+    # fire just because `cwd` happens to be $HOME.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("terminal", {"command": "ls ."}, cwd=str(tmp_path))
+    assert risk.level == "low"
+
+
+# -- finding #6 (important): `Path.expanduser()`'s `RuntimeError` for an
+#    unresolvable `~user` form must not escape `classify()` as a crash.
+
+
+def test_terminal_unresolvable_user_home_token_does_not_raise():
+    assert _terminal("ls ~nosuchuser12345") == "low"
+
+
+# -- finding #7 (important): a long command must not block the daemon's
+#    event loop — measured ~165ms/call before this fix (exception-driven
+#    `matches()` + rebuilding `sensitive_roots()` on every token).
+
+
+def test_long_command_classification_is_fast(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    command = "ls " + " ".join(f"file{i}.txt" for i in range(499))
+    started = time.perf_counter()
+    for _ in range(10):
+        classify("terminal", {"command": command}, cwd=str(tmp_path))
+    elapsed_ms = (time.perf_counter() - started) / 10 * 1000
+    # Generous ceiling (measured ~2ms after the fix) to stay non-flaky in CI.
+    assert elapsed_ms < 50

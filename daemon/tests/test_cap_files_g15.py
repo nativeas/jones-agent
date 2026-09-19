@@ -72,6 +72,36 @@ def test_an_unrelated_path_does_not_match(tmp_path, monkeypatch):
     assert defaults.matches((tmp_path / "projects" / "repo" / "README.md").resolve()) is None
 
 
+def test_uppercase_ssh_variant_matches_case_insensitively(tmp_path, monkeypatch):
+    # Round 2 review finding #1 (critical): macOS's default filesystem
+    # (APFS) is case-insensitive but case-preserving — `~/.SSH` and
+    # `~/.ssh` are the SAME directory on disk (verified: `ls -ld ~/.SSH` on
+    # a real macOS APFS volume returns the real `~/.ssh`'s own stat line).
+    # `matches()` used to compare with case-sensitive `==`/`relative_to()`,
+    # so this spelling silently fell through to `None` (and from there to
+    # `low` in the review gate) even though it resolves to the exact same
+    # inode as the lowercase form the test above already covers.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".ssh").mkdir()
+    resolved = (tmp_path / ".SSH" / "id_rsa").resolve(strict=False)
+    assert defaults.matches(resolved) is not None
+
+
+def test_ancestor_root_under_finds_ssh_under_home(tmp_path, monkeypatch):
+    # Round 2 review findings #2/#5: the reverse direction from `matches()` —
+    # `ancestor_root_under(home)` must find `~/.ssh` as a root CONTAINED by
+    # `home`, not just the other way around.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert defaults.ancestor_root_under(tmp_path.resolve()) == (tmp_path / ".ssh").resolve()
+
+
+def test_ancestor_root_under_an_unrelated_dir_is_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    other = tmp_path / "projects" / "repo"
+    other.mkdir(parents=True)
+    assert defaults.ancestor_root_under(other.resolve()) is None
+
+
 # ---------------------------------------------------------------------------
 # Unit: permissions/review.py::classify() — read_file/search_files/write_file/patch
 # ---------------------------------------------------------------------------
@@ -116,6 +146,35 @@ def test_write_file_under_browser_profile_is_high_risk(tmp_path, monkeypatch):
         tmp_path / "Library" / "Application Support" / "Google" / "Chrome" / "Default" / "Cookies"
     )
     risk = classify("write_file", {"path": str(target)}, cwd=str(tmp_path / "repo"))
+    assert risk.level == "high"
+
+
+def test_read_file_under_uppercase_ssh_variant_is_high_risk(tmp_path, monkeypatch):
+    # Round 2 review finding #1: same repro as `test_uppercase_ssh_variant_
+    # matches_case_insensitively` above, one layer up through `classify()`.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify(
+        "read_file", {"path": str(tmp_path / ".SSH" / "id_rsa")}, cwd=str(tmp_path / "repo")
+    )
+    assert risk.level == "high"
+
+
+def test_read_file_unresolvable_user_home_does_not_raise(tmp_path):
+    # Round 2 review finding #6 (important): `Path('~nosuchuser/x').
+    # expanduser()` raises `RuntimeError` (Python 3.12), not `OSError` —
+    # `_classify_path_access`'s `except OSError` used to let it escape
+    # `classify()` entirely (main already had this for write_file/patch;
+    # Issue #13 routing read_file/search_files through the same function
+    # widened the trigger surface without widening the `except`). Fails
+    # closed: `high`, never a crash.
+    risk = classify("read_file", {"path": "~nosuchuser12345/x"}, cwd=str(tmp_path))
+    assert risk.level == "high"
+
+
+def test_search_files_unresolvable_user_home_does_not_raise(tmp_path):
+    risk = classify(
+        "search_files", {"path": "~nosuchuser12345/x", "pattern": "*"}, cwd=str(tmp_path)
+    )
     assert risk.level == "high"
 
 
@@ -220,6 +279,14 @@ def test_terminal_head_aws_credentials_via_relative_path_with_home_cwd_is_high_r
     (tmp_path / ".aws").mkdir()
     monkeypatch.setenv("HOME", str(tmp_path))
     risk = classify("terminal", {"command": "head -5 .aws/credentials"}, cwd=str(tmp_path))
+    assert risk.level == "high"
+
+
+def test_terminal_cat_uppercase_ssh_variant_is_high_risk(tmp_path, monkeypatch):
+    # Round 2 review finding #1's exact repro: `cat ~/.SSH/id_rsa`/`cat
+    # ~/.AWS/credentials` must not be a silent bypass of the lowercase form.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    risk = classify("terminal", {"command": f"cat {tmp_path / '.SSH' / 'id_rsa'}"})
     assert risk.level == "high"
 
 

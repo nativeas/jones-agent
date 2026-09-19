@@ -65,10 +65,45 @@ This still delivers the exact behavior 03-w4-interfaces.md §3 asks for:
 
 See the PR report's "契约变更" section for the amendment this implies to
 03-w4-interfaces.md §3's literal "在规则闸的 gate_config 中" wording.
+
+## Round 2 review fixes (2026-09-19)
+
+Findings #1/#7: `matches()`/`sensitive_roots()` used to compare resolved
+paths with plain equality/`Path.relative_to()` — both case-SENSITIVE string
+comparisons, and `relative_to()` uses a raised `ValueError` as its
+"didn't match" signal. Two independent bugs that happened to live in the
+same two functions:
+
+- **Case sensitivity (finding #1, critical):** macOS's default filesystem
+  (APFS) is case-insensitive but case-PRESERVING — `~/.SSH` and `~/.ssh` are
+  the same directory on disk, `Path.resolve(strict=False)` does NOT fold
+  case for a path that exists (verified: `ls -ld ~/.SSH` on a real macOS
+  APFS volume returns the real `~/.ssh`'s own stat line), so `resolved ==
+  root` silently failed to match a same-directory, different-case spelling.
+  This is the exact case-insensitivity bug controller ruling commit
+  `43d56d3` already fixed for the protected-`.jones`-path check
+  (`kernel/plugin/jones_gate/_hard_deny.py::_protected_path_referenced`,
+  `.lower()` on both sides) — this module hadn't picked up that precedent
+  because it didn't exist yet when this file was first written. Fixed the
+  same way: both sides `.lower()`'d before comparing (PRD v1 is macOS-only,
+  00-foundation.md §12.1 G18, so this doesn't need a per-platform branch).
+- **Exceptions as control flow (finding #7, important):** `resolved.
+  relative_to(root)` inside a `try/except ValueError` re-evaluated on every
+  single token of every `terminal` call (`_terminal_token_sensitive_root` in
+  `permissions/review.py` calls `matches()` once per token) — a 500-token
+  command measured at 165ms of synchronous blocking on the daemon's single
+  event loop (FR08's whole 200ms streaming-latency budget, self-inflicted).
+  Replaced with a plain string-prefix check (no exception raised on the
+  common "doesn't match" path) plus caching `sensitive_roots()` per
+  resolved-home value (`_sensitive_roots_for_home`, `functools.lru_cache`)
+  so repeated calls stop re-running `Path.home().resolve()` and
+  reconstructing 20+ `Path` objects every time.
 """
 
 from __future__ import annotations
 
+import os
+from functools import lru_cache
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -118,6 +153,24 @@ SENSITIVE_ABSOLUTE_DIRS: tuple[str, ...] = (
 )
 
 
+@lru_cache(maxsize=256)
+def _sensitive_roots_for_home(resolved_home: str | None) -> tuple[Path, ...]:
+    """The cacheable half of `sensitive_roots()` — keyed on the already-
+    resolved home directory string (or `None` when it couldn't be resolved
+    at all), so repeated calls with the SAME home (the overwhelmingly common
+    case: one real `Path.home()` value for the daemon's whole process
+    lifetime) skip reconstructing 20+ `Path` objects every time (review
+    finding #7). A test suite that monkeypatches `$HOME` across many
+    different `tmp_path` values just grows a few more cache entries — still
+    correct, only a cache-size tradeoff, not a staleness bug, since the key
+    IS the resolved home value itself."""
+    roots: list[Path] = [Path(p) for p in SENSITIVE_ABSOLUTE_DIRS]
+    if resolved_home is not None:
+        home_path = Path(resolved_home)
+        roots.extend(home_path / rel for rel in SENSITIVE_HOME_RELATIVE_DIRS)
+    return tuple(roots)
+
+
 def sensitive_roots(home: Path | None = None) -> tuple[Path, ...]:
     """Every default-deny root as a resolved absolute `Path` — home-relative
     entries joined against `home` (default: `Path.home()`), plus the
@@ -126,28 +179,64 @@ def sensitive_roots(home: Path | None = None) -> tuple[Path, ...]:
     caller that can't resolve `Path.home()` has bigger problems than this
     one classifier, and the absolute system paths are still worth
     returning."""
-    roots: list[Path] = [Path(p) for p in SENSITIVE_ABSOLUTE_DIRS]
     try:
         resolved_home = (home or Path.home()).resolve(strict=False)
     except OSError:
-        return tuple(roots)
-    roots.extend(resolved_home / rel for rel in SENSITIVE_HOME_RELATIVE_DIRS)
-    return tuple(roots)
+        return _sensitive_roots_for_home(None)
+    return _sensitive_roots_for_home(str(resolved_home))
+
+
+def _casefold(path_str: str) -> str:
+    """macOS's default filesystem (APFS) is case-insensitive but case-
+    PRESERVING (review finding #1) — `~/.SSH` and `~/.ssh` are the same
+    directory on disk, so every comparison in this module folds case first.
+    `.lower()`, not `os.path.normcase()`: `normcase` is a no-op on POSIX
+    (it only folds case on Windows), which would silently do nothing here —
+    matches the precedent already set by `kernel/plugin/jones_gate/
+    _hard_deny.py::_protected_path_referenced` (controller ruling, commit
+    `43d56d3`)."""
+    return path_str.lower()
 
 
 def matches(resolved: Path, *, home: Path | None = None) -> Path | None:
     """The specific default-deny root `resolved` (already `Path.resolve()`d
     by the caller) sits at or under, or `None`. Callers use the return value
     both as a truthy check and to name which root triggered the match in
-    their own reason text (`str(root)`)."""
+    their own reason text (`str(root)`).
+
+    Case-insensitive (review finding #1) and exception-free on the common
+    "doesn't match" path (review finding #7: `Path.relative_to()`'s
+    `ValueError`-as-control-flow was ~9ms/call, the dominant cost in a
+    500-token terminal command's 165ms of event-loop blocking) — a plain
+    string-prefix comparison instead."""
+    resolved_cf = _casefold(str(resolved))
     for root in sensitive_roots(home):
-        if resolved == root:
+        root_cf = _casefold(str(root))
+        if resolved_cf == root_cf:
             return root
-        try:
-            resolved.relative_to(root)
+        prefix = root_cf if root_cf.endswith(os.sep) else root_cf + os.sep
+        if resolved_cf.startswith(prefix):
             return root
-        except ValueError:
-            continue
+    return None
+
+
+def ancestor_root_under(resolved: Path, *, home: Path | None = None) -> Path | None:
+    """The reverse direction from `matches()`: a default-deny root that sits
+    AT OR UNDER `resolved` — i.e. `resolved` is an ancestor of (or equal to)
+    that root, so recursively walking `resolved` would reach it. Review
+    findings #2/#5: `_classify_read`'s `directory_scope` already used this
+    exact reasoning for `search_files` (a directory argument can CONTAIN a
+    sensitive root even when it isn't one itself — `~/.ssh` is *under* `~`,
+    not equal to it); `permissions/review.py::
+    _terminal_recursive_ancestor_of_sensitive_root` applies the same check
+    to a `terminal` command's recursive/traversal targets (`grep -r`, `find`,
+    `tar` on a directory that contains `~/.ssh`)."""
+    resolved_cf = _casefold(str(resolved))
+    prefix = resolved_cf if resolved_cf.endswith(os.sep) else resolved_cf + os.sep
+    for root in sensitive_roots(home):
+        root_cf = _casefold(str(root))
+        if root_cf == resolved_cf or root_cf.startswith(prefix):
+            return root
     return None
 
 
@@ -188,3 +277,13 @@ DATA_DESTRUCTIVE_TERMINAL_PROGRAMS: frozenset[str] = frozenset({"dd"})
 # "change every file under an arbitrary directory tree", `rm -rf`'s own risk
 # shape.
 RECURSIVE_ESCALATES_TO_HIGH_PROGRAMS: frozenset[str] = frozenset({"chmod", "chown"})
+
+# Round 2 review findings #2/#5 (2026-09-19): programs whose normal, no-flags-
+# needed behavior already recursively walks a directory argument (`find`
+# always traverses; `tar`/`zip` archive a directory's full contents when
+# given one as an argument) — used by `permissions/review.py::
+# _terminal_recursive_ancestor_of_sensitive_root` alongside an explicit
+# `-r`/`-R`/`--recursive` flag (any program) to decide whether a command's
+# directory argument needs the reverse "does it CONTAIN a sensitive root"
+# check at all, not to change `dd`'s data-destructive handling above.
+RECURSIVE_TRAVERSAL_PROGRAMS: frozenset[str] = frozenset({"find", "tar", "zip"})
