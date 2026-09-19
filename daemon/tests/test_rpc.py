@@ -383,6 +383,106 @@ async def test_unsubscribe_stops_further_broadcasts(server):
         writer.close()
 
 
+# -- broadcast_all / recent_response_samples (added by O/#23, 04-w5-interfaces.md
+# §5's rpc/server.py 加法扩展, for the Key-redaction self-check) ------------------
+
+
+async def test_broadcast_all_delivers_to_every_connection_regardless_of_subscription(server):
+    # Unlike `broadcast()`, `broadcast_all` isn't scoped to a session — daemon.error
+    # from the redaction self-check has no session to be "about", so every
+    # connection must get it, subscribed or not.
+    reader_a, writer_a = await asyncio.open_unix_connection(str(server.socket_path))
+    reader_b, writer_b = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        # A full round trip on each connection first — `_handle_client` adding a
+        # connection to `self._connections` happens on a task scheduled by the
+        # accept callback, not synchronously when `open_unix_connection` returns
+        # client-side, so `broadcast_all` right after connecting could otherwise
+        # race a connection that isn't registered yet.
+        for reader, writer in ((reader_a, writer_a), (reader_b, writer_b)):
+            writer.write(b'{"jsonrpc":"2.0","id":"warmup","method":"daemon.ping"}\n')
+            await writer.drain()
+            await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2)
+
+        await server.broadcast_all("daemon.error", {"code": "x"})
+
+        note_a = json.loads(await asyncio.wait_for(reader_a.readuntil(b"\n"), timeout=2))
+        note_b = json.loads(await asyncio.wait_for(reader_b.readuntil(b"\n"), timeout=2))
+        expected = {"jsonrpc": "2.0", "method": "daemon.error", "params": {"code": "x"}}
+        assert note_a == expected
+        assert note_b == expected
+    finally:
+        writer_a.close()
+        writer_b.close()
+
+
+async def test_broadcast_all_to_a_connection_that_already_disconnected_does_not_raise(server):
+    async def _boom_notify(method, params=None):
+        raise ConnectionError("peer gone")
+
+    from jones_daemon.rpc.server import Connection
+
+    dead = Connection.__new__(Connection)
+    dead.notify = _boom_notify
+    server._connections.add(dead)
+    try:
+        await server.broadcast_all("daemon.error", {"code": "x"})
+    finally:
+        server._connections.discard(dead)
+
+
+async def test_recent_response_samples_is_empty_before_any_request(server):
+    # This is exactly the gap round-1 review flagged: at true process startup,
+    # before any client has connected, the buffer the redaction self-check reads
+    # is necessarily this — empty.
+    assert server.recent_response_samples() == []
+
+
+async def test_recent_response_samples_captures_successful_and_error_responses(server):
+    await _roundtrip(server.socket_path, {"jsonrpc": "2.0", "id": "1", "method": "daemon.ping"})
+    await _roundtrip(server.socket_path, {"jsonrpc": "2.0", "id": "2", "method": "nope.nope"})
+
+    samples = server.recent_response_samples()
+    assert len(samples) == 2
+    parsed = [json.loads(s) for s in samples]
+    assert parsed[0]["id"] == "1" and "result" in parsed[0]
+    assert parsed[1]["id"] == "2" and "error" in parsed[1]
+
+
+async def test_recent_response_samples_is_bounded(server):
+    from jones_daemon.rpc.server import RECENT_RESPONSES_MAXLEN
+
+    for i in range(RECENT_RESPONSES_MAXLEN + 5):
+        await _roundtrip(
+            server.socket_path, {"jsonrpc": "2.0", "id": str(i), "method": "daemon.ping"}
+        )
+
+    samples = server.recent_response_samples()
+    assert len(samples) == RECENT_RESPONSES_MAXLEN
+    # the oldest entries were dropped, not the newest.
+    ids = [json.loads(s)["id"] for s in samples]
+    assert ids[-1] == str(RECENT_RESPONSES_MAXLEN + 4)
+
+
+async def test_recent_response_samples_are_truncated_not_the_full_body(server):
+    # Round-2 review: a large response (e.g. `run.payload` with `limit=None`,
+    # 04-w5-interfaces.md §5) used to be sampled here in full — up to
+    # MAX_LINE_BYTES (16MB) per entry, times RECENT_RESPONSES_MAXLEN (100)
+    # retained. The self-check that consumes this buffer only needs an 8-byte
+    # substring match, not the whole body.
+    from jones_daemon.rpc.server import RECENT_RESPONSE_SAMPLE_MAX_CHARS
+
+    async def _big_handler(params, conn):
+        return {"blob": "x" * (RECENT_RESPONSE_SAMPLE_MAX_CHARS * 4)}
+
+    server.register("test.big", _big_handler)
+    await _roundtrip(server.socket_path, {"jsonrpc": "2.0", "id": "1", "method": "test.big"})
+
+    samples = server.recent_response_samples()
+    assert len(samples) == 1
+    assert len(samples[0]) == RECENT_RESPONSE_SAMPLE_MAX_CHARS
+
+
 async def test_broadcast_to_a_connection_that_already_disconnected_does_not_raise(server):
     class DeadConnLikeWriter:
         async def notify(self, method, params):

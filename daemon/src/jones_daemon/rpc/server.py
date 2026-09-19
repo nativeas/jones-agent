@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import json
 import os
+from collections import deque
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,35 @@ MAX_LINE_BYTES = 16 * 1024 * 1024
 MAX_INFLIGHT_PER_CONNECTION = 16
 MAX_INFLIGHT_GLOBAL = 64
 
+# Issue #23 (04-w5-interfaces.md §5): the periodic Key-redaction self-check
+# (`store/maintenance.py::run_redaction_self_check_loop`) scans a bounded window
+# of recent RPC response samples alongside log files — this is that buffer's
+# size. A plain bounded ring, not a persisted log: it only ever needs to answer
+# "did a response body in the recent past contain a configured key", never
+# survive a restart. Round-1 review: this used to be read exactly once, before
+# startup had accepted its first client connection — always empty in practice.
+# It's now polled periodically instead, so it actually gets read while it holds
+# real data. Round-3 review (controller ruling R-O2): shrunk from 100 to 32 —
+# together with the wider per-entry cap just below, this keeps the *aggregate*
+# response-sample budget bounded (32 * 8KB = 256KB) rather than growing the
+# product of "how many" and "how big" independently.
+RECENT_RESPONSES_MAXLEN = 32
+
+# Round-2 review: this buffer used to hold each response's *entire* serialized
+# body — `run.payload`'s own `limit` is allowed to be `None` (read to EOF), and
+# `MAX_LINE_BYTES` allows a 16MB line, so 100 entries of that could pin
+# hundreds of MB to 1.6GB in a desktop daemon that's supposed to be idle-cheap
+# (DEV.md 工程原则 #3), just to satisfy an 8-byte substring scan. The redaction
+# scan only ever needs a bounded prefix of each response to do its job — a
+# truncated sample still contains any leaked key that isn't itself split across
+# the truncation boundary, the same trade every other bound in this self-check
+# already makes (`store/maintenance.py`'s own per-source scan budgets). Round-3
+# review (controller ruling R-O2): widened from 4KB to 8KB per entry — paired
+# with shrinking `RECENT_RESPONSES_MAXLEN` above from 100 to 32, so the total
+# buffer size drops (100*4KB=400KB -> 32*8KB=256KB) even though each individual
+# sample now covers more of its response body.
+RECENT_RESPONSE_SAMPLE_MAX_CHARS = 8192
+
 
 def _peek_request_id(line: bytes) -> Any:
     """Best-effort extraction of `id` from a line we're rejecting without a full
@@ -88,9 +118,16 @@ class Connection:
         self.subscriptions: set[str] = set()
 
     async def _send(self, obj: dict[str, Any]) -> None:
-        line = json.dumps(obj, ensure_ascii=False) + "\n"
+        await self._send_line(json.dumps(obj, ensure_ascii=False))
+
+    async def _send_line(self, line: str) -> None:
+        """Write an already-serialized response line. Split out of `_send` (round-2
+        review) so `RpcServer._dispatch`/`_respond_error` can serialize a response
+        exactly once and reuse that same string both to write to the socket and
+        to sample into `_recent_responses`, instead of `json.dumps`-ing the same
+        object twice per response — once here, once for the sample."""
         async with self._lock:
-            self._writer.write(line.encode("utf-8"))
+            self._writer.write((line + "\n").encode("utf-8"))
             await self._writer.drain()
 
     async def notify(self, method: str, params: Any = None) -> None:
@@ -117,9 +154,23 @@ class RpcServer:
         # set: connections add themselves in `_handle_client` and remove
         # themselves in its `finally`, both on the event loop thread.
         self._connections: set[Connection] = set()
+        # Additive, Issue #23 (04-w5-interfaces.md §5): a bounded-size prefix
+        # (RECENT_RESPONSE_SAMPLE_MAX_CHARS) of the last RECENT_RESPONSES_MAXLEN
+        # response bodies (success or error) this server sent, fed to the
+        # startup Key-redaction self-check (`store/maintenance.py::
+        # startup_key_redaction_self_check`) — not the full body (round-2
+        # review, see RECENT_RESPONSE_SAMPLE_MAX_CHARS's comment). A `deque`
+        # with `maxlen` set drops the oldest entry itself on overflow — no
+        # separate trim step, and no unbounded growth for a long-lived daemon.
+        self._recent_responses: deque[str] = deque(maxlen=RECENT_RESPONSES_MAXLEN)
 
     def register(self, method: str, handler: Handler) -> None:
         self._methods[method] = handler
+
+    def recent_response_samples(self) -> list[str]:
+        """Snapshot of the last `RECENT_RESPONSES_MAXLEN` response bodies sent —
+        see `_recent_responses`'s docstring."""
+        return list(self._recent_responses)
 
     async def broadcast(self, session_id: str, method: str, params: Any) -> None:
         """Push a notification to every connection currently subscribed to
@@ -148,17 +199,18 @@ class RpcServer:
 
     async def broadcast_all(self, method: str, params: Any) -> None:
         """Push a notification to EVERY currently-connected client, regardless
-        of `session.subscribe` state (controller ruling R-H3, Issue #17/#19).
+        of `session.subscribe` state (controller ruling R-H3, Issue #17/#19;
+        design §4.2: `daemon.error`, "永不静默" — a leaked-key hit from the
+        startup redaction self-check, Issue #23, is exactly this shape too).
 
         `broadcast()` above only reaches connections subscribed to one
         specific `session_id` — right for a per-session event like `message.
-        delta`, wrong for a daemon-wide `daemon.error` a client should see
-        even if it hasn't subscribed to (or has a different session focused
-        than) the one that triggered it (e.g. `mcp_server_down`/
-        `capability_drift`, 00-foundation.md §4.3's "永不静默" for exactly this
-        reason). Same additive-only, best-effort-per-connection shape as
-        `broadcast()` (01-w2-interfaces.md §2 "加法不改法" — this file is the
-        one every W2+ branch may extend, never rewrite)."""
+        delta`, wrong for a daemon-wide notification a client should see even
+        if it hasn't subscribed to (or has a different session focused than)
+        the one that triggered it (e.g. `mcp_server_down`/`capability_drift`).
+        Same additive-only, best-effort-per-connection shape as `broadcast()`
+        (01-w2-interfaces.md §2 "加法不改法" — this file is the one every
+        W2+ branch may extend, never rewrite)."""
         targets = list(self._connections)
         for conn in targets:
             try:
@@ -310,7 +362,8 @@ class RpcServer:
             return
 
         if req_id is not None:
-            await conn._send({"jsonrpc": "2.0", "id": req_id, "result": result})
+            response = {"jsonrpc": "2.0", "id": req_id, "result": result}
+            await self._sample_and_send(conn, response)
 
     async def _respond_error(
         self,
@@ -323,4 +376,15 @@ class RpcServer:
         error: dict[str, Any] = {"code": code, "message": message}
         if detail is not None:
             error["data"] = detail
-        await conn._send({"jsonrpc": "2.0", "id": req_id, "error": error})
+        response = {"jsonrpc": "2.0", "id": req_id, "error": error}
+        await self._sample_and_send(conn, response)
+
+    async def _sample_and_send(self, conn: Connection, response: dict[str, Any]) -> None:
+        """Serialize `response` exactly once — reused both as the wire line and
+        as the (truncated) redaction-scan sample, instead of `json.dumps`-ing
+        the same object twice per response on the event loop thread (round-2
+        review; see `RECENT_RESPONSE_SAMPLE_MAX_CHARS`'s comment for the size
+        bound)."""
+        line = json.dumps(response, ensure_ascii=False)
+        self._recent_responses.append(line[:RECENT_RESPONSE_SAMPLE_MAX_CHARS])
+        await conn._send_line(line)

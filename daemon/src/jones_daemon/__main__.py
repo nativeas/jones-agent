@@ -36,7 +36,8 @@ from jones_daemon.secrets.vault import build_default_vault
 from jones_daemon.service import maybe_handle_cli
 from jones_daemon.sessions import methods as sessions_methods
 from jones_daemon.skills.methods import register as register_skills
-from jones_daemon.store import apply_pending, connect, run_in_db_thread
+from jones_daemon.store import apply_pending, connect, maintenance, run_in_db_thread
+from jones_daemon.store.methods import register as register_store
 from jones_daemon.store.migrator import SchemaTooNewError
 
 logger = get_logger("main")
@@ -90,7 +91,12 @@ def _release_single_instance_lock(fh: TextIO) -> None:
 
 
 async def _run() -> None:
-    configure_logging()
+    # Issue #23 (04-w5-interfaces.md §5): pass `logs_dir` so the daemon's own
+    # structured log stream gets real, self-managed, size-bounded rotation —
+    # see `configure_logging`'s docstring (round-3 review, controller ruling
+    # R-O3: size-based `RotatingFileHandler`, and the stderr handler is only
+    # added for an actual tty, not under launchd).
+    configure_logging(logs_dir=paths.logs_dir())
     lock_fh = _acquire_single_instance_lock()
 
     try:
@@ -145,6 +151,7 @@ async def _run() -> None:
         register_agents(server, ctx)
         register_skills(server, ctx)
         register_capabilities(server, ctx)  # Issue #17/#19 daemon 侧: `capability.list`
+        register_store(server, ctx)  # Issue #23: daemon.clear_cache
         session_service = sessions_methods.register(server, ctx)
         register_daemon_status(server, session_service)  # 02-w3-interfaces.md §2 集成收口 #2
         await session_service.startup()
@@ -160,6 +167,46 @@ async def _run() -> None:
             extra={"detail": {"sock": str(paths.sock_file()), "pid": os.getpid()}},
         )
 
+        # Round-3 review (controller ruling R-O3): the old `logs/` mtime-based
+        # rotation sweep (`maintenance.run_log_rotation_loop`) is gone —
+        # `logging.py::configure_logging`'s `RotatingFileHandler` now rotates
+        # `daemon.log` itself on size, and the stderr stream is only opened for
+        # an actual tty (not under launchd), so there is nothing left under
+        # `logs_dir` for a periodic sweep to clean up. See that module's own
+        # comment where the functions used to live.
+
+        async def _on_redaction_hit(code: str, message: str, detail: dict) -> None:
+            payload = {"code": code, "message": message, "detail": detail}
+            await server.broadcast_all("daemon.error", payload)
+
+        # 启动期 Key 脱敏自检 (04-w5-interfaces.md §5, G03/N02), as a *periodic*
+        # background loop rather than a single startup-time call. Round-1 review:
+        # a single call fires before `server.serve_forever()` has accepted its
+        # first client, so `server.recent_response_samples()` at that instant is
+        # always empty — the response-samples half of the contract never
+        # actually scanned anything. Looping it (started here, cancelled on
+        # shutdown) means every pass after daemon startup's first one has real
+        # response bodies to look at. A malfunctioning self-check pass (e.g. the
+        # vault's data key is unavailable) is logged and skipped inside the
+        # loop, not fatal to the daemon — see `run_redaction_self_check_loop`'s
+        # own docstring; a real *hit* (a key actually found unredacted) is what
+        # must never be silent, via `_on_redaction_hit` -> `daemon.error` above.
+        # Round-3 review (controller ruling R-O2): the scan itself now opens its
+        # own read-only connection to `paths.db_path()` on a dedicated executor
+        # thread rather than reusing the shared `conn` on the DB thread — see
+        # `maintenance.run_redaction_self_check_loop`'s own docstring.
+        redaction_check_task = asyncio.create_task(
+            maintenance.run_redaction_self_check_loop(
+                vault=vault,
+                logs_dir=paths.logs_dir(),
+                db_path=paths.db_path(),
+                runs_dir=paths.runs_dir(),
+                runtime_dir=paths.runtime_dir(),
+                recent_response_samples=server.recent_response_samples,
+                on_hit=_on_redaction_hit,
+            )
+        )
+
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -170,8 +217,15 @@ async def _run() -> None:
         logger.info("shutting down", extra={"detail": {}})
 
         serve_task.cancel()
+        # Round-1 review: this became a long-running loop (see
+        # `run_redaction_self_check_loop`'s docstring above) instead of a
+        # one-shot task — it must be cancelled, not just awaited, or shutdown
+        # would hang forever on its `while True`.
+        redaction_check_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await serve_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await redaction_check_task
         await server.stop()
         # Stop dispatching new cron triggers before tearing `session_service`
         # down — it dispatches through that service's public methods and must

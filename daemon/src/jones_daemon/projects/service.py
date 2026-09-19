@@ -8,7 +8,6 @@ RPC server.
 
 from __future__ import annotations
 
-import shutil
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -16,6 +15,7 @@ from typing import Any
 from jones_daemon import paths
 from jones_daemon.config.ids import new_ulid, now_iso
 from jones_daemon.rpc.errors import INVALID_PARAMS, INVALID_STATE, NOT_FOUND, RpcError
+from jones_daemon.store import maintenance
 
 # Fixed id for the implicit Project anchored at the user's home directory, seeded by
 # migration 004 (docs/design/01-w2-interfaces.md §2: A's 002 migration seeds a
@@ -90,15 +90,16 @@ class ProjectService:
         """Project 删除 = SQLite 行 + `<user_root>/projects/<id>/`（附件目录），不删
         用户目录里的 `.jones/`（那是用户数据，见 01-w2-interfaces.md §4）。
 
-        Refuses (诚实失败, not a silent cascade) rather than orphaning sessions or
-        agents that still reference this project — `sessions.project_id` and
-        `agents.project_id` are both `REFERENCES projects(id)` (00-foundation.md
-        §5) and this connection runs with `PRAGMA foreign_keys=ON` (store/db.py),
-        so an unchecked DELETE would simply raise sqlite3.IntegrityError; this
-        turns that into a clear application error instead — for *every* table that
-        can hold a `project_id`, not just sessions (a project with only a
-        project-scoped Agent and no sessions hit exactly this raw IntegrityError
-        before this check existed; see the branch report's review round 1).
+        Existence and the "can't delete the default Project" checks stay here
+        (Project-domain rules — `DEFAULT_PROJECT_ID` is this module's own
+        constant). The reference-count refusals (诚实失败, not a silent cascade,
+        for *every* table that can hold a `project_id` — `sessions.project_id`,
+        `agents.project_id`, `goals.project_id`, and `crons.project_id` are all
+        `REFERENCES projects(id)`, 001_init.sql, and this connection runs with
+        `PRAGMA foreign_keys=ON`, store/db.py) plus the actual row/attachments-
+        directory deletion and WAL checkpoint now live in `store/maintenance.py::
+        delete_project` (Issue #23, 04-w5-interfaces.md §5: "project.delete（已有，
+        改为调 maintenance）") — this method is a thin call into it.
         Batch-archiving/deleting a Project's sessions first is a `session.*`
         operation (owned by branch A) — not implemented here since it isn't in the
         RPC v0 method table (design §4.1 lists only `project.list/create/delete`).
@@ -107,32 +108,7 @@ class ProjectService:
         if project_id == DEFAULT_PROJECT_ID:
             raise RpcError(INVALID_STATE, "cannot delete the default project")
 
-        session_count = self._conn.execute(
-            "SELECT COUNT(*) AS c FROM sessions WHERE project_id = ?", (project_id,)
-        ).fetchone()["c"]
-        if session_count:
-            raise RpcError(
-                INVALID_STATE,
-                f"project has {session_count} session(s); remove or reassign them first",
-                {"session_count": session_count},
-            )
-
-        agent_count = self._conn.execute(
-            "SELECT COUNT(*) AS c FROM agents WHERE project_id = ?", (project_id,)
-        ).fetchone()["c"]
-        if agent_count:
-            raise RpcError(
-                INVALID_STATE,
-                f"project has {agent_count} agent(s); remove or reassign them first",
-                {"agent_count": agent_count},
-            )
-
-        self._conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-        self._conn.commit()
-
-        attachments_dir = paths.projects_dir() / project_id
-        if attachments_dir.exists():
-            shutil.rmtree(attachments_dir)
+        maintenance.delete_project(self._conn, paths.user_root(), project_id)
 
     def ensure_default_project(self, home_path: str) -> dict[str, Any] | None:
         """Idempotently correct `proj_default`'s `path`/`name` to the real,

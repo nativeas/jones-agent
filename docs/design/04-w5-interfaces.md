@@ -15,7 +15,7 @@
 | L `w5/20-cron` | #20 | `daemon/src/jones_daemon/scheduler/`（新）、`daemon/tests/test_scheduler*.py` | 只通过 `SessionService` 公开方法（`create`/`send`/`get`）派发，不改 sessions 内部；`__main__` 加一行 |
 | M `w5/21-bundled-skills` | #21 | `daemon/src/jones_daemon/skills/bundled/**`（新）、`daemon/tests/test_bundled_skills*.py`、`tests/integration/` 对应用例 | `skills/service.py`：只把 bundled 目录接进第三层（K 已留位）；toolsets 下发：在 H 的清单里**允许** `image_gen`/`video_gen`/`tts`（改 `capabilities/` 的 toolsets 常量一处，报告标明） |
 | N `w5/22-error-panel` | #22 | `daemon/src/jones_daemon/errors/`（新：分类器 + 卡片构造）、`apps/desktop/src/renderer/**` 中的错误/终止卡片与重试动作、`daemon/tests/test_errors*.py` | `sessions/service.py`：只改 `_terminate_run`、`_on_worker_crash`、新增 `retry`（公开方法）；`sessions/methods.py` 加 `session.retry`；`kernel/acp_client.py`：只加错误分类所需的异常类型信息，不改协议 |
-| O `w5/23-storage` | #23 | `daemon/src/jones_daemon/store/maintenance.py`（新：真删、备份轮转、迁移校验）、`daemon/tests/test_storage*.py`、`docs/design/00-foundation.md` §6 追加 | `sessions/methods.py` 加 `session.delete`；`replay/store.py::purge_run` 调用；`secrets/vault.py` 原子写 fsync；`paths.py` 只加访问器 |
+| O `w5/23-storage` | #23 | `daemon/src/jones_daemon/store/maintenance.py`（新：真删、备份轮转、迁移校验）、`daemon/src/jones_daemon/store/methods.py`（新：`daemon.clear_cache`）、`daemon/tests/test_storage*.py`、`docs/design/00-foundation.md` §4.1/§6 追加 | `sessions/methods.py` 加 `session.delete`/`session.export`/`run.delete`；`replay/store.py::purge_run` 调用（未改该文件本身，只是调用方）；`secrets/vault.py` 原子写 fsync + `VaultKeyMismatchError`；`paths.py` 只加访问器（`project_attachments_dir`）；`projects/service.py::delete`（改为调 `maintenance.delete_project`，落实 §5 原文的「project.delete（已有，改为调 maintenance）」——原表格此格未列出该文件，实现时按 §5 正文补上，见 O 分支报告「契约变更」）；`store/migrator.py::_backup_before_migrating`（迁移备份保留最近 5 份，同一理由补列）；`rpc/server.py`（仅新增 `broadcast_all`/响应采样环形缓冲，"加法不改法"，该文件本就允许任何 W2 分支这样扩展）；`__main__.py` 常规「加几行」（注册 `store/methods.py`、启动期 Key 脱敏自检、日志滚动后台循环） |
 
 ## 2. L：Cron（FR11）
 
@@ -62,6 +62,12 @@
 - **备份轮转**：迁移备份 `jones.db.bak-*` 保留最近 5 份；`logs/` 滚动 7 天；`cache/` 一键清空 RPC `daemon.clear_cache`。
 - **迁移（G19）**：测试：起 daemon 于 `JONES_HOME=A`，写入会话/Agent/Skill/记忆占位，停；整目录复制到 `B`，以 `JONES_HOME=B` 启动，断言会话历史/Agent/Skill 可读，`secrets/` 因绑定密钥链而需要重录（用 `JONES_VAULT_KEY` 模拟不同机器：不同 key 解密失败必须是**显式** `vault_key_mismatch` 错误 + 提示重录，不是崩溃）。
 - **重启不重放**再验一次：`queue_items` pending 在重启后仍 pending（A 已有测试，这里做端到端：真实起停 daemon）。
+
+### 5.1 第 3 轮评审后追加的契约修订（round-3，controller ruling R-O2/R-O3，2026-09-20）
+
+- **脱敏自检改为增量、独立 executor（R-O2）**：§5 原文「跑一遍所有日志文件」现改为「只扫每个日志文件自上次扫描以来新追加的字节」——`store/maintenance.py::_read_logs_incremental` 按已解析路径把每个文件的扫描偏移持久化到 `runtime/redaction_scan_state.json`（跨重启存活，不只是同进程内多轮循环之间）。「最近 100 条 RPC 响应样本」改为「最近 32 条，每条截至 8KB」（`rpc/server.py::RECENT_RESPONSES_MAXLEN`/`RECENT_RESPONSE_SAMPLE_MAX_CHARS`）——总量从 100×4KB=400KB 降到 32×8KB=256KB，单条覆盖面反而更大。整个扫描（Key 解密、日志/DB/payload 读取、子串扫描本身）现在跑在一个独立的单线程 executor（`_REDACTION_EXECUTOR`）上，既不占事件循环也不占 `store/db.py` 的专用 DB 线程——DB 半区改为在这个 executor 线程上开一个短生命周期的只读连接（`_recent_db_texts_readonly`），不再复用共享的 `check_same_thread=True` 连接。`startup_key_redaction_self_check`/`run_redaction_self_check_loop` 的签名相应变化：`conn: sqlite3.Connection` 参数换成 `db_path: Path` + 新增 `runtime_dir: Path`。
+- **脱敏自检按来源分别设扫描上限，不再对拼接后的整体 haystack 一刀切尾部（round-3 review 意见 1）**：`MAX_HAYSTACK_CHARS`（单一全局上限，join 之后截断）被 `MAX_HAYSTACK_CHARS_PER_SOURCE`（logs/db/run_payloads/rpc_responses 四个来源各自 2MB，join 之前分别截断）取代——旧写法下，`_recent_payload_texts` 没有自己的聚合字节上限（一个 Run 可能有几十到上百个 payload 文件），一旦联合后的字符串超过全局上限，被整段挤掉的恰好是排在列表最前的日志文件，且没有任何告警。现在每个来源独立触顶、独立记日志（`_cap_haystack_source`），互不挤占。
+- **`logs/` 滚动改为完全交给 `daemon.log` 自身的 size-based rotation（R-O3）**：`store/maintenance.py::rotate_logs`/`run_log_rotation_loop`（旧的 mtime 扫描 sweep）整体删除——`logging.py::configure_logging` 的 `daemon.log` handler 从 `TimedRotatingFileHandler`（午夜切割/7 天 `backupCount`，纯时间预算）改为 `RotatingFileHandler`（`DAEMON_LOG_MAX_BYTES=10MB` × `DAEMON_LOG_BACKUP_COUNT=7`，size-based），且 stderr 输出改为只在 `isatty()` 为真时开启——launchd 托管（非交互终端）下不再重复写 stderr，`logs_dir` 下除 `daemon.log` 外不再有任何东西需要清理，原 sweep 存在的理由（daemon.out.log/daemon.err.log 永远删不掉）随之消失。`__main__.py` 不再启动/取消这个循环。
 
 ## 6. 全体
 

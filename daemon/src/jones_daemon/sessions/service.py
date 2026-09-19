@@ -709,6 +709,62 @@ class SessionService:
         self._resolve_pending_permissions(session_id=session_id, reason="stopped by user")
         return {"stopped": True}
 
+    async def delete_guard(self, session_id: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        """Round-2 review, Issue #23: `store/maintenance.py::delete_session`'s own
+        "is this session running" check only reads `runs.status='running'` from
+        SQLite — but this class's own comment on `_advance_queue` below is
+        explicit that "everything that decides 'is this session still running'
+        must happen under `self._lock(session_id)`", because the authoritative
+        answer lives in `_active_turns`/`_turn_tasks`, not the DB row. `send()`
+        writes the `turns` row, `create_task()`s the Turn, and populates
+        `_active_turns`/`_turn_tasks` all inside that same lock — the `runs` row
+        itself isn't inserted until `_run_turn` reaches `queries.create_run`,
+        well after the task starts and after `send()` has already released the
+        lock. A `session.delete` racing that window sees zero running Runs in
+        SQLite, "successfully" deletes the session's rows out from under a Turn
+        that is very much in flight, and the abandoned Turn's own later
+        `create_run` then hits a live `sessions`/`turns` foreign key that no
+        longer resolves.
+
+        This closes that window the only way that matches the class's own
+        stated invariant: acquire `self._lock(session_id)` here too, so a
+        `send()` already past its own lock acquisition is fully done updating
+        `_active_turns`/`_turn_tasks` before this ever checks them, and a
+        `send()` that hasn't started yet blocks until this either refuses or
+        (on refusal) is done. Also stops this session's worker eagerly —
+        without this, a deleted session's worker process (and the credentials
+        under its `HERMES_HOME`, see `store/maintenance.py::delete_session`'s
+        own round-2 fix) would otherwise sit alive for up to
+        `workers/manager.py`'s `DEFAULT_IDLE_TIMEOUT_S` (600s) after the
+        Session it belongs to no longer exists.
+
+        `fn` is the actual delete call (e.g. `store/maintenance.py::
+        delete_session` via `run_in_db_thread`, wrapped in `sessions/methods.py::
+        _run_delete_honestly`) — this method only owns the "is it safe to even
+        try" decision and the worker teardown, not the delete mechanics
+        themselves (04-w5-interfaces.md §1: this branch's `sessions/service.py`
+        access is for exactly this kind of guard, not a rewrite of `send()`'s
+        own logic).
+
+        Round-3 review (review item 2): `session.export {delete_after: true}`
+        goes through this same guard now too (`sessions/methods.py::
+        session_export` -> `_run_export_honestly`), not just `session.delete` —
+        it can trigger the exact same `delete_session` call and was racing the
+        same window and leaving the same live-worker `HERMES_HOME` purge bug
+        when it called `maintenance.export_session` directly."""
+        async with self._lock(session_id):
+            running = session_id in self._active_turns or (
+                session_id in self._turn_tasks and not self._turn_tasks[session_id].done()
+            )
+            if running:
+                raise RpcError(
+                    INVALID_STATE,
+                    "session has a Turn actively running; stop it before deleting",
+                    {"id": session_id},
+                )
+            await self.worker_manager.stop_worker(session_id, reason="session_deleted")
+            return await fn(*args, **kwargs)
+
     async def queue(self, session_id: str) -> list[dict[str, Any]]:
         return await run_in_db_thread(queries.list_queue_items, self.ctx.db, session_id)
 

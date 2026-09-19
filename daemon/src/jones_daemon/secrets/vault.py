@@ -42,6 +42,20 @@ class VaultError(RuntimeError):
     """
 
 
+class VaultKeyMismatchError(VaultError):
+    """Decryption failed with `InvalidTag` — the data key doesn't match the one this vault
+    file was encrypted with (PRD G19: `~/.jones/` copied to another machine, where
+    `JONES_VAULT_KEY`/the macOS Keychain holds a different key than the origin machine did).
+
+    A distinct subclass (not just a `VaultError` message) so a migration flow can tell this
+    apart from "file is corrupt" and show an actionable "re-enter your API keys" prompt
+    instead of "vault is broken" — see docs/design/04-w5-interfaces.md §5's explicit
+    "不同 key 解密失败必须是显式 vault_key_mismatch 错误，不是崩溃". Still a `VaultError`, so
+    every existing `except VaultError` call site (providers/methods.py) keeps working
+    unchanged — this narrows, it doesn't replace, that contract.
+    """
+
+
 def _decode_data_key(raw: str, *, source: str) -> bytes:
     try:
         key = base64.b64decode(raw, validate=True)
@@ -120,7 +134,7 @@ class Vault:
         try:
             plaintext = AESGCM(self._key()).decrypt(nonce, ciphertext, None)
         except InvalidTag as exc:
-            raise VaultError(
+            raise VaultKeyMismatchError(
                 f"vault file {self._path} failed to decrypt — wrong data key or corrupt file"
             ) from exc
         try:
@@ -141,9 +155,31 @@ class Vault:
         }
         self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         tmp_path = self._path.with_name(f".{self._path.name}.tmp-{os.getpid()}")
-        tmp_path.write_text(json.dumps(envelope), encoding="utf-8")
-        tmp_path.chmod(0o600)
+        # `os.replace` alone is atomic (POSIX rename never exposes a half-written file), but
+        # atomicity isn't durability: without an fsync, the tmp file's bytes can still be sitting
+        # in the OS page cache when the rename happens, and a power loss / hard crash right after
+        # can lose the write entirely (rename survives, content doesn't) or leave the directory
+        # entry pointing at zero-length/garbage data depending on filesystem/journaling mode —
+        # for `vault.enc` that means a silently empty or corrupt credential store, not just a
+        # missed update (04-w5-interfaces.md §5: "vault.py 原子写补 fsync"). fsync the file
+        # before the rename, then fsync the containing directory after — the directory entry
+        # itself (the rename) needs its own fsync to be durable, the file's fsync only covers its
+        # data.
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", closefd=True) as f:
+                f.write(json.dumps(envelope))
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
         os.replace(tmp_path, self._path)  # atomic on the same filesystem
+        dir_fd = os.open(self._path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
     def get(self, name: str) -> str | None:
         return self._read_entries().get(name)
@@ -164,6 +200,17 @@ class Vault:
 
     def names(self) -> list[str]:
         return list(self._read_entries())
+
+    def entries(self) -> dict[str, str]:
+        """Every configured entry, `{name: secret_value}`, from one `_read_entries()`
+        call. `store/maintenance.py`'s redaction self-check (round-2 review, Issue
+        #23) used to call `get()` once per configured provider name — each call
+        independently re-reads and re-decrypts the whole vault file, so N
+        configured providers meant N redundant full-vault decrypts every single
+        pass of an hourly-forever loop. `names()`/`get()` remain the normal
+        per-key API for everything else; this is for a caller that genuinely
+        needs every value at once."""
+        return dict(self._read_entries())
 
     def reset(self, entries: dict[str, str]) -> None:
         """Discard whatever is on disk — even if it's corrupt JSON or no longer decrypts with the

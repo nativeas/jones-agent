@@ -14,6 +14,9 @@
  *   - `skill.list` — added by this branch (issue #18/#19, FR12) as a real
  *     §4.1 table row (not one of the two "documented additions" above; the
  *     test below picks it up automatically since it parses the table).
+ *   - `daemon.clear_cache` / `session.delete` / `session.export` / `run.delete`
+ *     — added by issue #23 (04-w5-interfaces.md §5, G20 真删) as real §4.1
+ *     table rows, same as `skill.list` above — no special-casing needed here.
  *
  * `apps/desktop/src/main/index.ts`'s `ALLOWED_RPC_METHODS` is this exact set —
  * `src/shared/__tests__/rpcMethods.test.ts` parses 00-foundation.md §4.1's table
@@ -31,6 +34,7 @@
 export const RPC_V0_METHODS = [
   'daemon.ping',
   'daemon.status',
+  'daemon.clear_cache',
   'project.list',
   'project.create',
   'project.delete',
@@ -49,11 +53,14 @@ export const RPC_V0_METHODS = [
   'session.stop',
   'session.subscribe',
   'session.unsubscribe',
+  'session.delete',
+  'session.export',
   'turn.messages',
   'run.list',
   'run.get',
   'run.steps',
   'run.payload',
+  'run.delete',
   'permission.pending',
   'permission.decide',
   'provider.list',
