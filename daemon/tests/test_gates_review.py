@@ -9,7 +9,20 @@ from jones_daemon.permissions.review import classify
 
 
 def test_read_file_is_low_risk():
-    assert classify("read_file", {"path": "/anything"}).level == "low"
+    # Issue #13/#14 (G15): read_file used to be unconditionally `low`
+    # regardless of `path` — it now shares `write_file`'s "which real
+    # filesystem location does this touch" reasoning (`cwd` required to say
+    # "inside the workspace" -> low; see `test_read_file_with_unknown_
+    # workspace_is_medium_not_low` and the G15 tests in
+    # tests/test_cap_files_g15.py for the sensitive/out-of-workspace cases
+    # this correction exists for).
+    risk = classify("read_file", {"path": "/repo/src/main.py"}, cwd="/repo")
+    assert risk.level == "low"
+
+
+def test_read_file_with_unknown_workspace_is_medium_not_low():
+    risk = classify("read_file", {"path": "/anything"}, cwd=None)
+    assert risk.level == "medium"
 
 
 def test_search_files_is_low_risk():

@@ -45,20 +45,22 @@ from typing import Any, Literal
 # WORKER's copy of it has to stay dependency-free, see that package's
 # `__init__.py` docstring.
 from jones_daemon.kernel.plugin.jones_gate import _hard_deny, _transparency
+from jones_daemon.permissions import defaults
 
 RiskLevel = Literal["low", "medium", "high"]
 
-# Tools whose read-only-ness is knowable from the name alone (no args needed) —
-# 00-foundation.md §9.2's rule-gate-eligible browser tools plus Hermes's two
-# read-only file tools. NOTE: these are classified `low` here for cases where a
-# caller routes them through the review gate anyway (e.g. review runs before a
-# rule-gate allow-rule would have short-circuited it) — the rule gate
-# (`kernel/plugin/jones_gate`) already allows the browser subset of these
-# outright per 00-foundation.md §9.2, so in practice only `read_file`/
-# `search_files` are likely to actually reach this function via that name set.
+# Browser tools whose read-only-ness is knowable from the name alone (no args
+# needed) — 00-foundation.md §9.2's rule-gate-eligible subset. `read_file`/
+# `search_files` used to be in this set too (see git history) — Issue #13/#14
+# (G15) moved them to `_classify_read` below, since "read-only" and "safe to
+# auto-allow regardless of path" turned out not to be the same claim (see that
+# function's docstring). NOTE: these are classified `low` here for cases
+# where a caller routes them through the review gate anyway (e.g. review runs
+# before a rule-gate allow-rule would have short-circuited it) — the rule
+# gate (`kernel/plugin/jones_gate`) already allows these outright per
+# 00-foundation.md §9.2.
 _READ_ONLY_LOW = frozenset(
-    {"read_file", "search_files", "browser_navigate", "browser_snapshot",
-     "browser_take_screenshot", "browser_wait_for"}
+    {"browser_navigate", "browser_snapshot", "browser_take_screenshot", "browser_wait_for"}
 )
 
 # 02-w3-interfaces.md §1.1: "终端命令是否含网络外发 curl|wget|ssh|scp"; round 4
@@ -141,12 +143,21 @@ def _is_sensitive_home_path(resolved: Path) -> bool:
     try:
         home = Path.home().resolve(strict=False)
     except OSError:
-        return False
-    for rel in _SENSITIVE_HOME_RELATIVE_PATHS:
-        sensitive_root = home / rel
-        if resolved == sensitive_root or _is_relative_to(resolved, sensitive_root):
-            return True
-    return False
+        home = None
+    if home is not None:
+        for rel in _SENSITIVE_HOME_RELATIVE_PATHS:
+            sensitive_root = home / rel
+            if resolved == sensitive_root or _is_relative_to(resolved, sensitive_root):
+                return True
+    # Issue #13/#14 (G15): `permissions/defaults.py` is the canonical
+    # default-deny set (browser profiles, ~/.jones/secrets, system keychain,
+    # ~/.ssh/~/.aws/~/.gnupg again — overlap with the list above is
+    # intentional, not a bug: that list predates this branch and covers a
+    # few write-specific entries (shell rc files, ~/.hermes, ~/.claude)
+    # `defaults.py` doesn't repeat) — merged in here rather than duplicated,
+    # see that module's docstring for why this is where it plugs in instead
+    # of the rule gate's `gate_config`.
+    return defaults.matches(resolved) is not None
 
 
 def _workspace_root_too_wide(root: Path) -> bool:
@@ -161,9 +172,14 @@ def _workspace_root_too_wide(root: Path) -> bool:
     return _is_relative_to(home, root)
 
 
-def _classify_write(path: Any, *, cwd: str | None) -> Risk:
+def _classify_path_access(path: Any, *, cwd: str | None, verb: str) -> Risk:
+    """Shared "which real filesystem location does this touch" reasoning for
+    both a write-family call (`_classify_write`) and, since Issue #13/#14
+    (G15) found read_file/search_files needed the identical judgment (see
+    `_classify_read`'s docstring for why), a read-family one too. `verb` only
+    varies the wording of the "no resolvable path" fallback message."""
     if not isinstance(path, str) or not path:
-        return _medium("write-family tool call with no resolvable path")
+        return _medium(f"{verb} tool call with no resolvable path")
     try:
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():
@@ -179,8 +195,10 @@ def _classify_write(path: Any, *, cwd: str | None) -> Risk:
     if _is_sensitive_home_path(resolved):
         return _high(
             f"path {path!r} resolves under a sensitive user-home location (~/.ssh, ~/.aws, "
-            "a shell rc file, ~/Library/LaunchAgents, ~/.hermes, ~/.claude, …) — never low "
-            "risk regardless of the workspace boundary (review finding #9)"
+            "~/.gnupg, a shell rc file, a real browser profile, ~/.jones/secrets, the system "
+            "keychain, ~/Library/LaunchAgents, ~/.hermes, ~/.claude, …) — never low risk "
+            "regardless of the workspace boundary (review finding #9; PRD 12.1 G15; "
+            "reopen explicitly via a permissions.json allow rule for this tool, PRD 11.3)"
         )
 
     if cwd is None:
@@ -199,7 +217,37 @@ def _classify_write(path: Any, *, cwd: str | None) -> Risk:
         )
     if _is_relative_to(resolved, root):
         return _low(f"path {path!r} is inside the project workspace")
-    return _high(f"path {path!r} escapes the project workspace ({cwd!r})")
+    return _high(f"path {path!r} escapes the project workspace ({cwd!r}) — FR07's 越界路径走权限闸")
+
+
+def _classify_write(path: Any, *, cwd: str | None) -> Risk:
+    return _classify_path_access(path, cwd=cwd, verb="write-family")
+
+
+def _classify_read(path: Any, *, cwd: str | None) -> Risk:
+    """Issue #13/#14 (G15): `read_file`/`search_files` used to be
+    unconditionally `_low` (via `_READ_ONLY_LOW`) regardless of `path` — a
+    sensitive-path read (or one outside the Project workspace, FR07's "越界
+    路径走权限闸") was silently auto-allowed in auto/task mode with no
+    user-gate visibility at all. Read and write share the exact same "which
+    real filesystem location does this touch" question, so this reuses
+    `_classify_write`'s reasoning verbatim via `_classify_path_access`
+    rather than a second, independent implementation. `search_files`'s
+    `path` argument is a directory/glob root rather than a single file, but
+    the same containment reasoning applies unchanged — see 00-foundation.md
+    §3's file-tools contract for that tool's schema (both use `path` as the
+    argument name, verified against `hermes-agent`'s
+    `acp_adapter/tools.py::extract_locations`/`_START_CONTENT_BUILDERS`,
+    which read `arguments.get("path")` generically for every file tool). A
+    call with no `path` at all (e.g. a directory-less `search_files`
+    defaulting to the whole workspace) degrades to `_low` here rather than
+    `_medium`/`_high` — unlike a write-family call missing a path (which is
+    always a malformed call worth flagging), "search the whole workspace" is
+    `search_files`'s own documented default, not evidence of anything
+    suspicious."""
+    if not isinstance(path, str) or not path:
+        return _low("read-only call with no specific path to classify")
+    return _classify_path_access(path, cwd=cwd, verb="read-family")
 
 
 _PRIVILEGE_ESCALATION_PROGRAMS = frozenset({"sudo", "doas", "su", "pkexec"})
@@ -265,6 +313,19 @@ def _classify_terminal(args: dict[str, Any]) -> Risk:
     tokens = _hard_deny.tokenize(command)
     if tokens is None:
         return _high("could not parse this command for risk analysis")
+    # Issue #13/#14 (G15): a `plain` command can still reference one of
+    # `permissions/defaults.py`'s default-deny sensitive locations by an
+    # absolute or `~`-expanded path token (`cat ~/.ssh/id_rsa`) without
+    # tripping any operator/quoting-based `opaque` signal — checked before
+    # the network-egress/mutation checks below since touching a sensitive
+    # location is the more specific, more important reason to escalate.
+    sensitive_root = _terminal_token_sensitive_root(tokens)
+    if sensitive_root is not None:
+        return _high(
+            f"command references a default-deny sensitive location ({sensitive_root}) — "
+            "PRD 12.1 G15; reopen explicitly via a permissions.json allow rule for the "
+            "terminal tool, PRD 11.3"
+        )
     # Round 6 (controller ruling R11): lowercased — `CURL`/`Wget` must be
     # flagged exactly like their lowercase spellings.
     programs = {Path(t).name.lower() for t in tokens}
@@ -279,6 +340,34 @@ def _classify_terminal(args: dict[str, Any]) -> Risk:
     esc = programs & _PRIVILEGE_ESCALATION_PROGRAMS
     if esc:
         return _high(f"command escalates privileges: {', '.join(sorted(esc))}")
+    # Issue #14's "高危命令分类补全" list, the two entries not already `high`
+    # above (`sudo`/`curl|sh` are covered by the two checks just above; "写
+    # shell rc 文件" is covered by the sensitive-path check above this
+    # function plus the opaque/redirection check earlier — see
+    # `permissions/defaults.py`'s module docstring for the full mapping):
+    destructive = programs & defaults.DATA_DESTRUCTIVE_TERMINAL_PROGRAMS
+    if destructive:
+        return _high(
+            f"command uses a data-destructive tool that can wipe an entire disk/partition "
+            f"in one call: {', '.join(sorted(destructive))}"
+        )
+    recursive_escalates = programs & defaults.RECURSIVE_ESCALATES_TO_HIGH_PROGRAMS
+    if recursive_escalates and any(_hard_deny._is_recursive_flag(t) for t in tokens):
+        return _high(
+            f"recursive {', '.join(sorted(recursive_escalates))} can change an entire "
+            "directory tree's permissions/ownership in one call"
+        )
+    lowered_tokens = [t.lower() for t in tokens]
+    if "git" in programs and "push" in lowered_tokens and any(
+        t in ("--force", "-f", "--force-with-lease") or t.startswith("--force-with-lease=")
+        for t in lowered_tokens
+    ):
+        # `git push --force` to `main`/`master` is already hard-denied by a
+        # different gate entirely (`kernel/plugin/jones_gate/_hard_deny.py`,
+        # unconfigurable); this covers every OTHER target, which the hard-
+        # deny gate deliberately does not touch — force-pushing any branch
+        # can still overwrite another collaborator's history irreversibly.
+        return _high("git push --force can overwrite remote history irreversibly")
     mut = programs & _MUTATING_PROGRAMS
     if mut:
         return _medium(f"command mutates state: {', '.join(sorted(mut))}")
@@ -288,6 +377,34 @@ def _classify_terminal(args: dict[str, Any]) -> Risk:
         "plain terminal command with no network-egress or state-mutation signal "
         "(controller ruling R10, round 6)"
     )
+
+
+def _terminal_token_sensitive_root(tokens: list[str]) -> Path | None:
+    """Does any token in a `terminal` command's flat token stream, once
+    `~`-expanded, resolve under a `permissions/defaults.py` default-deny
+    root? Only absolute-after-expansion tokens are checked (no `cwd`
+    threading into `_classify_terminal`'s signature for this — the
+    realistic G15 shape, `cat ~/.ssh/id_rsa`, always uses `~` or an already-
+    absolute path; a relative reference would additionally need the
+    session's workspace root, adding complexity for a case this function
+    deliberately leaves to the existing "escapes the project workspace"
+    reasoning `_classify_read`/`_classify_write` already cover for the
+    file-tool equivalents of the same access)."""
+    for tok in tokens:
+        try:
+            candidate = Path(tok).expanduser()
+        except (OSError, ValueError):
+            continue
+        if not candidate.is_absolute():
+            continue
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError:
+            continue
+        root = defaults.matches(resolved)
+        if root is not None:
+            return root
+    return None
 
 
 def _classify_browser_evaluate(args: dict[str, Any]) -> Risk:
@@ -309,6 +426,8 @@ def classify(tool_name: str, args: dict[str, Any] | None, *, cwd: str | None = N
     args = args if isinstance(args, dict) else {}
     if tool_name in _READ_ONLY_LOW:
         return _low(f"{tool_name} is read-only")
+    if tool_name in ("read_file", "search_files"):
+        return _classify_read(args.get("path"), cwd=cwd)
     if tool_name in ("write_file", "patch"):
         return _classify_write(args.get("path"), cwd=cwd)
     if tool_name == "terminal":

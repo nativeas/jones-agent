@@ -176,6 +176,53 @@ def _extract_tool_call(params: dict[str, Any]) -> tuple[str, dict[str, Any], str
     return "", {}, None
 
 
+def _extract_diff_content(content: Any) -> dict[str, Any] | None:
+    """Find an ACP diff-kind `ToolCallContent` block (`{"type": "diff",
+    "path": ..., "newText": ..., "oldText": ...}` — the wire shape of the
+    installed `agent-client-protocol==0.9.0` package's `FileEditToolCallContent`/
+    `Diff` schema, `newText`/`oldText` aliased from `new_text`/`old_text`;
+    verified against `venv/lib/python3.11/site-packages/acp/schema.py`) in a
+    `content` value — either the array ACP's `tool_call`/`tool_call_update`
+    events carry, or the single dict some ACP shapes use — and return it as
+    `{"path", "old_text", "new_text"}` (this codebase's own snake_case
+    convention), or `None` if no such block is present.
+
+    Issue #13 (FR07's "写入前后 diff 在 Step 中可见"): source-verified against
+    the installed `hermes-agent` checkout that Hermes DOES send this shape
+    for `write_file`/`patch` over ACP — `acp_adapter/tools.py::
+    build_tool_start` (when the edit auto-approves, `acp_adapter/events.py`'s
+    `make_tool_progress_cb`) and `acp_adapter/edit_approval.py::
+    build_acp_edit_tool_call` (the `session/request_permission` request
+    itself, when the edit needs a human decision) both call `acp.tool_diff_
+    content(path=..., old_text=..., new_text=...)`. The fallback this
+    contract's original wording anticipated ("不带 → 在 jones_gate 的
+    post_tool_call 里算 diff 写到 payload") is therefore not needed in
+    practice — see the PR report's "契约变更" section for the full
+    evidence trail and why the actual hook points are `_handle_tool_call_
+    start`/`_on_request_permission`, not `_handle_tool_call_update` alone as
+    03-w4-interfaces.md §3 originally assumed."""
+    blocks: list[Any]
+    if isinstance(content, list):
+        blocks = content
+    elif isinstance(content, dict):
+        blocks = [content]
+    else:
+        return None
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != "diff":
+            continue
+        path = block.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        new_text = block.get("newText")
+        return {
+            "path": path,
+            "old_text": block.get("oldText"),
+            "new_text": new_text if isinstance(new_text, str) else "",
+        }
+    return None
+
+
 @dataclass
 class _TurnContext:
     turn_id: str
@@ -193,6 +240,23 @@ class _TurnContext:
     # current value (which may have advanced past it by the time a `tool_call_update`
     # for an earlier, still-in-flight call arrives).
     step_seq_by_id: dict[str, int] = field(default_factory=dict)
+    # step_id -> {"path","old_text","new_text"} — Issue #13's "写入 diff 在
+    # Step 中可见" (FR07). Populated by `_handle_tool_call_start` (an ACP
+    # diff-kind `ToolCallContent` on the `tool_call` "started" event, present
+    # only when Hermes auto-approved the edit — `acp_adapter/tools.py`'s
+    # `build_tool_start`) and by `_on_request_permission` (the SAME diff
+    # content, present instead on the `session/request_permission` request
+    # itself, when the edit needs a human decision —
+    # `acp_adapter/edit_approval.py::build_acp_edit_tool_call` — verified
+    # against the installed `hermes-agent` checkout: neither path ever runs
+    # for the same call, see `_extract_diff_content`'s docstring). Consumed
+    # (popped) by `_handle_tool_call_update` when that step's completion
+    # event arrives — kept off the DB until then because `write_file`/
+    # `patch`'s own `tool_call_update` never repeats the diff content
+    # (`acp_adapter/tools.py::_build_tool_complete_content` has no
+    # write_file/patch special case), so this is the only place the
+    # in-flight daemon process ever has it.
+    step_diffs: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -1084,6 +1148,21 @@ class SessionService:
         if tool_call_id:
             ctx_turn.tool_call_steps[tool_call_id] = step_id
             ctx_turn.step_started_at[step_id] = time.monotonic()
+        # Issue #13 (FR07 diff-in-Step): an auto-approved write_file/patch's
+        # "started" event carries the diff directly (see
+        # `_extract_diff_content`'s docstring for why this, not the
+        # completion event, is where it lives) — stash it now, merged into
+        # the Step by `_handle_tool_call_update` once that call completes.
+        # The needs-approval path's diff arrives separately, via
+        # `_on_request_permission`'s own `tool_call.content` (a DIFFERENT
+        # synthetic `toolCallId` Hermes's edit-approval channel invents —
+        # see that method's docstring), stashed there instead; the two
+        # paths are mutually exclusive per call (verified against the
+        # installed checkout: `edit_approval.py`'s auto-approve check runs
+        # BEFORE it would ever send a `session/request_permission` at all).
+        diff = _extract_diff_content(update.get("content"))
+        if diff is not None:
+            ctx_turn.step_diffs[step_id] = diff
         # ACP's ToolCall schema carries a human-readable `title`, not a raw tool
         # name (see kernel/acp_client.py's docstring evidence) — `title` is the
         # closest honest value for the `tool` column until Hermes's wire schema
@@ -1113,11 +1192,18 @@ class SessionService:
         started = ctx_turn.step_started_at.get(step_id)
         if started is not None and status in ("completed", "failed"):
             duration_ms = int((time.monotonic() - started) * 1000)
+        # Issue #13 (FR07 diff-in-Step): the diff `_handle_tool_call_start`/
+        # `_on_request_permission` stashed for this step (see `_TurnContext.
+        # step_diffs`'s docstring) — popped, not peeked, so a step can only
+        # ever attach its diff to ONE completion event even if Hermes were
+        # to send more than one `tool_call_update` for the same
+        # `toolCallId` (defensive; not observed in practice).
+        diff = ctx_turn.step_diffs.pop(step_id, None)
         result_summary = None
         dumped_output: str | None = None
-        if raw_output is not None:
-            # Serialize `raw_output` exactly once. Round-1 review fix: this used
-            # to be dumped twice — once here (truncated to 4000 chars for
+        if raw_output is not None or diff is not None:
+            # Serialize exactly once. Round-1 review fix: this used to be
+            # dumped twice — once here (truncated to 4000 chars for
             # `result_summary`) and again, independently, inside
             # `_write_step_payload` — and the second dump ran on *this* event
             # loop thread, before ever reaching `asyncio.to_thread` (CPython's C
@@ -1128,7 +1214,22 @@ class SessionService:
             # 02-w3-interfaces.md §3's "回放 payload 写入异步、不阻塞 ACP 读循环"
             # is about. `dumped_output` (the one dump) feeds both the truncated
             # summary and the full-fidelity payload below.
-            dumped_output = json.dumps(raw_output, default=str, ensure_ascii=False)
+            #
+            # `diff` only ever exists for `write_file`/`patch` (see
+            # `_extract_diff_content`'s docstring) — wrapping `raw_output`
+            # under a `"raw_output"` key ONLY when a diff is also present
+            # keeps every other tool's `result_summary`/payload shape
+            # byte-for-byte unchanged from before this branch (still the raw
+            # `json.dumps(raw_output, ...)`), so nothing downstream that
+            # parses an existing tool's `result_summary` (e.g. G/#12's replay
+            # UI) needs to change for this addition.
+            if diff is not None:
+                to_dump: Any = {"diff": diff}
+                if raw_output is not None:
+                    to_dump["raw_output"] = raw_output
+            else:
+                to_dump = raw_output
+            dumped_output = json.dumps(to_dump, default=str, ensure_ascii=False)
             result_summary = dumped_output[:4000]
         row = await run_in_db_thread(
             queries.update_step, self.ctx.db, step_id,
@@ -1386,6 +1487,38 @@ class SessionService:
             or (session["mode"] if session is not None else "task")
         )
         risk = review.classify(tool_name, tool_args, cwd=cwd)
+
+        # Issue #13 (FR07 diff-in-Step), needs-approval path: `write_file`/
+        # `patch` going through `acp_adapter/edit_approval.py`'s own
+        # channel carries the diff on THIS request's `tool_call.content`
+        # (`_extract_diff_content`'s docstring), but that channel's
+        # `toolCallId` is a synthetic `edit-approval-N` id
+        # (`edit_approval.py::build_acp_edit_tool_call`) from a counter
+        # completely independent of the real ACP tool_call_id
+        # `_handle_tool_call_start` assigned moments earlier for the SAME
+        # call — so `step_id` above (looked up by that synthetic id) is
+        # always `None` for this shape. Hermes dispatches tool calls
+        # strictly sequentially within one Turn in this codebase (v1 has no
+        # parallel tool execution — `delegate_task` stays off per
+        # 03-w4-interfaces.md §2), and `tool.started` always fires (and
+        # therefore `ctx_turn.tool_call_steps` always gains its entry)
+        # before the dispatcher can reach this edit-approval gate for that
+        # same call (verified against the installed checkout:
+        # `agent/tool_executor.py::_begin_tool_execution` fires `tool.
+        # started` before `model_tools.py::_pre_dispatch_guards` — which
+        # calls `maybe_require_edit_approval` — ever runs) — so the most
+        # recently started, still-open step in this Turn IS this call's
+        # real step. A concurrent multi-write Turn (not possible in v1,
+        # documented above) would be the one scenario this heuristic could
+        # mis-attribute a diff to the wrong sibling step; written down here
+        # rather than silently assumed away.
+        diff = _extract_diff_content(tool_call.get("content"))
+        if diff is not None and ctx_turn is not None:
+            target_step_id = step_id or next(
+                reversed(ctx_turn.tool_call_steps.values()), None
+            )
+            if target_step_id is not None:
+                ctx_turn.step_diffs[target_step_id] = diff
 
         if tool_name in TERMINAL_LIKE_TOOLS:
             decided = await self._decide_terminal_like_permission(

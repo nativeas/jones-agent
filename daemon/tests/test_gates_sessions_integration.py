@@ -152,7 +152,18 @@ async def test_auto_mode_low_risk_auto_allows_with_no_pending_broadcast(tmp_path
     service = await _make_service(tmp_path, monkeypatch)
     try:
         session_id = await _new_session(service, mode="auto")
-        prompt = _custom_permission_prompt("read_file", {"path": "/tmp/x"}, mode="auto")
+        # `browser_navigate` (unconditionally `low`, no path/cwd involved) rather
+        # than `read_file`: Issue #13/#14 (G15) made `read_file`'s risk depend on
+        # `path` vs. the session's workspace root, and the DEFAULT project's cwd
+        # is still the placeholder `Path.home()` (01-w2-interfaces.md §2.2) — a
+        # root `permissions/review.py::_workspace_root_too_wide` always treats as
+        # "too wide to mean anything by 'inside the workspace'", so no `read_file`
+        # path is ever genuinely `low` here until a real Project cwd lands
+        # (see tests/test_cap_files_g15.py for the read_file-specific coverage
+        # this correction exists for).
+        prompt = _custom_permission_prompt(
+            "browser_navigate", {"url": "https://example.com"}, mode="auto"
+        )
         await service.send(session_id, prompt)
         await _wait_until(
             lambda: service.ctx.server.events("permission.decided")
@@ -201,7 +212,11 @@ async def test_task_mode_low_risk_auto_allows_with_no_pending_broadcast_G06(tmp_
     service = await _make_service(tmp_path, monkeypatch)
     try:
         session_id = await _new_session(service, mode="task")
-        prompt = _custom_permission_prompt("read_file", {"path": "/tmp/x"}, mode="task")
+        # See test_auto_mode_low_risk_auto_allows_with_no_pending_broadcast's
+        # comment just above for why `browser_navigate`, not `read_file`.
+        prompt = _custom_permission_prompt(
+            "browser_navigate", {"url": "https://example.com"}, mode="task"
+        )
         await service.send(session_id, prompt)
         await _wait_until(
             lambda: service.ctx.server.events("permission.decided")
