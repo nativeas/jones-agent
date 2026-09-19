@@ -11,6 +11,14 @@ def _table_names(conn: sqlite3.Connection) -> set[str]:
     return {row["name"] for row in rows}
 
 
+def _latest_migration_version() -> int:
+    # Not hardcoded to a fixed number: this worktree only carries its own migration
+    # (004; see docs/design/01-w2-interfaces.md §0 — 002/003 belong to sibling W2
+    # branches not present here), and other worktrees carry different subsets, so
+    # "how many migrations exist" isn't a stable constant across branches/merges.
+    return max(v for v, _ in migrator._discover_migrations(migrator.MIGRATIONS_DIR))
+
+
 def test_empty_database_reports_version_zero(tmp_path):
     conn = connect(tmp_path / "jones.db")
     try:
@@ -19,13 +27,14 @@ def test_empty_database_reports_version_zero(tmp_path):
         conn.close()
 
 
-def test_apply_pending_migrates_empty_db_to_v1(tmp_path):
+def test_apply_pending_migrates_empty_db_to_latest(tmp_path):
     conn = connect(tmp_path / "jones.db")
     try:
         version = migrator.apply_pending(conn)
 
-        assert version == 1
-        assert migrator.current_version(conn) == 1
+        latest = _latest_migration_version()
+        assert version == latest
+        assert migrator.current_version(conn) == latest
         tables = _table_names(conn)
         for expected in [
             "projects",
@@ -53,7 +62,7 @@ def test_apply_pending_is_idempotent(tmp_path):
     try:
         migrator.apply_pending(conn)
         version = migrator.apply_pending(conn)
-        assert version == 1
+        assert version == _latest_migration_version()
         assert conn.execute("SELECT COUNT(*) AS n FROM schema_version").fetchone()["n"] == 1
     finally:
         conn.close()
@@ -100,8 +109,10 @@ def test_apply_pending_backs_up_the_db_file_before_migrating(tmp_path):
     try:
         migrator.apply_pending(conn)
         backups = _backups(tmp_path)
-        assert len(backups) == 1
-        assert backups.pop().name.startswith("jones.db.bak-1-")
+        pending = migrator._discover_migrations(migrator.MIGRATIONS_DIR)
+        assert len(backups) == len(pending)
+        backup_versions = {b.name.split("-", 3)[1] for b in backups}
+        assert backup_versions == {str(v) for v, _ in pending}
     finally:
         conn.close()
 
@@ -110,11 +121,11 @@ def test_apply_pending_skips_backup_when_nothing_is_pending(tmp_path):
     db_path = tmp_path / "jones.db"
     conn = connect(db_path)
     try:
-        migrator.apply_pending(conn)  # v0 -> v1: db file exists by now, gets backed up
+        migrator.apply_pending(conn)  # v0 -> latest: db file exists by now, gets backed up
         for backup in _backups(tmp_path):
             backup.unlink()  # prove the *next* (no-op) call doesn't recreate one
 
-        migrator.apply_pending(conn)  # already at v1: nothing pending
+        migrator.apply_pending(conn)  # already at latest: nothing pending
         assert not _backups(tmp_path)
     finally:
         conn.close()

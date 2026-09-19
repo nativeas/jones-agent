@@ -15,11 +15,17 @@ import os
 import signal
 import sqlite3
 import sys
-import types
+from pathlib import Path
+from types import SimpleNamespace
 from typing import TextIO
 
 from jones_daemon import paths
+from jones_daemon.agents.methods import register as register_agents
+from jones_daemon.agents.service import AgentService
+from jones_daemon.config.methods import register as register_config
 from jones_daemon.logging import configure_logging, get_logger
+from jones_daemon.projects.methods import register as register_projects
+from jones_daemon.projects.service import ProjectService
 from jones_daemon.providers import methods as providers_methods
 from jones_daemon.rpc.methods import register_builtin_methods
 from jones_daemon.rpc.server import RpcServer
@@ -93,14 +99,34 @@ async def _run() -> None:
         conn, version = await run_in_db_thread(_open_store)
         logger.info("store ready", extra={"detail": {"schema_version": version}})
 
+        # C (#8 #9): default Project/Agent bootstrap + project/agent/settings RPC.
+        # `ctx` here is a minimal duck-typed stand-in for the shared DaemonContext
+        # (docs/design/01-w2-interfaces.md §1, created by branch A in
+        # jones_daemon/context.py — not present in this branch's history since all
+        # W2 branches were cut from the same pre-W2 main commit). It only needs a
+        # `.db` attribute, which every module in this file's `register()` calls
+        # relies on — swapping in the real DaemonContext at merge time needs no
+        # change on the projects/agents/config side, only here.
+        def _bootstrap_projects_and_agents() -> None:
+            ProjectService(conn).ensure_default_project(str(Path.home()))
+            agent_service = AgentService(conn)
+            agent_service.ensure_default_agent_file()
+            agent_service.sync_from_files()
+
+        await run_in_db_thread(_bootstrap_projects_and_agents)
+        ctx = SimpleNamespace(db=conn)
+
         server = RpcServer(paths.sock_file())
         register_builtin_methods(server)
-        # Temporary stand-in for the shared `DaemonContext` (docs/design/01-w2-interfaces.md §1,
-        # owned by branch A, not yet landed in this worktree) — `providers_methods.register()`
-        # only reads `ctx.db`, so a minimal namespace carrying that one attribute is enough to
-        # wire provider.*/model.list up now rather than leaving them unreachable until §1 lands.
-        # Replace with the real `DaemonContext` once it exists; no other call site changes.
-        providers_methods.register(server, types.SimpleNamespace(db=conn))
+        # `ctx` is a minimal duck-typed stand-in for the shared `DaemonContext`
+        # (docs/design/01-w2-interfaces.md §1, owned by branch A, not yet landed in
+        # this worktree) — every register() below only reads `ctx.db`, so one shared
+        # namespace carrying that attribute covers all of them. Replace with the
+        # real DaemonContext once it exists; no other call site changes.
+        providers_methods.register(server, ctx)
+        register_projects(server, ctx)
+        register_agents(server, ctx)
+        register_config(server, ctx)
         await server.start()
         logger.info(
             "daemon listening",
