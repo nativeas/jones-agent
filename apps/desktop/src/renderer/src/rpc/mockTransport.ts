@@ -1,6 +1,7 @@
 import type { RpcCallResult, RpcTransport } from './transport'
 import type {
   Agent,
+  CapabilityListResult,
   Message,
   PermissionRequest,
   Project,
@@ -8,6 +9,7 @@ import type {
   QueueItem,
   Session,
   SessionMode,
+  SkillEntry,
   Step,
   TerminationCard
 } from '../domain/types'
@@ -284,6 +286,16 @@ export class MockTransport implements RpcTransport {
         this.settings = { ...this.settings, ...params.patch }
         return this.settings
 
+      // skill.list / capability.list: neither is real daemon behavior yet in
+      // this dev-mode mock (skill.list is this branch's own new RPC;
+      // capability.list is H/#17, not landed) — static, believable data so
+      // the Capabilities settings tab is demoable via `pnpm dev:mock` without
+      // a real daemon (03-w4-interfaces.md §5's transparency page).
+      case 'skill.list':
+        return { skills: this.mockSkills() }
+      case 'capability.list':
+        return this.mockCapabilities()
+
       default:
         throw new Error(`mock transport: 未实现的方法 ${method}`)
     }
@@ -293,6 +305,46 @@ export class MockTransport implements RpcTransport {
     const session = this.sessions.find((s) => s.id === id)
     if (!session) throw new Error('session not found')
     return session
+  }
+
+  private mockSkills(): SkillEntry[] {
+    return [
+      {
+        name: 'research',
+        description: '带引用的深度调研（示例数据，见 mockTransport.ts）',
+        tier: 'builtin',
+        source_path: '<bundled>/research/SKILL.md',
+        valid: true,
+        error: null
+      },
+      {
+        name: 'weekly-report',
+        description: '整理本周 Run 生成周报',
+        tier: 'user',
+        source_path: '~/.jones/skills/weekly-report/SKILL.md',
+        valid: true,
+        error: null
+      }
+    ]
+  }
+
+  private mockCapabilities(): CapabilityListResult {
+    return {
+      tools: [
+        { name: 'read_file', source: 'builtin', enabled: true, actually_loaded: true },
+        { name: 'write_file', source: 'builtin', enabled: true, actually_loaded: true },
+        { name: 'terminal', source: 'builtin', enabled: true, actually_loaded: true },
+        {
+          name: 'kanban_create',
+          source: 'builtin',
+          enabled: false,
+          hidden_reason: 'not_in_allowlist',
+          actually_loaded: false
+        },
+        { name: 'research', source: 'skill', enabled: true, actually_loaded: true }
+      ],
+      drift: []
+    }
   }
 
   private mockModels(provider?: string): Array<{ provider: string; id: string; label: string }> {
@@ -363,7 +415,7 @@ export class MockTransport implements RpcTransport {
       session_id: session.id,
       turn_id: turnId,
       role: 'user',
-      content: text,
+      content: { kind: 'text', text },
       seq: (this.messages.get(session.id)?.length ?? 0) + 1
     }
     this.pushMessage(session.id, userMessage)
@@ -407,14 +459,12 @@ export class MockTransport implements RpcTransport {
   private requestPermissionThenContinue(session: Session, runId: string, turnId: string, reason: string): void {
     const requestId = nextId('perm')
     const request: PermissionRequest = {
-      id: requestId,
+      request_id: requestId,
       session_id: session.id,
       gate: 'user',
       risk: 'high',
-      action_description: reason,
-      tool: 'terminal.exec',
-      args_summary: reason,
-      requested_at: new Date().toISOString()
+      reasons: [reason],
+      tool_call: { title: reason, kind: 'execute' }
     }
     this.permissions.set(requestId, request)
     this.emit('permission.requested', request)
@@ -437,7 +487,7 @@ export class MockTransport implements RpcTransport {
       session_id: session.id,
       turn_id: turnId,
       role: 'assistant',
-      content: '',
+      content: { kind: 'text', text: '' },
       seq: (this.messages.get(session.id)?.length ?? 0) + 1,
       streaming: true
     }
@@ -479,7 +529,7 @@ export class MockTransport implements RpcTransport {
         this.maybeSendNextQueued(session)
         return
       }
-      assistantMessage.content += chunk
+      assistantMessage.content = { ...assistantMessage.content, text: assistantMessage.content.text + chunk }
       this.emit('message.delta', { session_id: session.id, turn_id: turnId, message_id: messageId, delta: chunk })
       i += 1
       this.schedule(emitNextChunk)

@@ -11,6 +11,9 @@
  *     §4.1 never had a way to discover a historical Run id at all besides the
  *     live `turn.started` notification — `run.list` is what the 回放 view's
  *     "选一个 Run" list actually calls.
+ *   - `skill.list` — added by this branch (issue #18/#19, FR12) as a real
+ *     §4.1 table row (not one of the two "documented additions" above; the
+ *     test below picks it up automatically since it parses the table).
  *
  * `apps/desktop/src/main/index.ts`'s `ALLOWED_RPC_METHODS` is this exact set —
  * `src/shared/__tests__/rpcMethods.test.ts` parses 00-foundation.md §4.1's table
@@ -58,6 +61,7 @@ export const RPC_V0_METHODS = [
   'provider.delete_key',
   'model.list',
   'capability.list',
+  'skill.list',
   'cron.list',
   'cron.upsert',
   'cron.delete',

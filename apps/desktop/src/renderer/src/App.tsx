@@ -4,6 +4,7 @@ import { useLayoutStore } from './store/layoutStore'
 import { useSessionsStore } from './store/sessionsStore'
 import { useNavigationStore } from './store/navigationStore'
 import { DaemonStatusCard } from './components/DaemonStatusCard'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { LeftPane } from './components/left/LeftPane'
 import { CenterPane } from './components/CenterPane'
 import { RightPane } from './components/right/RightPane'
@@ -50,23 +51,35 @@ export function App(): JSX.Element {
         <DaemonStatusCard transport={transport} />
         <button onClick={toggleRightPane}>{rightPaneOpen ? '▶' : '◀'} 详情</button>
       </header>
-      {view === 'settings' ? (
-        <SettingsPage transport={transport} />
-      ) : (
-        <div className="shell__body">
-          {leftPaneOpen && (
-            <aside className="shell__pane shell__pane--left">
-              <LeftPane />
-            </aside>
-          )}
-          <CenterPane transport={transport} />
-          {rightPaneOpen && (
-            <aside className="shell__pane shell__pane--right">
-              <RightPane transport={transport} />
-            </aside>
-          )}
-        </div>
-      )}
+      {/* jones-agent#34 / PRD G08 / N16: one bad render below (a message
+       * whose shape drifted from what the daemon actually sent, e.g.) must
+       * not take the whole shell — including the topbar's session/settings
+       * nav above — down with it.
+       *
+       * 评审第 1 轮 #4：`key={view}` — 没有它，boundary 的 `state.error` 和
+       * `children` 无关，会话区崩溃后点"设置"切到 SettingsPage，React 认为
+       * 还是同一个 ErrorBoundary 实例，继续渲染 fallback（导航"能点"但画面
+       * 不动，对用户等同白屏）。换 `view` 时 key 变化 → React 卸载重挂这个
+       * 子树 → boundary 的 state 随之重置，真正做到"崩溃后导航仍可用"。 */}
+      <ErrorBoundary key={view}>
+        {view === 'settings' ? (
+          <SettingsPage transport={transport} />
+        ) : (
+          <div className="shell__body">
+            {leftPaneOpen && (
+              <aside className="shell__pane shell__pane--left">
+                <LeftPane />
+              </aside>
+            )}
+            <CenterPane transport={transport} />
+            {rightPaneOpen && (
+              <aside className="shell__pane shell__pane--right">
+                <RightPane transport={transport} />
+              </aside>
+            )}
+          </div>
+        )}
+      </ErrorBoundary>
     </div>
   )
 }

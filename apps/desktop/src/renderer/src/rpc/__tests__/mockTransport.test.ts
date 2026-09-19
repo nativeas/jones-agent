@@ -117,7 +117,7 @@ describe('MockTransport', () => {
 
     let requestId: string | null = null
     transport.on('permission.requested', (params) => {
-      requestId = (params as { id: string }).id
+      requestId = (params as { request_id: string }).request_id
     })
     let completed = false
     transport.on('message.completed', () => {

@@ -26,7 +26,7 @@ function renderEntry(entry: TimelineEntry, props: MessageListProps): JSX.Element
       <div className={`message-bubble message-bubble--${message.role}`}>
         <div className="message-bubble__role">{ROLE_LABEL[message.role] ?? message.role}</div>
         <div className="message-bubble__content">
-          {message.content}
+          {message.content.text}
           {message.streaming && <span className="message-bubble__cursor" aria-hidden>▍</span>}
         </div>
       </div>

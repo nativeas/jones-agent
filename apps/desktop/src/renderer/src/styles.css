@@ -667,3 +667,99 @@ body {
   font-size: 0.85em;
   margin-top: 2px;
 }
+
+/* --- permission card reasons (03-w4-interfaces.md §5) --- */
+
+.permission-card__reasons {
+  margin: 2px 0;
+  padding-left: 18px;
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+/* --- error boundary (jones-agent#34 / PRD G08 N16) --- */
+
+.error-boundary {
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.error-boundary__title {
+  font-weight: 600;
+  color: #d33;
+}
+
+.error-boundary__message {
+  font-size: 12px;
+  opacity: 0.7;
+  word-break: break-word;
+}
+
+/* --- capability settings / 能力透明 (03-w4-interfaces.md §5, issue #18/#19) --- */
+
+.capability-settings {
+  max-width: 100%;
+}
+
+.capability-settings__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.capability-settings__section {
+  margin-top: 12px;
+}
+
+.capability-settings__drift-warning {
+  border: 1px solid #d33;
+  background: #d331;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-top: 8px;
+}
+
+.capability-table {
+  border-collapse: collapse;
+  font-size: 12px;
+  width: 100%;
+}
+
+.capability-table th,
+.capability-table td {
+  border-bottom: 1px solid #3332;
+  text-align: left;
+  padding: 4px 8px;
+}
+
+.capability-table__row--hidden,
+.capability-table__row--invalid {
+  opacity: 0.55;
+}
+
+/* 评审第 1 轮 #5：项目级 Skill 未经用户确认就会进 Agent 的装配集合——见
+   CapabilitySettings.tsx 顶部注释。这里只是让透明页如实标出来，不是权限控制。 */
+.capability-settings__project-skill-warning {
+  border: 1px solid #d90;
+  background: #d901;
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.capability-table__row--project {
+  background: #d901;
+}
+
+.capability-table__badge {
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid #d90;
+  color: #a60;
+  font-size: 10px;
+}
