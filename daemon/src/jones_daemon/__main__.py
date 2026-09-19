@@ -90,7 +90,13 @@ def _release_single_instance_lock(fh: TextIO) -> None:
 
 
 async def _run() -> None:
-    configure_logging()
+    # Issue #23 round-1 review (04-w5-interfaces.md §5): pass `logs_dir` so the
+    # daemon's own structured log stream gets real, self-managed 7-day rotation
+    # (see `configure_logging`'s docstring) — the mtime-based `rotate_logs` sweep
+    # below never could, for the two files launchd actually keeps under
+    # `logs_dir` (they're continuously appended to for as long as the process
+    # runs, so their mtime never goes stale).
+    configure_logging(logs_dir=paths.logs_dir())
     lock_fh = _acquire_single_instance_lock()
 
     try:
@@ -158,24 +164,27 @@ async def _run() -> None:
             payload = {"code": code, "message": message, "detail": detail}
             await server.broadcast_all("daemon.error", payload)
 
-        async def _run_startup_redaction_check() -> None:
-            # 启动期 Key 脱敏自检 (04-w5-interfaces.md §5, G03/N02): a failure to
-            # *run* the check (e.g. the vault file exists but its data key is
-            # unavailable) is logged, not fatal to daemon startup — a malfunctioning
-            # self-check must not itself become an outage; a real *hit* (a key
-            # actually found unredacted) is what must never be silent, via
-            # `_on_redaction_hit` -> `daemon.error` above.
-            try:
-                await maintenance.startup_key_redaction_self_check(
-                    vault=vault,
-                    logs_dir=paths.logs_dir(),
-                    recent_response_samples=server.recent_response_samples(),
-                    on_hit=_on_redaction_hit,
-                )
-            except Exception:  # noqa: BLE001 - see comment above: log, don't crash startup
-                logger.error("startup key-redaction self-check failed to run", exc_info=True)
-
-        redaction_check_task = asyncio.create_task(_run_startup_redaction_check())
+        # 启动期 Key 脱敏自检 (04-w5-interfaces.md §5, G03/N02), as a *periodic*
+        # background loop rather than a single startup-time call. Round-1 review:
+        # a single call fires before `server.serve_forever()` has accepted its
+        # first client, so `server.recent_response_samples()` at that instant is
+        # always empty — the "最近 100 条 RPC 响应样本" half of the contract never
+        # actually scanned anything. Looping it (same lifecycle as
+        # `log_rotation_task` below: started here, cancelled on shutdown) means
+        # every pass after daemon startup's first one has real response bodies to
+        # look at. A malfunctioning self-check pass (e.g. the vault's data key is
+        # unavailable) is logged and skipped inside the loop, not fatal to the
+        # daemon — see `run_redaction_self_check_loop`'s own docstring; a real
+        # *hit* (a key actually found unredacted) is what must never be silent,
+        # via `_on_redaction_hit` -> `daemon.error` above.
+        redaction_check_task = asyncio.create_task(
+            maintenance.run_redaction_self_check_loop(
+                vault=vault,
+                logs_dir=paths.logs_dir(),
+                recent_response_samples=server.recent_response_samples,
+                on_hit=_on_redaction_hit,
+            )
+        )
 
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -188,6 +197,11 @@ async def _run() -> None:
 
         serve_task.cancel()
         log_rotation_task.cancel()
+        # Round-1 review: this became a long-running loop (see
+        # `run_redaction_self_check_loop`'s docstring above) instead of a
+        # one-shot task — it must be cancelled like `log_rotation_task`, not just
+        # awaited, or shutdown would hang forever on its `while True`.
+        redaction_check_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await serve_task
         with contextlib.suppress(asyncio.CancelledError):

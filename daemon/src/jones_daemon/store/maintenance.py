@@ -26,7 +26,7 @@ import json
 import shutil
 import sqlite3
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +36,35 @@ from jones_daemon.replay import store as replay_store
 from jones_daemon.rpc.errors import INVALID_STATE, NOT_FOUND, RpcError
 
 logger = get_logger("store.maintenance")
+
+
+class PartialDeleteError(RuntimeError):
+    """A delete's SQLite rows are already committed (irreversible at this point —
+    see each function's own transaction below) but a step *after* the commit
+    failed partway: purging a Run's payload directory, or the trailing WAL
+    checkpoint. 04-w5-interfaces.md §6: "任何删除半途失败 → 记录部分完成状态并
+    daemon.error, 不假装删完" — this type is what lets the RPC layer (which has
+    the `RpcServer` needed to broadcast `daemon.error`, unlike this module) tell
+    the two shapes of "半途" apart instead of both surfacing as an opaque
+    `INTERNAL_ERROR`:
+
+    - `detail["fully_deleted"] is False`: rows are gone but at least one payload
+      directory was *not* purged — genuinely incomplete, the caller must not
+      report this as a plain success.
+    - `detail["fully_deleted"] is True`: rows + every payload directory are
+      gone; only the trailing `wal_checkpoint(TRUNCATE)` stayed busy
+      (`CheckpointBusyError`) — the delete itself fully succeeded, so the
+      caller must *not* turn this into a failure response (that would be
+      reporting a completed delete as failed, the opposite mistake), while
+      still surfacing the anomaly via `daemon.error` for whoever is watching
+      disk/WAL health.
+
+    `detail` is JSON-safe (str/int/list/dict only) and meant to be broadcast
+    verbatim as the `daemon.error` payload's `detail` field."""
+
+    def __init__(self, message: str, *, detail: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.detail = detail
 
 
 class CheckpointBusyError(RuntimeError):
@@ -92,6 +121,12 @@ def delete_session(conn: sqlite3.Connection, user_root: Path, session_id: str) -
         codebase stops a live worker's ACP event stream before its target rows
         vanish out from under it — refusing is honest, silently deleting while a
         worker still writes Steps for this Run would not be).
+
+    The SQLite cascade itself is one transaction (rolls back whole on failure,
+    see the `try`/`except sqlite3.Error` below) — but payload-purge and the
+    trailing checkpoint run *after* that commit, where a rollback is no longer
+    possible. A failure in either of those raises `PartialDeleteError` instead
+    of a bare exception (04-w5-interfaces.md §6, see that type's docstring).
     """
     row = conn.execute("SELECT is_main FROM sessions WHERE id = ?", (session_id,)).fetchone()
     if row is None:
@@ -147,10 +182,45 @@ def delete_session(conn: sqlite3.Connection, user_root: Path, session_id: str) -
         conn.rollback()
         raise
 
+    # Round-1 review (04-w5-interfaces.md §6 "诚实失败"): the rows above are
+    # already committed, so a failure in either step below is *not* a rolled-
+    # back no-op — it's a real partial-completion state that must be reported
+    # as such (`PartialDeleteError`), not left to surface as a bare exception
+    # (N09-style "error happened but said nothing actionable").
+    purged_run_ids: list[str] = []
     for run_id in run_ids:
-        replay_store.purge_run(user_root, run_id)
+        try:
+            replay_store.purge_run(user_root, run_id)
+        except OSError as exc:
+            remaining = [r for r in run_ids if r not in purged_run_ids and r != run_id]
+            raise PartialDeleteError(
+                f"session {session_id}: SQLite rows deleted, but purging payload "
+                f"for run {run_id} failed after {len(purged_run_ids)}/{len(run_ids)} "
+                "run(s) already purged",
+                detail={
+                    "session_id": session_id,
+                    "stage": "purge_run",
+                    "purged_run_ids": purged_run_ids,
+                    "failed_run_id": run_id,
+                    "remaining_run_ids": remaining,
+                    "fully_deleted": False,
+                },
+            ) from exc
+        purged_run_ids.append(run_id)
 
-    checkpoint_truncate_or_raise(conn)
+    try:
+        checkpoint_truncate_or_raise(conn)
+    except CheckpointBusyError as exc:
+        raise PartialDeleteError(
+            f"session {session_id}: rows and every run's payload are deleted, but "
+            "the WAL checkpoint is still busy",
+            detail={
+                "session_id": session_id,
+                "stage": "checkpoint",
+                "purged_run_ids": purged_run_ids,
+                "fully_deleted": True,
+            },
+        ) from exc
 
 
 # --- Run real-delete (G20, 04-w5-interfaces.md §5 "新增到 v0 表") --------------
@@ -186,8 +256,25 @@ def delete_run(conn: sqlite3.Connection, user_root: Path, run_id: str) -> None:
         conn.rollback()
         raise
 
-    replay_store.purge_run(user_root, run_id)
-    checkpoint_truncate_or_raise(conn)
+    # Same partial-completion contract as `delete_session` above — the row is
+    # already committed by this point.
+    try:
+        replay_store.purge_run(user_root, run_id)
+    except OSError as exc:
+        raise PartialDeleteError(
+            f"run {run_id}: SQLite row deleted, but purging its payload directory "
+            "failed",
+            detail={"run_id": run_id, "stage": "purge_run", "fully_deleted": False},
+        ) from exc
+
+    try:
+        checkpoint_truncate_or_raise(conn)
+    except CheckpointBusyError as exc:
+        raise PartialDeleteError(
+            f"run {run_id}: row and payload are deleted, but the WAL checkpoint "
+            "is still busy",
+            detail={"run_id": run_id, "stage": "checkpoint", "fully_deleted": True},
+        ) from exc
 
 
 # --- Project real-delete (already existed as ProjectService.delete; this is the ---
@@ -196,10 +283,17 @@ def delete_run(conn: sqlite3.Connection, user_root: Path, run_id: str) -> None:
 
 
 def delete_project(conn: sqlite3.Connection, user_root: Path, project_id: str) -> None:
-    """Refuses if any Session or Agent still references `project_id` (same rule
-    `ProjectService.delete` enforced inline before this existed — moved here
-    verbatim, not changed), then deletes the `projects` row, the Project's
-    attachments directory (`paths.project_attachments_dir`), and checkpoints.
+    """Refuses if any Session, Agent, Goal, or Cron still references `project_id`
+    — *every* table `001_init.sql` declares a `project_id` FK on: `sessions`,
+    `agents`, `goals.project_id REFERENCES projects(id)`, and
+    `crons.project_id NOT NULL REFERENCES projects(id)`. (Round-1 review: the
+    first cut of this function, moved verbatim from `ProjectService.delete`,
+    only checked the first two — `crons`/`goals` didn't exist as a real
+    reference path yet at the time, but `store/db.py::connect()` runs with
+    `PRAGMA foreign_keys=ON`, so a Project with a live cron or goal now raises a
+    raw `sqlite3.IntegrityError` on the `DELETE` below instead of this explicit
+    refusal.) Then deletes the `projects` row, the Project's attachments
+    directory (`paths.project_attachments_dir`), and checkpoints.
     Existence and the "can't delete the default Project" business rule stay in
     `ProjectService.delete` — those are Project-domain rules, not storage
     mechanics, and `DEFAULT_PROJECT_ID` lives in `projects/service.py`, not here
@@ -225,8 +319,32 @@ def delete_project(conn: sqlite3.Connection, user_root: Path, project_id: str) -
             {"agent_count": agent_count},
         )
 
-    conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-    conn.commit()
+    goal_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM goals WHERE project_id = ?", (project_id,)
+    ).fetchone()["c"]
+    if goal_count:
+        raise RpcError(
+            INVALID_STATE,
+            f"project has {goal_count} goal(s); remove or reassign them first",
+            {"goal_count": goal_count},
+        )
+
+    cron_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM crons WHERE project_id = ?", (project_id,)
+    ).fetchone()["c"]
+    if cron_count:
+        raise RpcError(
+            INVALID_STATE,
+            f"project has {cron_count} cron(s); remove or reassign them first",
+            {"cron_count": cron_count},
+        )
+
+    try:
+        conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
 
     attachments_dir = user_root / "projects" / project_id
     if attachments_dir.exists():
@@ -311,6 +429,11 @@ def export_session(
 MAX_BACKUPS = 5
 LOG_RETENTION_DAYS = 7
 LOG_ROTATION_INTERVAL_S = 3600.0  # matches replay/retention.py's idle-sweep cadence
+# Round-1 review: same cadence as log rotation above, reused (not a new number to
+# justify) for `run_redaction_self_check_loop` — see that function's docstring for
+# why a *periodic* self-check, not just a one-shot startup call, is what it takes
+# for the "最近 100 条 RPC 响应样本" half of the contract to ever see real data.
+REDACTION_CHECK_INTERVAL_S = LOG_ROTATION_INTERVAL_S
 
 
 def rotate_backups(db_path: Path, *, keep: int = MAX_BACKUPS) -> list[Path]:
@@ -345,16 +468,22 @@ def rotate_logs(logs_dir: Path, *, retention_days: int = LOG_RETENTION_DAYS) -> 
     """Delete any file under `logs_dir` whose mtime is older than `retention_days`
     (PRD 10.3 "守护进程 / worker 日志 ... 滚动保留 7 天"). Returns the count removed.
 
-    Caveat (honest, not silently glossed over): the daemon's two live log files
-    (`daemon.out.log`/`daemon.err.log`, launchd's `StandardOutPath`/
-    `StandardErrorPath` — see `service.py::render_plist`) are continuously
-    appended to by the OS redirect for as long as the daemon runs, so their mtime
-    never falls behind `retention_days` while the process is up — this sweep
-    can't truncate a file that's open and being written by another process
-    without an out-of-band log-reopen signal (SIGHUP-style), which is out of this
-    issue's scope. What this *does* clean up: any other, non-continuously-written
-    file that lands under `logs_dir` (a one-shot diagnostic dump, a rotated
-    `.log.1` some future logrotate-alike produces) once it's actually stale."""
+    Caveat (honest, not silently glossed over — round-1 review, narrowed but not
+    eliminated): the daemon's two launchd-redirected files (`daemon.out.log`/
+    `daemon.err.log`, launchd's `StandardOutPath`/`StandardErrorPath` — see
+    `service.py::render_plist`) are continuously appended to by the OS redirect
+    for as long as the daemon runs, so their mtime never falls behind
+    `retention_days` while the process is up — this sweep can't truncate a file
+    that's open and being written by another process without an out-of-band
+    log-reopen signal (SIGHUP-style), which is out of this issue's scope. The
+    daemon's own structured log stream no longer has this problem: `daemon.log`
+    (written by `logging.py::configure_logging`'s `TimedRotatingFileHandler`)
+    rotates and prunes itself, real 7-day retention enforced by the logging
+    module directly, independent of this sweep. What this sweep *does* clean up:
+    any other, non-continuously-written file that lands under `logs_dir` (a
+    one-shot diagnostic dump, an already-rotated `daemon.log.2026-09-01` past its
+    retention window if the handler's own pruning ever lagged) once it's
+    actually stale."""
     cutoff = time.time() - retention_days * 86400
     removed = 0
     if not logs_dir.exists():
@@ -455,17 +584,26 @@ async def startup_key_redaction_self_check(
     recent_response_samples: Iterable[bytes],
     on_hit: Any,
 ) -> list[str]:
-    """Wires `scan_for_leaked_keys` to real inputs at daemon startup: every log
-    file under `logs_dir`, plus the last ~100 RPC response samples the server
-    already buffers. Reads log files off the event loop thread via
-    `asyncio.to_thread` (file I/O, DEV.md 工程原则 #3: 性能是需求 — must not block
-    the loop during startup). `on_hit(code, message, detail)` is called (once,
-    with every hit provider name) iff there's at least one hit — the caller wires
-    this to `RpcServer` broadcasting `daemon.error` (00-foundation.md §4.2:
-    "daemon.error ... 永不静默"); this function itself never silently returns
-    "clean" without having actually looked at real data — vault access failures
-    (VaultError) propagate, they are not swallowed into a false-clean result.
-    """
+    """One pass of `scan_for_leaked_keys` over real inputs: every log file under
+    `logs_dir`, plus whatever `recent_response_samples` the caller hands in (the
+    server's last ~100 RPC response bodies). Reads log files off the event loop
+    thread via `asyncio.to_thread` (file I/O, DEV.md 工程原则 #3: 性能是需求 — must
+    not block the loop), and — round-1 review — runs the CPU-bound scan itself
+    off-thread too, not just the I/O. `on_hit(code, message, detail)` is called
+    (once, with every hit provider name) iff there's at least one hit — the
+    caller wires this to `RpcServer` broadcasting `daemon.error` (00-foundation.md
+    §4.2: "daemon.error ... 永不静默"); this function itself never silently
+    returns "clean" without having actually looked at real data — vault access
+    failures (VaultError) propagate, they are not swallowed into a false-clean
+    result.
+
+    Round-1 review: called once, this can't do what its own name promises —
+    at true daemon startup (the moment `__main__.py` used to call this)
+    `recent_response_samples` is necessarily empty (`RpcServer.serve_forever()`
+    hasn't accepted a first client yet), so the "response samples" half of the
+    contract silently scanned nothing, every run, forever. Call this repeatedly
+    via `run_redaction_self_check_loop` below instead of once — see its
+    docstring."""
 
     def _read_logs() -> list[str]:
         if not logs_dir.exists():
@@ -493,7 +631,16 @@ async def startup_key_redaction_self_check(
         b.decode("utf-8", errors="replace") if isinstance(b, bytes) else str(b)
         for b in recent_response_samples
     ]
-    hits = scan_for_leaked_keys(configured_keys, [*log_texts, *response_texts])
+    # Round-1 review: `scan_for_leaked_keys` (the join plus an 8-char sliding
+    # window per configured key over the whole haystack) is pure CPU, not I/O —
+    # unlike `_load_keys`/`_read_logs` above, it was never in the `to_thread`
+    # gather, so it ran straight on the event loop. Log files are unbounded (see
+    # `rotate_logs`'s own docstring: it *can't* truncate the daemon's own live
+    # `daemon.out.log`/`daemon.err.log`), so this must not block RPC dispatch
+    # while it scans however large those have grown.
+    hits = await asyncio.to_thread(
+        scan_for_leaked_keys, configured_keys, [*log_texts, *response_texts]
+    )
     if hits:
         logger.error(
             "startup key-redaction self-check found a configured key substring "
@@ -506,3 +653,46 @@ async def startup_key_redaction_self_check(
             {"providers": hits},
         )
     return hits
+
+
+async def run_redaction_self_check_loop(
+    *,
+    vault: Any,
+    logs_dir: Path,
+    recent_response_samples: Callable[[], Iterable[bytes]],
+    on_hit: Any,
+    interval_s: float = REDACTION_CHECK_INTERVAL_S,
+) -> None:
+    """Background loop around `startup_key_redaction_self_check`, same
+    started/cancelled-from-`__main__.py` lifecycle as `run_log_rotation_loop`
+    above (04-w5-interfaces.md §1).
+
+    Round-1 review: a single call at process startup is structurally unable to
+    ever see a real RPC response — the daemon hasn't accepted its first client
+    connection yet at the point `__main__.py` used to fire this once. Looping
+    it, instead, means every pass after the first can actually see whatever
+    responses have gone out since — the contract's "最近 100 条 RPC 响应样本"
+    half of the check only ever does real work this way. The first iteration
+    below still runs immediately (not after the first `interval_s` sleep, unlike
+    `run_log_rotation_loop`): even with empty response samples, the log-file
+    half of the check is worth running as early in startup as the surrounding
+    async setup in `__main__.py` allows, not delayed by a full hour.
+
+    `recent_response_samples` is a zero-arg callable (`RpcServer.
+    recent_response_samples`, a bound method) rather than a fixed iterable —
+    each pass needs a *fresh* snapshot of whatever the server's ring buffer
+    holds at that moment, not the one snapshot taken when this loop started."""
+    try:
+        while True:
+            try:
+                await startup_key_redaction_self_check(
+                    vault=vault,
+                    logs_dir=logs_dir,
+                    recent_response_samples=recent_response_samples(),
+                    on_hit=on_hit,
+                )
+            except Exception:  # noqa: BLE001 - one bad pass must not kill the loop forever
+                logger.error("key-redaction self-check pass failed", exc_info=True)
+            await asyncio.sleep(interval_s)
+    except asyncio.CancelledError:
+        raise

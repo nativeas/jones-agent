@@ -57,11 +57,14 @@ MAX_LINE_BYTES = 16 * 1024 * 1024
 MAX_INFLIGHT_PER_CONNECTION = 16
 MAX_INFLIGHT_GLOBAL = 64
 
-# Issue #23 (04-w5-interfaces.md §5): the startup Key-redaction self-check scans
-# "最近 100 条 RPC 响应样本" alongside log files — this is that buffer's size. A
-# plain bounded ring, not a persisted log: it only ever needs to answer "did a
-# response body in the recent past contain a configured key", never survive a
-# restart.
+# Issue #23 (04-w5-interfaces.md §5): the periodic Key-redaction self-check
+# (`store/maintenance.py::run_redaction_self_check_loop`) scans "最近 100 条 RPC
+# 响应样本" alongside log files — this is that buffer's size. A plain bounded
+# ring, not a persisted log: it only ever needs to answer "did a response body
+# in the recent past contain a configured key", never survive a restart. Round-1
+# review: this used to be read exactly once, before startup had accepted its
+# first client connection — always empty in practice. It's now polled
+# periodically instead, so it actually gets read while it holds real data.
 RECENT_RESPONSES_MAXLEN = 100
 
 

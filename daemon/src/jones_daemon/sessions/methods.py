@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import Any
 
 from jones_daemon.context import DaemonContext
-from jones_daemon.rpc.errors import INVALID_PARAMS, RpcError
+from jones_daemon.rpc.errors import INVALID_PARAMS, INVALID_STATE, RpcError
 from jones_daemon.rpc.server import Connection, RpcServer
 from jones_daemon.sessions.service import SessionService
 from jones_daemon.store import maintenance, run_in_db_thread
@@ -30,6 +30,40 @@ def _require_str(params: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise RpcError(INVALID_PARAMS, f"{key!r} must be a non-empty string", {"params": params})
     return value
+
+
+async def _run_delete_honestly(
+    server: RpcServer, fn: Any, *args: Any, **kwargs: Any
+) -> dict[str, Any]:
+    """Shared `session.delete`/`run.delete` tail: run a `store/maintenance.py`
+    delete on the DB thread and translate `maintenance.PartialDeleteError`
+    (04-w5-interfaces.md §6 "诚实失败") into the two outcomes it actually
+    represents, instead of letting both fall through to `rpc/server.py::
+    _dispatch`'s generic `except Exception` -> opaque `INTERNAL_ERROR` (round-1
+    review: that path also never told anyone else on the daemon — `daemon.error`
+    — regardless of which of the two shapes below it was).
+
+    Every `PartialDeleteError` is broadcast as `daemon.error` unconditionally —
+    "记录部分完成状态并 daemon.error" applies whether or not the delete itself
+    ends up reported to *this* caller as success:
+      - `detail["fully_deleted"]` True (only the trailing WAL checkpoint stayed
+        busy — rows and payload are already fully gone): reported to the caller
+        as an ordinary success. Turning a completed delete into a client-visible
+        error would be the opposite mistake the review flagged.
+      - otherwise (a payload purge failed partway): re-raised as a structured
+        `RpcError(INVALID_STATE, ...)` carrying the same detail, so the caller
+        gets something actionable instead of a bare `PartialDeleteError:` string.
+    """
+    try:
+        await run_in_db_thread(fn, *args, **kwargs)
+    except maintenance.PartialDeleteError as exc:
+        await server.broadcast_all(
+            "daemon.error",
+            {"code": "delete_partially_failed", "message": str(exc), "detail": exc.detail},
+        )
+        if not exc.detail.get("fully_deleted"):
+            raise RpcError(INVALID_STATE, str(exc), exc.detail) from exc
+    return {"deleted": True}
 
 
 def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
@@ -142,8 +176,9 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
         # params -> call translation, same shape as every other handler here.
         session_id = _require_str(params, "id")
         user_root = ctx.paths.user_root()
-        await run_in_db_thread(maintenance.delete_session, ctx.db, user_root, session_id)
-        return {"deleted": True}
+        return await _run_delete_honestly(
+            server, maintenance.delete_session, ctx.db, user_root, session_id
+        )
 
     async def session_export(params: dict[str, Any], conn: Connection) -> Any:
         session_id = _require_str(params, "id")
@@ -163,8 +198,9 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
 
     async def run_delete(params: dict[str, Any], conn: Connection) -> Any:
         run_id = _require_str(params, "run_id")
-        await run_in_db_thread(maintenance.delete_run, ctx.db, ctx.paths.user_root(), run_id)
-        return {"deleted": True}
+        return await _run_delete_honestly(
+            server, maintenance.delete_run, ctx.db, ctx.paths.user_root(), run_id
+        )
 
     async def permission_pending(params: dict[str, Any], conn: Connection) -> Any:
         return await service.permission_pending(params.get("session_id"))

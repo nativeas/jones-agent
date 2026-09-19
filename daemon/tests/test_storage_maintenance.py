@@ -3,6 +3,7 @@ the Key-redaction scan (Issue #23, 04-w5-interfaces.md §5)."""
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import time
 
@@ -128,6 +129,58 @@ def test_delete_session_does_not_touch_an_unrelated_session(conn):
     assert conn.execute("SELECT 1 FROM runs WHERE id='r2'").fetchone() is not None
 
 
+def test_delete_session_raises_partial_delete_error_when_a_run_purge_fails_partway(
+    conn, monkeypatch
+):
+    # 04-w5-interfaces.md §6 "诚实失败": the SQLite rows are already committed by
+    # the time `replay_store.purge_run` runs — a failure here must not surface as
+    # a bare exception. Two runs; the first purges fine, the second raises.
+    _seed_session(conn, session_id="s1")
+    _seed_full_run(conn, session_id="s1", run_id="r1")
+    _seed_full_run(conn, session_id="s1", run_id="r2")
+
+    real_purge = replay_store.purge_run
+
+    def _flaky_purge(user_root, run_id):
+        if run_id == "r2":
+            raise OSError("simulated purge failure")
+        real_purge(user_root, run_id)
+
+    monkeypatch.setattr(maintenance.replay_store, "purge_run", _flaky_purge)
+
+    with pytest.raises(maintenance.PartialDeleteError) as exc_info:
+        maintenance.delete_session(conn, paths.user_root(), "s1")
+
+    detail = exc_info.value.detail
+    assert detail["fully_deleted"] is False
+    assert detail["purged_run_ids"] == ["r1"]
+    assert detail["failed_run_id"] == "r2"
+    # The SQLite cascade is not rolled back by this — it already committed;
+    # "partial" here means "rows gone, payload partly not" not "nothing happened".
+    assert conn.execute("SELECT 1 FROM sessions WHERE id='s1'").fetchone() is None
+
+
+def test_delete_session_partial_delete_error_marked_fully_deleted_on_checkpoint_busy(
+    conn, monkeypatch
+):
+    # The opposite shape: rows + every run's payload are genuinely gone, only
+    # the trailing WAL checkpoint stayed busy — `fully_deleted` must say True so
+    # the RPC layer doesn't report a completed delete as a failure.
+    _seed_session(conn, session_id="s1")
+    _seed_full_run(conn, session_id="s1", run_id="r1")
+
+    def _always_busy(conn, **kwargs):
+        raise maintenance.CheckpointBusyError("simulated busy")
+
+    monkeypatch.setattr(maintenance, "checkpoint_truncate_or_raise", _always_busy)
+
+    with pytest.raises(maintenance.PartialDeleteError) as exc_info:
+        maintenance.delete_session(conn, paths.user_root(), "s1")
+
+    assert exc_info.value.detail["fully_deleted"] is True
+    assert conn.execute("SELECT 1 FROM sessions WHERE id='s1'").fetchone() is None
+
+
 # --- delete_run ------------------------------------------------------------------
 
 
@@ -160,6 +213,39 @@ def test_delete_run_refuses_a_running_run(conn):
 def test_delete_run_raises_not_found(conn):
     with pytest.raises(RpcError):
         maintenance.delete_run(conn, paths.user_root(), "does-not-exist")
+
+
+def test_delete_run_raises_partial_delete_error_when_purge_fails(conn, monkeypatch):
+    _seed_session(conn, session_id="s1")
+    _seed_full_run(conn, session_id="s1", run_id="r1")
+
+    def _boom(user_root, run_id):
+        raise OSError("simulated purge failure")
+
+    monkeypatch.setattr(maintenance.replay_store, "purge_run", _boom)
+
+    with pytest.raises(maintenance.PartialDeleteError) as exc_info:
+        maintenance.delete_run(conn, paths.user_root(), "r1")
+
+    assert exc_info.value.detail["fully_deleted"] is False
+    assert conn.execute("SELECT 1 FROM runs WHERE id='r1'").fetchone() is None
+
+
+def test_delete_run_raises_partial_delete_error_marked_fully_deleted_when_only_checkpoint_is_busy(
+    conn, monkeypatch
+):
+    _seed_session(conn, session_id="s1")
+    _seed_full_run(conn, session_id="s1", run_id="r1")
+
+    def _always_busy(conn, **kwargs):
+        raise maintenance.CheckpointBusyError("simulated busy")
+
+    monkeypatch.setattr(maintenance, "checkpoint_truncate_or_raise", _always_busy)
+
+    with pytest.raises(maintenance.PartialDeleteError) as exc_info:
+        maintenance.delete_run(conn, paths.user_root(), "r1")
+
+    assert exc_info.value.detail["fully_deleted"] is True
 
 
 # --- delete_project ----------------------------------------------------------------
@@ -196,6 +282,81 @@ def test_delete_project_refuses_when_sessions_reference_it(conn, tmp_path):
 
     with pytest.raises(RpcError, match="session"):
         maintenance.delete_project(conn, paths.user_root(), project["id"])
+
+
+def test_delete_project_refuses_when_a_goal_references_it(conn, tmp_path):
+    # Round-1 review: `001_init.sql`'s `goals.project_id REFERENCES projects(id)`
+    # was never checked here — a goal left pointing at the Project made the
+    # `DELETE FROM projects` below raise a raw `sqlite3.IntegrityError` instead
+    # of this explicit, structured refusal.
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    from jones_daemon.projects.service import ProjectService
+
+    project = ProjectService(conn).create(str(workdir))
+    conn.execute(
+        "INSERT INTO goals(id, project_id, title, status, created_at, updated_at) "
+        "VALUES ('g1', ?, 'goal title', 'active', 'now', 'now')",
+        (project["id"],),
+    )
+    conn.commit()
+
+    with pytest.raises(RpcError, match="goal"):
+        maintenance.delete_project(conn, paths.user_root(), project["id"])
+    row = conn.execute("SELECT 1 FROM projects WHERE id=?", (project["id"],)).fetchone()
+    assert row is not None
+
+
+def test_delete_project_refuses_when_a_cron_references_it(conn, tmp_path):
+    # Same gap as the goals test above, for `crons.project_id NOT NULL
+    # REFERENCES projects(id)` — this is the one L/w5/20-cron makes reachable
+    # for real once it lands in the same wave.
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    from jones_daemon.projects.service import ProjectService
+
+    project = ProjectService(conn).create(str(workdir))
+    conn.execute(
+        "INSERT INTO crons(id, project_id, agent_id, expr, prompt, mode, created_at, updated_at) "
+        "VALUES ('c1', ?, 'agent_default', '* * * * *', 'do it', 'task', 'now', 'now')",
+        (project["id"],),
+    )
+    conn.commit()
+
+    with pytest.raises(RpcError, match="cron"):
+        maintenance.delete_project(conn, paths.user_root(), project["id"])
+    row = conn.execute("SELECT 1 FROM projects WHERE id=?", (project["id"],)).fetchone()
+    assert row is not None
+
+
+def test_delete_project_rolls_back_and_leaves_no_open_transaction_on_failure(conn, tmp_path):
+    # Round-1 review: before this fix, a `DELETE FROM projects` that raised
+    # (e.g. the raw `IntegrityError` from the two tests above, pre-fix) left
+    # `conn` — the daemon's one long-lived shared connection (`__main__.py`) —
+    # sitting in an implicitly-open transaction forever, the same class of bug
+    # `providers/methods.py`'s "Round 2 review" comment already fixed once
+    # elsewhere. `delete_session`/`delete_run` already guard their own commit
+    # with `except sqlite3.Error: conn.rollback()`; this proves `delete_project`
+    # now does too. Forces the failure via a `BEFORE DELETE` trigger (`sqlite3.
+    # Connection` is a C type — its `commit` method can't be monkeypatched)
+    # since, post-fix, every real FK a `projects` row can be referenced by is
+    # refused before the `DELETE` even runs — there's no naturally-occurring
+    # `IntegrityError` left to trigger this path with real data anymore.
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    from jones_daemon.projects.service import ProjectService
+
+    project = ProjectService(conn).create(str(workdir))
+    conn.execute(
+        "CREATE TRIGGER test_boom_on_project_delete BEFORE DELETE ON projects "
+        "BEGIN SELECT RAISE(ABORT, 'simulated failure'); END"
+    )
+    conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        maintenance.delete_project(conn, paths.user_root(), project["id"])
+
+    assert conn.in_transaction is False
 
 
 # --- export_session ----------------------------------------------------------------
@@ -386,3 +547,174 @@ def test_scan_for_leaked_keys_checks_multiple_providers_independently():
         ["log has sk-aaaaaaaaaaaaaaaa but not the other one"],
     )
     assert hits == ["a"]
+
+
+# --- startup_key_redaction_self_check / run_redaction_self_check_loop ----------------
+# Round-1 review: this wiring (as opposed to the pure `scan_for_leaked_keys`
+# function above) had zero test coverage — the one layer that could have caught
+# both "the response-sample half never sees anything" and "on_hit never fires".
+
+
+class _FakeVault:
+    def __init__(self, keys: dict[str, str]) -> None:
+        self._keys = keys
+
+    def names(self) -> list[str]:
+        return list(self._keys)
+
+    def get(self, name: str) -> str:
+        return self._keys[name]
+
+
+async def test_startup_key_redaction_self_check_reads_real_logs_and_calls_on_hit(tmp_path):
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    (logs_dir / "daemon.log").write_text("leaked: sk-ant-abcdef1234567890 in the clear")
+
+    hit_calls = []
+
+    async def on_hit(code, message, detail):
+        hit_calls.append((code, message, detail))
+
+    hits = await maintenance.startup_key_redaction_self_check(
+        vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
+        logs_dir=logs_dir,
+        recent_response_samples=[],
+        on_hit=on_hit,
+    )
+
+    assert hits == ["anthropic"]
+    assert len(hit_calls) == 1
+    code, _message, detail = hit_calls[0]
+    assert code == "key_redaction_failed"
+    assert detail == {"providers": ["anthropic"]}
+
+
+async def test_startup_key_redaction_self_check_scans_response_samples_too(tmp_path):
+    logs_dir = tmp_path / "logs"  # left empty — the hit must come from responses alone
+    logs_dir.mkdir()
+    hit_calls = []
+
+    async def on_hit(code, message, detail):
+        hit_calls.append((code, message, detail))
+
+    hits = await maintenance.startup_key_redaction_self_check(
+        vault=_FakeVault({"openai": "sk-oa-abcdef1234567890"}),
+        logs_dir=logs_dir,
+        recent_response_samples=[b'{"result":"sk-oa-abcdef1234567890 leaked here"}'],
+        on_hit=on_hit,
+    )
+
+    assert hits == ["openai"]
+    assert len(hit_calls) == 1
+
+
+async def test_startup_key_redaction_self_check_does_not_call_on_hit_when_clean(tmp_path):
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    (logs_dir / "daemon.log").write_text("nothing sensitive here")
+
+    async def on_hit(code, message, detail):
+        raise AssertionError("on_hit must not fire when there is no leak")
+
+    hits = await maintenance.startup_key_redaction_self_check(
+        vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
+        logs_dir=logs_dir,
+        recent_response_samples=[],
+        on_hit=on_hit,
+    )
+    assert hits == []
+
+
+async def test_run_redaction_self_check_loop_runs_immediately_then_on_every_interval(tmp_path):
+    # Round-1 review: a one-shot call at process startup can never see a real
+    # RPC response (the server hasn't accepted a client yet at that instant) —
+    # this proves the loop (a) checks right away, not after the first sleep, and
+    # (b) re-reads `recent_response_samples` fresh on each pass rather than a
+    # snapshot frozen at loop-start, so a response that arrives *between*
+    # passes gets scanned on the next one.
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+
+    live_samples: list[bytes] = []  # empty at loop start, like a real cold boot
+    passes = 0
+    hit_calls = []
+
+    async def on_hit(code, message, detail):
+        hit_calls.append(detail)
+
+    def _samples():
+        nonlocal passes
+        passes += 1
+        return list(live_samples)
+
+    task = asyncio.create_task(
+        maintenance.run_redaction_self_check_loop(
+            vault=_FakeVault({"anthropic": "sk-ant-abcdef1234567890"}),
+            logs_dir=logs_dir,
+            recent_response_samples=_samples,
+            on_hit=on_hit,
+            interval_s=0.01,
+        )
+    )
+    try:
+        # First pass must happen immediately, well before interval_s could have
+        # elapsed on its own, and with genuinely nothing to find yet.
+        for _ in range(200):
+            if passes >= 1:
+                break
+            await asyncio.sleep(0.005)
+        assert passes >= 1
+        assert hit_calls == []
+
+        # A "response" shows up only now — between passes, not at loop start.
+        live_samples.append(b'{"result":"sk-ant-abcdef1234567890 leaked here"}')
+
+        for _ in range(200):
+            if hit_calls:
+                break
+            await asyncio.sleep(0.005)
+        assert hit_calls == [{"providers": ["anthropic"]}]
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_run_redaction_self_check_loop_survives_a_failing_pass(tmp_path):
+    # A malfunctioning check (e.g. vault access blows up) must be logged and
+    # skipped, not crash the loop — DEV.md 诚实失败 applies to the guard's own
+    # plumbing too, but a broken self-check must not itself take the daemon down.
+    class _BoomVault:
+        def names(self):
+            raise RuntimeError("vault unavailable")
+
+    passes = 0
+
+    def _samples():
+        nonlocal passes
+        passes += 1
+        return []
+
+    async def _noop(*_args):
+        return None
+
+    task = asyncio.create_task(
+        maintenance.run_redaction_self_check_loop(
+            vault=_BoomVault(),
+            logs_dir=tmp_path / "logs",
+            recent_response_samples=_samples,
+            on_hit=_noop,
+            interval_s=0.01,
+        )
+    )
+    try:
+        for _ in range(200):
+            if passes >= 2:
+                break
+            await asyncio.sleep(0.005)
+        assert passes >= 2  # kept looping past the first failing pass
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task

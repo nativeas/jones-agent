@@ -93,11 +93,11 @@ class ProjectService:
         Existence and the "can't delete the default Project" checks stay here
         (Project-domain rules — `DEFAULT_PROJECT_ID` is this module's own
         constant). The reference-count refusals (诚实失败, not a silent cascade,
-        for *every* table that can hold a `project_id` — `sessions.project_id`
-        and `agents.project_id` are both `REFERENCES projects(id)`,
-        00-foundation.md §5, and this connection runs with `PRAGMA
-        foreign_keys=ON`, store/db.py) plus the actual row/attachments-directory
-        deletion and WAL checkpoint now live in `store/maintenance.py::
+        for *every* table that can hold a `project_id` — `sessions.project_id`,
+        `agents.project_id`, `goals.project_id`, and `crons.project_id` are all
+        `REFERENCES projects(id)`, 001_init.sql, and this connection runs with
+        `PRAGMA foreign_keys=ON`, store/db.py) plus the actual row/attachments-
+        directory deletion and WAL checkpoint now live in `store/maintenance.py::
         delete_project` (Issue #23, 04-w5-interfaces.md §5: "project.delete（已有，
         改为调 maintenance）") — this method is a thin call into it.
         Batch-archiving/deleting a Project's sessions first is a `session.*`
