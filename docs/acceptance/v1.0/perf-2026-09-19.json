@@ -1,0 +1,118 @@
+{
+  "date": "2026-09-19",
+  "generated_by": "daemon/tests/perf (pytest) + apps/desktop/tests/perf (electron)",
+  "machine": {
+    "platform": "macOS-27.0-arm64-arm-64bit",
+    "arch": "arm64",
+    "chip": "Apple M4",
+    "memory_gb": 32,
+    "is_prd_reference_machine": false,
+    "prd_reference_machines": [
+      "Apple M1 / 16GB",
+      "Intel i5 12代 / 16GB"
+    ]
+  },
+  "idle_window_s": 2,
+  "metrics": [
+    {
+      "name": "daemon_cold_start_ms",
+      "value": 79.63466600085667,
+      "unit": "ms",
+      "threshold": 6000,
+      "threshold_source": "PRD 11.1 冷启动（守护进程未运行）≤ 6s",
+      "passed": true,
+      "detail": {}
+    },
+    {
+      "name": "send_to_first_delta_ms",
+      "value": 0.12020800022582989,
+      "unit": "ms",
+      "threshold": 800,
+      "threshold_source": "PRD 11.1 首个 Turn 首 token ≤ 模型 RTT + 800ms（此处 RTT≈0，仅测运行时开销）",
+      "passed": true,
+      "detail": {
+        "agent": "fake_acp_agent.py",
+        "worker": "pre-warmed"
+      }
+    },
+    {
+      "name": "idle_rss_mb",
+      "value": 36.15625,
+      "unit": "MB",
+      "threshold": 150,
+      "threshold_source": "PRD 11.2 守护进程常驻内存（空闲）≤ 150MB",
+      "passed": true,
+      "detail": {}
+    },
+    {
+      "name": "idle_cpu_delta_s",
+      "value": 0,
+      "unit": "s",
+      "threshold": 0.15,
+      "threshold_source": "PRD 11.2 空闲 CPU ≈ 0（无任务时不轮询）",
+      "passed": true,
+      "detail": {
+        "window_s": 2,
+        "threshold_rate_s_per_s": 0.075
+      }
+    },
+    {
+      "name": "worker_cold_start_fake_agent_ms",
+      "value": 37.89900000083435,
+      "unit": "ms",
+      "threshold": 2000,
+      "threshold_source": "PRD 11.1 冷启动 worker ≤ 2s",
+      "passed": true,
+      "detail": {
+        "agent": "fake_acp_agent.py"
+      }
+    },
+    {
+      "name": "desktop_window_visible_ms",
+      "value": 289.880958,
+      "unit": "ms",
+      "threshold": 1500,
+      "threshold_source": "PRD 11.1 桌面壳可见 ≤ 1.5s",
+      "passed": true,
+      "detail": {}
+    },
+    {
+      "name": "desktop_input_ready_ms",
+      "value": 728.589416,
+      "unit": "ms",
+      "threshold": 3000,
+      "threshold_source": "PRD 11.1 可开始输入 ≤ 3s（守护进程已在运行的情况下）",
+      "passed": true,
+      "detail": {}
+    },
+    {
+      "name": "desktop_electron_rss_mb",
+      "value": 276.21875,
+      "unit": "MB",
+      "threshold": 300,
+      "threshold_source": "PRD 11.2 Electron 壳（Main + Renderer）≤ 300MB",
+      "passed": true,
+      "detail": {
+        "processes": [
+          {
+            "type": "Browser",
+            "rss_kb": 162576
+          },
+          {
+            "type": "GPU",
+            "rss_kb": 90528
+          },
+          {
+            "type": "Utility",
+            "rss_kb": 47024
+          },
+          {
+            "type": "Tab",
+            "rss_kb": 120272
+          }
+        ]
+      }
+    }
+  ],
+  "all_passed": true
+}

@@ -15,7 +15,14 @@ build/
 # Node / Electron
 node_modules/
 out/
-release/
+# Anchored to repo root (was bare `release/`, W6/#25: that unanchored form
+# matches a directory named `release` ANYWHERE in the tree, which swallowed
+# the real, tracked `packaging/release/` and `scripts/release/` directories
+# 05-w6-interfaces.md §1 explicitly assigns to Q/#25 — `git status`/`git add`
+# silently saw neither. This repo has no top-level `release/` output dir
+# today (electron-builder's own output goes to `build/release/dist`, already
+# covered by the `build/` rule above), so anchoring changes nothing else.
+/release/
 .vite/
 
 # 环境与凭据

@@ -60,6 +60,54 @@ Electron main ──(socket client)──> daemon
 - Electron main 启动：先连 socket；连不上则尝试 `launchctl kickstart`（已安装）或直接 spawn daemon（开发模式），最多重试 3 次后向 renderer 报错（PRD 11.3）。
 - worker：由 daemon 按 Session 拉起，`python -m jones_daemon.workers.entry --session <id>`，stdio 上跑 Hermes 自带的 ACP（Agent Client Protocol）server（`acp_adapter/`，本身就是 JSON-RPC 2.0，不是自定义协议）；daemon 是 ACP client。worker 进程内启动时额外加载一个 Jones 自研的 `pre_tool_call` 插件，做 Step 级权限拦截（见 §7 spike #1 结论、PRD 6.3）。
 
+### 3.1 打包模式下的进程路径（W6/#25 追加，2026-09-20）
+
+spike #2（§2 已定案的 python-build-standalone 方案）在真实 daemon（含 `hermes-agent`
+依赖）上落地的结果，`scripts/release/build-mac.sh` 可复现：
+
+```
+<App>.app/Contents/Resources/daemon/
+  bin/jones-daemon          # 入口脚本：export PYTHONPATH=<...>/hermes-agent，
+                             #   exec <...>/python/bin/python3.12 -m jones_daemon "$@"
+  python/                   # python-build-standalone 解释器 + 真实 site-packages
+                             #   （daemon 自身 uv build --wheel 出的 wheel + `uv export
+                             #   --group worker` 导出的合并依赖闭包，见下）
+  hermes-agent/              # 锁定 commit 的 `git archive` 源码树（不 pip 安装，
+                             #   Hermes 自己的 setup.py 拒绝非 editable 构建，spike #2）
+```
+
+- **依赖合并**：`daemon/pyproject.toml` 的 `worker` 依赖组（`hermes-agent[acp]` +
+  `mcp`）与基础依赖本来就由 `uv` 解析进同一份 `uv.lock`（`uv sync --group worker`
+  能成功本身就证明这份合并图无冲突）；打包脚本 `uv export --no-default-groups
+  --group worker` 直接复用这份已合并、已验证无冲突的锁，而不是重新协调两份独立
+  锁文件——冲突检查因此是「这份合并本来就是 uv 解析时做的，不是打包脚本自己在
+  猜」，不是重新发明的一步。
+- **Electron main 打包模式的 daemon 路径**：`process.resourcesPath/daemon/bin/
+  jones-daemon`（`apps/desktop/src/main/index.ts::findPackagedDaemonExecutable()`）。
+  01-w2-interfaces.md §6 原文「打包模式 spawn `process.resourcesPath/daemon/...`」
+  在 `ensureDaemonRunning()` 重试序列的第三步（kickstart 之后、报错之前）落地为
+  直接 `spawn(exe, [], {detached: true})`，与开发模式 `spawn('uv', ['run', ...])`
+  同一形状，不是 `service install`——launchd 仍是设计上的主管方式（§3 本节），
+  这条只是「daemon 还没被 launchd 接管时」的兜底恢复路径。
+- **`service install --program`**：`packaging/launchd/`、`daemon/src/jones_daemon/
+  service.py` 已支持 `--program "<自定义命令>"`；打包安装流程调用它时传
+  `process.resourcesPath/daemon/bin/jones-daemon`，把 LaunchAgent 的
+  `ProgramArguments` 指向这个入口脚本而不是 `sys.executable -m jones_daemon`
+  （后者在打包产物里没有 `uv`/系统 Python 可依赖）。本分支未接入「首次安装时
+  调用 `service install`」这一步（不在 §1 授权范围——那是完整安装器/首次运行
+  向导的范畴，见报告「没做什么」），只确保这条命令行本身在打包产物上跑得通。
+- 详见 `docs/release.md`（发布检查单）与本分支报告「性能与打包实测」。
+- **对 §2 打包结论的一条重要订正（实测新发现）**：§2 表格「python-build-
+  standalone 不需要在目标架构上执行任何代码」这个结论，spike #2 只在**零第三方
+  依赖**的空壳 daemon 上验证过。真实 daemon 引入编译型依赖后，这个结论不成立：
+  `cryptography==50.0.0`（daemon 精确依赖，见 §2.2/Hermes 供应链策略）在 PyPI 上
+  **没有发布 macOS x86_64 wheel**（只有 arm64 三个 wheel），导致 `uv pip install
+  --python-platform x86_64-apple-darwin` 退化成在宿主（arm64）架构上从源码编译，
+  产出架构不匹配、链接失败——不是"不能在本机验证运行"，是"本机造不出这个产物"。
+  详见 `docs/release.md` §2.2 的完整实测记录与后续路径。v1.0 macOS 双架构
+  （PRD G18）在真实依赖闭环下的 x86_64 可行性因此仍是未验证状态，不能引用 spike
+  #2 的空壳结论作为已验证的依据。
+
 ## 4. RPC 契约 v0（daemon ⇄ 前端）
 
 传输：NDJSON，每行一个 JSON-RPC 2.0 对象。请求/响应/通知三种。JSON-RPC 信封的 `id` 字段（请求/响应关联用）只要求是字符串，由前端自行生成（如客户端自增计数器加前缀 `c-<n>`），不要求是 ULID——ULID 是 §5 领域对象（`session`/`project`/... 的主键）的 id 格式，是另一套 id 空间，两者共用「id」这个字段名但含义不同。所有时间为 ISO-8601 UTC。

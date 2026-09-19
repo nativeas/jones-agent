@@ -1,0 +1,8 @@
+{
+  "name": "jones-release-packaging",
+  "private": true,
+  "description": "electron-builder toolchain for scripts/release/build-mac.sh — self-contained under packaging/ (Q/#25's own directory), not a dependency of apps/desktop/package.json, matching packaging/electron-shell/'s existing spike pattern.",
+  "devDependencies": {
+    "electron-builder": "25.1.8"
+  }
+}

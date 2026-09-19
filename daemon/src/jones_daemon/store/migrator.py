@@ -21,6 +21,26 @@ MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 _FILENAME_RE = re.compile(r"^(\d+)_.*\.sql$")
 
 
+class SchemaTooNewError(RuntimeError):
+    """Raised by `apply_pending` when the database's `schema_version` is newer than
+    the highest migration this build knows about — i.e. an older build of the
+    daemon was pointed at a database a newer build already migrated (PRD 11.3
+    "升级不丢数据"; 05-w6-interfaces.md §3.3: "旧版打开新库…明确拒绝启动并提示，不
+    静默降级").
+
+    Without this check, `apply_pending` would compute `pending` as every migration
+    file with `version > current_version` — for this scenario that set is empty by
+    construction (every file this build ships is <= its own highest known
+    version, which is < the db's version), so it would silently return the db's
+    (higher) version and let the daemon start talking to tables/columns this
+    build has never seen, rather than refusing outright."""
+
+
+def _known_max_version(migrations_dir: Path) -> int:
+    versions = [v for v, _ in _discover_migrations(migrations_dir)]
+    return max(versions) if versions else 0
+
+
 def current_version(conn: sqlite3.Connection) -> int:
     exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
@@ -96,8 +116,24 @@ def _backup_before_migrating(conn: sqlite3.Connection, target_version: int) -> P
 
 
 def apply_pending(conn: sqlite3.Connection, migrations_dir: Path = MIGRATIONS_DIR) -> int:
-    """Apply every migration newer than the current schema version. Returns the new version."""
+    """Apply every migration newer than the current schema version. Returns the new
+    version.
+
+    Raises `SchemaTooNewError` instead of touching the database at all when
+    `current_version(conn)` is already ahead of every migration this build knows
+    about — see that class's docstring. Checked before anything else so an old
+    build can never partially "apply" (i.e. no-op through) a newer database and
+    proceed to run against it."""
     version = current_version(conn)
+    known_max = _known_max_version(migrations_dir)
+    if version > known_max:
+        raise SchemaTooNewError(
+            f"database schema_version={version} is newer than this build knows how to "
+            f"read (highest known migration={known_max}); refusing to start against it "
+            "— this is an older build pointed at a database a newer build already "
+            "migrated. Install the matching (or newer) build, or restore a backup "
+            "from before the upgrade (see jones.db.bak-* next to the database file)."
+        )
     pending = [(v, p) for v, p in _discover_migrations(migrations_dir) if v > version]
     for file_version, path in pending:
         # Backed up right before *this* migration, not once for the whole batch:

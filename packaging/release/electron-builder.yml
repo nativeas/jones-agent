@@ -1,0 +1,54 @@
+# Real jones-agent packaging config (docs/design/05-w6-interfaces.md §3.2,
+# Issue #25) — built on the same extraResources/entitlements approach spike 02
+# validated in packaging/electron-shell/electron-builder.yml, pointed at the
+# real apps/desktop build output instead of the spike shell.
+#
+# Lives under packaging/ (Q/#25's own directory), not apps/desktop/, so it can
+# be built and iterated on without touching apps/desktop/package.json beyond
+# the one narrow change 05-w6-interfaces.md §1 already allows there. Invoked
+# via `electron-builder --project <repo>/apps/desktop --config <this file>`
+# (scripts/release/build-mac.sh) — electron-builder resolves every relative
+# path below against the `--project` dir (apps/desktop), which is why
+# `extraResources.from`/`entitlements`/`afterPack` all reach back out with
+# `../../`. The REPO_ROOT placeholder token below (double-underscore prefixed
+# and suffixed, deliberately not spelled out literally in this comment so
+# `sed` substitution doesn't also rewrite this sentence) is substituted with
+# an absolute path by build-mac.sh before this file is handed to
+# electron-builder, so `directories.output` (a build scratch dir, not inside
+# apps/desktop) is unambiguous regardless of how electron-builder resolves
+# the rest.
+appId: ai.jones.desktop
+productName: Jones
+directories:
+  output: __REPO_ROOT__/build/release/dist
+files:
+  - out/**/*
+  - package.json
+extraResources:
+  # ${arch} is electron-builder's own macro (arm64/x64), matching
+  # scripts/release/build-daemon-bundle.sh's own output directory naming —
+  # one config covers both `--arm64` and `--x64` invocations.
+  - from: ../../build/release/daemon/${arch}
+    to: daemon
+mac:
+  category: public.developer-tools
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: ../../packaging/electron-shell/entitlements.mac.plist
+  entitlementsInherit: ../../packaging/electron-shell/entitlements.mac.plist
+  # No Developer ID on this machine (docs/spikes/02-packaging.md §3) — ad-hoc
+  # only; afterPack below does the by-hand signing electron-builder itself
+  # skips entirely when identity is null (confirmed in the spike:
+  # app-builder-lib's macPackager.js returns before any signing at all).
+  # docs/release.md documents the real-certificate path (identity + notarize.sh).
+  identity: null
+dmg:
+  sign: false
+# Top-level, not nested under `mac:` (electron-builder's schema rejects
+# `mac.afterPack` — confirmed by actually running it).
+afterPack: ../../packaging/release/afterPack.cjs
