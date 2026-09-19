@@ -14,6 +14,7 @@ from jones_daemon.workers.manager import (
     DEFAULT_STARTUP_TIMEOUT_S,
     WorkerManager,
     WorkerStartupError,
+    _prepare_hermes_home,
     _worker_env,
 )
 
@@ -157,7 +158,7 @@ async def test_prepare_hermes_home_failure_surfaces_as_worker_startup_error(tmp_
     """
     monkeypatch.setenv("FAKE_ACP_MODE", "normal")
 
-    def _boom(_hermes_home):
+    def _boom(_hermes_home, **_kwargs):
         raise OSError("simulated disk failure")
 
     monkeypatch.setattr("jones_daemon.workers.manager._prepare_hermes_home", _boom)
@@ -270,5 +271,107 @@ async def test_worker_startup_latency_measurement(tmp_path, monkeypatch, _run):
     try:
         await manager.ensure_started(f"s-{_run}", cwd="/tmp")
         assert manager.startup_latencies_s[-1] < DEFAULT_STARTUP_TIMEOUT_S
+    finally:
+        await manager.stop()
+
+
+# -- `_prepare_hermes_home` mcp_servers/skill_dirs (Issue #17, FR13) -----------
+
+
+def test_prepare_hermes_home_writes_mcp_servers_into_config_yaml(tmp_path):
+    import yaml
+
+    hermes_home = tmp_path / "hh"
+    _prepare_hermes_home(
+        hermes_home,
+        mcp_servers=[
+            {"name": "echo", "command": "python3", "args": ["server.py"], "env": {"A": "b"}},
+            {"name": "docs", "url": "https://example.com/mcp", "headers": {}},
+            {"name": "off", "command": "x", "enabled": False},
+        ],
+    )
+    raw = (hermes_home / "config.yaml").read_text(encoding="utf-8")
+    parsed = yaml.safe_load(raw)
+    assert parsed["plugins"]["enabled"] == ["jones_gate"]
+    assert parsed["command_allowlist"] == []
+    assert parsed["mcp_servers"] == {
+        "echo": {"command": "python3", "args": ["server.py"], "env": {"A": "b"}},
+        "docs": {"url": "https://example.com/mcp", "headers": {}},
+    }
+
+
+def test_prepare_hermes_home_with_no_mcp_servers_writes_empty_dict(tmp_path):
+    import yaml
+
+    hermes_home = tmp_path / "hh"
+    _prepare_hermes_home(hermes_home)
+    parsed = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8"))
+    assert parsed["mcp_servers"] == {}
+
+
+def test_prepare_hermes_home_symlinks_skill_dirs(tmp_path):
+    real_skill = tmp_path / "some" / "research"
+    real_skill.mkdir(parents=True)
+    (real_skill / "SKILL.md").write_text("# research", encoding="utf-8")
+
+    hermes_home = tmp_path / "hh"
+    _prepare_hermes_home(hermes_home, skill_dirs=[real_skill])
+
+    link = hermes_home / "skills" / "research"
+    assert link.is_symlink()
+    assert (link / "SKILL.md").read_text(encoding="utf-8") == "# research"
+
+
+def test_prepare_hermes_home_skill_symlink_failure_does_not_raise(tmp_path, monkeypatch):
+    def _boom(self, target, target_is_directory=False):
+        raise OSError("simulated symlink failure")
+
+    monkeypatch.setattr(Path, "symlink_to", _boom)
+    hermes_home = tmp_path / "hh"
+    _prepare_hermes_home(hermes_home, skill_dirs=[tmp_path / "some-skill"])  # must not raise
+    assert (hermes_home / "skills").is_dir()
+    assert not (hermes_home / "skills" / "some-skill").exists()
+
+
+async def test_ensure_started_writes_the_mcp_servers_it_was_given(tmp_path, monkeypatch):
+    """`ensure_started(..., mcp_servers=...)` (03-w4-interfaces.md §2; review
+    round-2 finding #4 / controller ruling R-H4): the real spawn path writes
+    an ALREADY-RESOLVED `mcp_servers` list into the worker's `config.yaml`.
+    Resolving `ctx.config.mcp_servers(project_id)` itself is no longer
+    `WorkerManager`'s job — see `ensure_started`'s own docstring for why (a
+    real `ConfigResolver` does synchronous sqlite I/O that must not run on
+    this class's event-loop thread) — that now happens in `sessions/
+    service.py::_run_turn`, off-loop, before this method is ever called; see
+    `test_sessions_service.py` for the caller-side degrade-on-failure
+    coverage that scenario used to (incorrectly) live here as."""
+    import yaml
+
+    monkeypatch.setenv("FAKE_ACP_MODE", "normal")
+    manager = _make_manager(tmp_path)
+    await manager.start()
+    try:
+        worker = await manager.ensure_started(
+            "s1", cwd="/tmp",
+            mcp_servers=[{"name": "echo", "command": "python3", "args": [], "env": {}}],
+        )
+        parsed = yaml.safe_load((worker.hermes_home / "config.yaml").read_text(encoding="utf-8"))
+        assert parsed["mcp_servers"] == {"echo": {"command": "python3", "args": [], "env": {}}}
+    finally:
+        await manager.stop()
+
+
+async def test_ensure_started_without_mcp_servers_has_none(tmp_path, monkeypatch):
+    """Every pre-existing test's `ensure_started(...)` call (no `mcp_servers=`)
+    must keep behaving exactly as before this Issue's change: an empty
+    `mcp_servers:` dict, never an error."""
+    import yaml
+
+    monkeypatch.setenv("FAKE_ACP_MODE", "normal")
+    manager = _make_manager(tmp_path)
+    await manager.start()
+    try:
+        worker = await manager.ensure_started("s1", cwd="/tmp")
+        parsed = yaml.safe_load((worker.hermes_home / "config.yaml").read_text(encoding="utf-8"))
+        assert parsed["mcp_servers"] == {}
     finally:
         await manager.stop()

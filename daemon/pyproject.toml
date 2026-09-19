@@ -47,6 +47,18 @@ worker = [
     # `[tool.uv.sources]` below) — `ee4452991d17534aa561f31ee55596d082aa94e7`
     # self-reports `version = "0.21.2"` in its own pyproject.toml.
     "hermes-agent[acp]==0.21.2",
+    # Issue #17/FR13 (03-w4-interfaces.md §2): source-verified (`tools/mcp_tool.py`'s
+    # `_ensure_mcp_sdk()`) that Hermes's MCP client support is gated on the `mcp`
+    # PyPI package being importable, but hermes-agent's own `[acp]` extra does NOT
+    # pull it in — only hermes-agent's OWN `dev` extra does (its pyproject.toml,
+    # `dev = [..., "mcp==2.0.0", ...]`). Without this, `uv sync --group worker`
+    # alone leaves `tests/integration/test_mcp_e2e.py` unable to register ANY MCP
+    # server ("MCP SDK not available -- skipping explicit MCP registration", a
+    # silent empty-list return, not an error — reproduced against this exact
+    # checkout before adding this line). Pinned to the same version hermes-agent's
+    # own `dev` extra uses, for the same "install exactly what that commit was
+    # built/tested against" reason `hermes-agent[acp]==0.21.2` above is pinned.
+    "mcp==2.0.0",
 ]
 
 [tool.uv]

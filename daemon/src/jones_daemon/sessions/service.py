@@ -66,7 +66,13 @@ from jones_daemon.projects.service import ProjectService
 from jones_daemon.providers.resolver import ProviderNotConfiguredError
 from jones_daemon.replay import retention as replay_retention
 from jones_daemon.replay import store as replay_store
-from jones_daemon.rpc.errors import INVALID_PARAMS, INVALID_STATE, NOT_FOUND, RpcError
+from jones_daemon.rpc.errors import (
+    INVALID_PARAMS,
+    INVALID_STATE,
+    MCP_SERVER_DOWN,
+    NOT_FOUND,
+    RpcError,
+)
 from jones_daemon.sessions import queries
 from jones_daemon.store import run_in_db_thread
 from jones_daemon.workers.manager import WorkerManager, WorkerStartupError
@@ -270,6 +276,40 @@ class SessionService:
         # acp_client.py) is left awaiting a future nobody will ever resolve.
         self._resolve_pending_permissions(reason="daemon shutdown")
         await self.worker_manager.stop()
+        # Issue #35 fix (root cause found via H/#17's repro — see
+        # `tests/repro_issue_35.py` and `tests/test_issue_35_repro.py`; reported
+        # against `kernel/acp_client.py`/`workers/manager.py` in 02-w3-
+        # interfaces.md §1.2, root cause turned out to live here instead — see
+        # this PR's report for the full writeup):
+        #
+        # `_advance_queue` (this file) pops `self._active_turns[session_id]` —
+        # the bookkeeping `active_turn_session_ids()` reports — BEFORE its own
+        # two remaining awaits (`run_in_db_thread(queries.list_queue_items,
+        # ...)` and the `queue.changed` broadcast) actually run. A caller using
+        # "no active turns" as its "safe to tear down now" signal (exactly what
+        # a graceful shutdown needs to do) can therefore proceed to close
+        # `ctx.db` (`__main__.py`'s `_run()`, right after this method returns)
+        # while that trailing work is still in flight on `store/db.py`'s
+        # single-worker `_DB_EXECUTOR`. If the event loop closes (`asyncio.
+        # run()`'s teardown) before that queued DB callable's result is
+        # delivered back, the awaiting `_run_turn` task is abandoned mid-flight
+        # — `loop.run_in_executor`'s completion callback has nowhere left to
+        # deliver the result to — which is exactly "Task was destroyed but it
+        # is pending!" at interpreter exit, this bug's actual, reproducible
+        # shape (not a true infinite hang every time, which is why it only
+        # showed up "间歇" — intermittently, depending on exactly how much of
+        # that trailing work had completed before shutdown reached this point).
+        #
+        # The fix: wait for every still-tracked `_turn_tasks` entry to actually
+        # finish (bounded, same 5s/`return_exceptions=True` shape the
+        # `_background_tasks` wait right below already uses, for the same
+        # reason — a shutdown must still make forward progress even if one is
+        # stuck) — AFTER `worker_manager.stop()` above, which is what unblocks
+        # a task still genuinely mid-Turn (an unbounded `AcpClient.prompt()`
+        # await starts erroring the moment its worker's stdout closes, see that
+        # class's `_read_loop` finally block), not before.
+        if self._turn_tasks:
+            await asyncio.wait(list(self._turn_tasks.values()), timeout=5.0)
         if self._retention_task is not None:
             self._retention_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -871,8 +911,50 @@ class SessionService:
                         ctx_turn, kind="error", reason=f"provider_error: {message}"
                     )
                     return
+                # Review round-2 finding #4 / controller ruling R-H4: resolve
+                # `ctx.config.mcp_servers(project_id)` HERE, off the event
+                # loop, and pass the already-resolved value into
+                # `ensure_started` — `WorkerManager` itself never touches a
+                # `ConfigResolver` again (see `ensure_started`'s docstring for
+                # why calling it directly on the event loop reproducibly threw
+                # `sqlite3.ProgrammingError` against every real, non-test-double
+                # `ConfigResolver` and made FR13's MCP wiring dead on the
+                # production path despite every test passing).
                 try:
-                    worker = await self.worker_manager.ensure_started(session_id, cwd=cwd)
+                    mcp_servers = await run_in_db_thread(
+                        self.ctx.config.mcp_servers, session["project_id"]
+                    )
+                except Exception as exc:  # noqa: BLE001 - a broken mcp.json must not
+                    # block the worker from starting at all (DEV.md 工程原则 #4:
+                    # 诚实失败 — reported via `daemon.error`, not silently
+                    # swallowed to a log line the way a previous round of this
+                    # branch did; R-H4 "不允许只 warning"). The session still
+                    # gets a worker with zero MCP tools rather than failing to
+                    # start entirely over an unrelated config file.
+                    logger.warning(
+                        "failed to resolve mcp_servers for project; starting worker "
+                        "with no MCP servers configured",
+                        extra={"detail": {"project_id": session["project_id"]}},
+                        exc_info=True,
+                    )
+                    mcp_servers = []
+                    await self.ctx.server.broadcast_all(
+                        "daemon.error",
+                        {
+                            "code": MCP_SERVER_DOWN,
+                            "message": f"session {session_id}: failed to resolve this "
+                            "project's configured MCP servers; starting with none",
+                            "detail": {
+                                "session_id": session_id,
+                                "project_id": session["project_id"],
+                                "error": str(exc),
+                            },
+                        },
+                    )
+                try:
+                    worker = await self.worker_manager.ensure_started(
+                        session_id, cwd=cwd, mcp_servers=mcp_servers
+                    )
                 except WorkerStartupError as exc:
                     await self._terminate_run(
                         ctx_turn, kind="error", reason=f"worker startup failed: {exc}"

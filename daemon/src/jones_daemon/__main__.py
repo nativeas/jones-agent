@@ -19,6 +19,7 @@ from typing import TextIO
 
 from jones_daemon import paths
 from jones_daemon.agents.methods import register as register_agents
+from jones_daemon.capabilities.methods import register as register_capabilities
 from jones_daemon.config.methods import register as register_config
 from jones_daemon.config.resolver import DefaultConfigResolver
 from jones_daemon.context import DaemonContext
@@ -128,6 +129,7 @@ async def _run() -> None:
         register_projects(server, ctx)
         register_agents(server, ctx)
         register_skills(server, ctx)
+        register_capabilities(server, ctx)  # Issue #17/#19 daemon 侧: `capability.list`
         session_service = sessions_methods.register(server, ctx)
         register_daemon_status(server, session_service)  # 02-w3-interfaces.md §2 集成收口 #2
         await session_service.startup()

@@ -19,6 +19,17 @@ PROVIDER_ERROR = 1004
 BUDGET_EXCEEDED = 1005
 KERNEL_ERROR = 1006
 TOO_MANY_REQUESTS = 1007
+# Issue #17/#19 daemon 侧 (03-w4-interfaces.md §2, G21; controller ruling R-H3).
+# R-H3's own text names these "1007 capability_drift、1008 mcp_server_down" —
+# 1007 was already `TOO_MANY_REQUESTS` in this table before this branch
+# existed (docs/design/00-foundation.md §4.3, shipped and tested since W2/A's
+# #10). Reusing it would silently change what an existing `daemon.error{code:
+# 1007}` means to every current consumer — the premise (that 1007 was free)
+# was wrong, not the ruling's intent; taking the next two free codes instead
+# is the "改前提不打补丁" fix (DEV.md 工程原则 #2), not a disagreement with
+# R-H3 — see the PR report's "契约变更" section.
+MCP_SERVER_DOWN = 1008
+CAPABILITY_DRIFT = 1009
 
 APP_ERROR_CODES = {
     NOT_FOUND: "not_found",
@@ -28,6 +39,8 @@ APP_ERROR_CODES = {
     BUDGET_EXCEEDED: "budget_exceeded",
     KERNEL_ERROR: "kernel_error",
     TOO_MANY_REQUESTS: "too_many_requests",
+    MCP_SERVER_DOWN: "mcp_server_down",
+    CAPABILITY_DRIFT: "capability_drift",
 }
 
 
