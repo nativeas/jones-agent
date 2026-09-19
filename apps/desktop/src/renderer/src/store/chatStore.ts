@@ -51,8 +51,12 @@ interface ChatState {
   /** turn_id → which action already completed successfully (round-2 review
    * #2/#6) — once a termination card's action has been used, it renders inert
    * (no buttons, a status line instead) rather than staying clickable forever
-   * (the bug that let one card spawn unlimited Turns). */
-  handledTerminations: Map<string, CardAction>
+   * (the bug that let one card spawn unlimited Turns). Round-N2 review #2:
+   * also carries `session.retry(action:"abandon")`'s own `cleared_queue_
+   * items` count, so the "放弃" status line can say how many (if any)
+   * queued instructions actually got cleared instead of always claiming the
+   * queue was cleared. */
+  handledTerminations: Map<string, { action: CardAction; clearedQueueItems?: number }>
 
   bindSession(transport: RpcTransport, sessionId: string): Promise<void>
   unbindSession(): void
@@ -420,7 +424,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       // Round-2 review #2/#6: mark the ORIGINAL failed turn's card inert —
       // it already spawned a new Turn, retrying it again would spawn another.
       set((state) => ({
-        handledTerminations: new Map(state.handledTerminations).set(turnId, 'retry')
+        handledTerminations: new Map(state.handledTerminations).set(turnId, { action: 'retry' })
       }))
     } finally {
       set((state) => {
@@ -460,7 +464,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         set((state) => ({ timeline: upsertTimeline(state.timeline, { kind: 'message', message }) }))
       }
       set((state) => ({
-        handledTerminations: new Map(state.handledTerminations).set(turnId, 'switch_model')
+        handledTerminations: new Map(state.handledTerminations).set(turnId, { action: 'switch_model' })
       }))
     } finally {
       set((state) => {
@@ -477,7 +481,15 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     if (pendingTerminations.has(turnId)) return
     set((state) => ({ pendingTerminations: new Set(state.pendingTerminations).add(turnId) }))
     try {
-      const res = await transport.call('session.retry', {
+      // Round-N2 review #2: `session.retry(action:"abandon")` returns
+      // `cleared_queue_items` (sessions/service.py::retry) — carry it through
+      // instead of discarding it, so the status line below can say how many
+      // (if any) queued instructions actually got cleared.
+      const res = await transport.call<{
+        turn_id: string
+        action: string
+        cleared_queue_items: number
+      }>('session.retry', {
         id: activeSessionId,
         turn_id: turnId,
         action: 'abandon'
@@ -491,7 +503,10 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       // a user had no way to tell "放弃" actually did anything. Mark it
       // handled so the card swaps its actions for a "已放弃" status line.
       set((state) => ({
-        handledTerminations: new Map(state.handledTerminations).set(turnId, 'abandon')
+        handledTerminations: new Map(state.handledTerminations).set(turnId, {
+          action: 'abandon',
+          clearedQueueItems: res.result?.cleared_queue_items
+        })
       }))
     } finally {
       set((state) => {

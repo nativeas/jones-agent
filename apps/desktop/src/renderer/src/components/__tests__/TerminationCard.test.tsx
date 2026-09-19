@@ -201,7 +201,7 @@ describe('TerminationCard', () => {
   it('round-2 review #2/#6: `handled` replaces the action buttons with a status line', () => {
     const card = errorCard()
     const { container, unmount } = mount(
-      <TerminationCard card={card} providers={providers} models={models} handled="retry" />
+      <TerminationCard card={card} providers={providers} models={models} handled={{ action: 'retry' }} />
     )
     try {
       expect(container.querySelectorAll('.termination-card__actions button')).toHaveLength(0)
@@ -211,13 +211,36 @@ describe('TerminationCard', () => {
     }
   })
 
-  it('round-2 review #2: an abandoned card says so even with nothing else to show', () => {
+  it('round-N2 review #2: an abandoned card with a nonzero cleared_queue_items says how many', () => {
     const card = errorCard({ actions: ['abandon'], retryable: false })
     const { container, unmount } = mount(
-      <TerminationCard card={card} providers={providers} models={models} handled="abandon" />
+      <TerminationCard
+        card={card}
+        providers={providers}
+        models={models}
+        handled={{ action: 'abandon', clearedQueueItems: 2 }}
+      />
     )
     try {
-      expect(container.textContent).toContain('已放弃，这条消息与排队中的后续指令已清空。')
+      expect(container.textContent).toContain('已放弃，同时清空了排队中的 2 条后续指令。')
+    } finally {
+      unmount()
+    }
+  })
+
+  it('round-N2 review #2: an abandoned card with an empty queue does not falsely claim it cleared something', () => {
+    const card = errorCard({ actions: ['abandon'], retryable: false })
+    const { container, unmount } = mount(
+      <TerminationCard
+        card={card}
+        providers={providers}
+        models={models}
+        handled={{ action: 'abandon', clearedQueueItems: 0 }}
+      />
+    )
+    try {
+      expect(container.textContent).toContain('已放弃这条消息。')
+      expect(container.textContent).not.toMatch(/清空了排队中的/)
     } finally {
       unmount()
     }

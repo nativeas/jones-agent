@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -318,14 +320,15 @@ async def test_worker_crash_watchdog_force_terminates_when_the_prompt_call_never
         service._turn_tasks[session_id] = stuck_task
 
         await service._on_worker_crash(session_id, 137)
-        # Round-2 review fix (#7) moved `task.cancel()` to the very last thing
-        # this function does (after its own finalize+terminate, see that
-        # function's comment) — `cancel()` only *schedules* delivery of
-        # `CancelledError`, it doesn't synchronously run it, so with nothing
-        # left to `await` afterward inside `_on_worker_crash`, the event loop
-        # hasn't necessarily had a turn to actually mark the task cancelled by
-        # the time this coroutine resumes here. Yield once so it does — a test
-        # concern only; production code has no such ordering dependency.
+        # `task.cancel()` (called right after the `current_run` status read,
+        # R-N1 — see `_on_worker_crash`'s comment) only *schedules* delivery of
+        # `CancelledError`, it doesn't synchronously run it. `_on_worker_crash`
+        # does several more `await`s afterward (`_finalize_streamed_messages`,
+        # `_terminate_run`'s DB read/write/broadcast) which should have already
+        # given the event loop plenty of chances to mark the task cancelled by
+        # the time this coroutine resumes here — this extra yield is just cheap
+        # test-side insurance against relying on that, not a production
+        # ordering dependency.
         await asyncio.sleep(0)
 
         assert len(_terminated(service)) == 1
@@ -339,19 +342,24 @@ async def test_worker_crash_watchdog_force_terminates_when_the_prompt_call_never
         await service.shutdown()
 
 
-async def test_worker_crash_watchdog_broadcasts_before_cancelling_the_stuck_task(
+async def test_worker_crash_watchdog_cancels_the_stuck_task_before_its_own_terminate(
     tmp_path, monkeypatch
 ):
-    """Round-2 review fix (#7), the actual contract: no matter what asyncio
-    scheduling does to the stuck task, this watchdog's own finalize+terminate
-    (and therefore its `run.terminated` broadcast) must happen BEFORE it calls
-    `task.cancel()` on the stuck task — not after. Verified by call order, not
-    by trying to win a real race against `store/db.py`'s single DB thread
-    (the failure mode this fix closes needs the interrupted task to be blocked
-    genuinely inside a `run_in_executor` future at the moment of cancellation,
-    which isn't something a test can force deterministically without invasive
-    mocking of the DB thread itself — the order guarantee this test checks is
-    what makes that scenario safe regardless of exact timing)."""
+    """Round-N2 review fix (#1, controller ruling R-N1) supersedes round-2's
+    (#7) "broadcast before cancel" ordering, which this test used to lock in
+    (`order == ["terminate", "cancel"]`). Round-2's reordering moved the
+    `self._turn_tasks.get(session_id)` lookup several `await`s after the
+    `current_run` status read — long enough for the in-flight `prompt()`
+    call's own `finally: await self._advance_queue(...)` to pop+start the NEXT
+    queued Turn in between, so that late lookup could grab the NEW task
+    instead of the stuck one (this round's review #1). The fix reverts to
+    capturing/cancelling the task immediately after the status read — this
+    test now locks in THAT order instead (`cancel` before `terminate`) — and
+    relies on `_terminate_run`'s own write/broadcast idempotency split (R-N1,
+    see `test_terminate_run_rebroadcasts_after_a_racing_write_gets_cancelled`
+    below) to still guarantee a broadcast no matter how the race against the
+    cancelled task's own write resolves, instead of trying to win that race
+    through call ordering."""
     monkeypatch.setattr(service_module, "_WORKER_CRASH_GRACE_S", 0.2)
     monkeypatch.setattr(service_module, "_WORKER_CRASH_POLL_INTERVAL_S", 0.02)
     service = await _make_service(tmp_path, monkeypatch)
@@ -412,7 +420,7 @@ async def test_worker_crash_watchdog_broadcasts_before_cancelling_the_stuck_task
 
         await service._on_worker_crash(session_id, 137)
 
-        assert order == ["terminate", "cancel"]
+        assert order == ["cancel", "terminate"]
     finally:
         hung.cancel()
         stuck_task.cancel()
@@ -420,6 +428,118 @@ async def test_worker_crash_watchdog_broadcasts_before_cancelling_the_stuck_task
         # proxy with the real (already-cancelled) task before that, or it
         # blows up on the proxy missing `add_done_callback`.
         service._turn_tasks[session_id] = stuck_task
+        await service.shutdown()
+
+
+async def test_terminate_run_rebroadcasts_after_a_racing_write_gets_cancelled(
+    tmp_path, monkeypatch
+):
+    """R-N1 (controller ruling, round-N2): reproduces the exact window the old
+    watchdog-race comment wrongly claimed couldn't exist — a call to
+    `_terminate_run` gets cancelled *after* its `mark_run_terminated` DB write
+    has already committed on `store/db.py`'s single DB thread but *before* it
+    reaches its own `run.terminated` broadcast. Before this fix, a second call
+    to `_terminate_run` for the same Run (standing in for the N07 watchdog's
+    own call right after cancelling the stuck task) would see `runs.status !=
+    'running'` and return unconditionally — net result, `run.terminated`
+    broadcasts zero times and the UI is stuck on "运行中" forever.
+
+    The delay is injected directly into `queries.mark_run_terminated` itself —
+    the real UPDATE runs synchronously first, *then* the delay — so the
+    asyncio-level cancel genuinely cannot stop the write (matching
+    `store/db.py`'s `ThreadPoolExecutor` semantics exactly, not simulating
+    them): once a job is actually running on that single worker thread,
+    cancelling the awaiting asyncio Task can't cancel the underlying
+    `concurrent.futures.Future`, so the coroutine gets `CancelledError`
+    delivered only once that future resolves — discarding its real result, not
+    stopping the write that already happened."""
+    service = await _make_service(tmp_path, monkeypatch)
+    try:
+        session_id = await _new_session(service, title="s1")
+        run_id = "run_delay01"
+        turn_id = "turn_delay01"
+        await run_in_db_thread(
+            service_module.queries.create_turn_and_user_message,
+            service.ctx.db,
+            turn_id=turn_id,
+            message_id="msg_delay01",
+            session_id=session_id,
+            text="hello",
+            queued=False,
+        )
+        await run_in_db_thread(
+            service_module.queries.create_run,
+            service.ctx.db,
+            run_id=run_id,
+            turn_id=turn_id,
+            session_id=session_id,
+        )
+        ctx_turn = service_module._TurnContext(
+            turn_id=turn_id, run_id=run_id, session_id=session_id
+        )
+
+        write_committed = threading.Event()
+        real_mark_run_terminated = service_module.queries.mark_run_terminated
+
+        def _slow_mark_run_terminated(
+            conn: Any,
+            run_id_: str,
+            turn_id_: str,
+            *,
+            kind: str,
+            reason: str,
+            terminated_step_seq: int | None = None,
+        ) -> None:
+            # The real write happens (and commits) FIRST — everything after
+            # this point is purely simulating "still inside the awaited
+            # executor future", the exact window `task.cancel()` can't reach.
+            real_mark_run_terminated(
+                conn,
+                run_id_,
+                turn_id_,
+                kind=kind,
+                reason=reason,
+                terminated_step_seq=terminated_step_seq,
+            )
+            write_committed.set()
+            time.sleep(0.2)
+
+        monkeypatch.setattr(
+            service_module.queries, "mark_run_terminated", _slow_mark_run_terminated
+        )
+
+        racing_call = asyncio.create_task(
+            service._terminate_run(ctx_turn, kind="error", reason="ACP prompt failed: boom")
+        )
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, write_committed.wait, 2.0)
+        assert write_committed.is_set(), "the DB write never started — test setup is broken"
+        # The write has committed; now interrupt the coroutine before it gets
+        # to its own broadcast — this is the exact scenario the deleted
+        # comment claimed couldn't happen.
+        racing_call.cancel()
+        try:
+            await racing_call
+        except asyncio.CancelledError:
+            pass
+
+        # Confirms the cancel really did land before the broadcast — this is
+        # the failure mode being reproduced, not (yet) the fix.
+        assert _terminated(service) == []
+
+        # A second call (standing in for the watchdog's own `_terminate_run`
+        # right after cancelling the stuck task) must not silently no-op just
+        # because `runs.status` is already 'terminated' — it has to notice the
+        # write landed without a broadcast and rebroadcast from the persisted
+        # row.
+        await service._terminate_run(ctx_turn, kind="error", reason="ACP prompt failed: boom")
+
+        events = _terminated(service)
+        assert len(events) == 1
+        assert events[0]["run_id"] == run_id
+        assert events[0]["turn_id"] == turn_id
+        assert events[0]["card"]["kind"] == ErrorKind.PROVIDER_ERROR.value
+    finally:
         await service.shutdown()
 
 

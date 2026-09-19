@@ -416,6 +416,19 @@ class SessionService:
         # a restart just falls back to the Agent's normal model_pref, which is
         # honest — PRD 5.8 never promises restart preserves in-flight intent).
         self._turn_model_override: dict[str, dict[str, Any]] = {}
+        # Round-N2 review fix (#1, controller ruling R-N1): `_terminate_run`'s
+        # idempotency guard used to treat "DB write already landed" and
+        # "already broadcast" as the same fact — they aren't (see that
+        # method's guard for the full race this closes). This tracks which
+        # `run_id`s have actually had `run.terminated` broadcast, so a second
+        # call for a Run whose write landed but whose broadcast never fired
+        # (its caller's coroutine got cancelled in between) can tell the
+        # difference and rebroadcast instead of silently no-op-ing. Same
+        # restart-scoped lifetime as the maps above; never pruned — each entry
+        # is one short run_id string for one terminated Run in this process's
+        # lifetime, not worth cross-function bookkeeping in `_advance_queue`
+        # (out of this branch's authorized change set, 04-w5-interfaces.md §1).
+        self._terminated_broadcast_run_ids: set[str] = set()
 
     def _lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -1392,17 +1405,56 @@ class SessionService:
         # `prompt()` call's own `except (AcpError, AcpProtocolError)` branch was
         # about to do the same thing on its own (see `_on_worker_crash`'s
         # docstring note) — rather than add cross-coroutine locking for a race
-        # this narrow, make the second call a documented no-op: a Run already
-        # out of `'running'` status has already been reported once, and writing
-        # over it again (or broadcasting `run.terminated` twice) would be the
-        # actual bug, not this check.
+        # this narrow, make the second call a documented no-op for the DB
+        # write: a Run already out of `'running'` status has already had that
+        # write happen once, and writing over it again would be the actual
+        # bug, not this check.
+        #
+        # Round-N2 review fix (#1, controller ruling R-N1): "already written"
+        # and "already broadcast" are NOT the same fact, and treating them as
+        # one (the old code below this comment used to `return` unconditionally
+        # here) could drop `run.terminated` entirely. The two racing callers
+        # for the same Run are always "the in-flight `prompt()` call's own
+        # termination" and "`_on_worker_crash`'s N07 watchdog" — if the FIRST
+        # one to reach `mark_run_terminated` gets `task.cancel()`-ed by the
+        # watchdog while genuinely blocked inside that DB call (a real
+        # `ThreadPoolExecutor` future on `store/db.py`'s single worker thread —
+        # cancelling the awaiting asyncio Task can't stop a callable already
+        # running on that thread; the UPDATE keeps going to completion and
+        # commits), the cancelled coroutine gets `CancelledError` delivered
+        # right at that await and never reaches its own broadcast a few lines
+        # below. The watchdog's own subsequent `_terminate_run` call would then
+        # read `status != 'running'` here — under the old code, that alone was
+        # treated as "already reported, nothing to do", so `run.terminated`
+        # broadcasts zero times and the UI is stuck on "运行中" forever
+        # (recoverable only by restarting the daemon; exactly what N07 exists
+        # to prevent).
+        #
+        # Tracking which `run_id`s have actually been broadcast (not just
+        # written) separately closes this: a duplicate call for a `run_id`
+        # already in that set is a true no-op (something really did broadcast
+        # already); one that isn't rebuilds the `run.terminated` payload from
+        # the persisted row and broadcasts it now, guaranteeing at least one
+        # broadcast for this Run no matter which of the two racing callers'
+        # writes landed first or which one got cancelled in between.
         existing = await run_in_db_thread(queries.get_run, self.ctx.db, ctx_turn.run_id)
         if existing is not None and existing["status"] != "running":
-            logger.debug(
-                "_terminate_run called for a Run that's already terminated; skipping "
-                "the duplicate DB write/broadcast",
+            if ctx_turn.run_id in self._terminated_broadcast_run_ids:
+                logger.debug(
+                    "_terminate_run called for a Run that's already terminated AND "
+                    "broadcast; skipping the duplicate DB write/broadcast",
+                    extra={"detail": {"run_id": ctx_turn.run_id, "status": existing["status"]}},
+                )
+                return
+            logger.warning(
+                "_terminate_run called for a Run whose DB write already landed but "
+                "was never broadcast (the writer's own coroutine likely got "
+                "cancelled between its DB write and its broadcast — R-N1); "
+                "rebroadcasting from the persisted row instead of dropping "
+                "run.terminated",
                 extra={"detail": {"run_id": ctx_turn.run_id, "status": existing["status"]}},
             )
+            await self._rebroadcast_terminated_run(existing)
             return
 
         # Issue #22 (04-w5-interfaces.md §4): "run.terminated 的 card 字段统一用
@@ -1465,6 +1517,62 @@ class SessionService:
                 "card": card.to_dict(),
             },
         )
+        # R-N1: mark this Run as actually broadcast, not just written — see the
+        # idempotency guard above.
+        self._terminated_broadcast_run_ids.add(ctx_turn.run_id)
+
+    async def _rebroadcast_terminated_run(self, existing: dict[str, Any]) -> None:
+        """R-N1 (controller ruling, round-N2): rebuild and broadcast
+        `run.terminated` from an already-persisted `runs` row — used only by
+        `_terminate_run`'s idempotency guard, for a Run whose DB write landed
+        but whose broadcast never happened (the coroutine that wrote it got
+        cancelled before reaching its own broadcast call).
+
+        `existing["terminated_kind"]`/`["terminated_reason"]` are the *outer*
+        `kind` (`"user"|"error"|"budget"`) and the already-redacted `reason`
+        `_terminate_run` itself persisted — this reclassifies from them
+        directly (this coroutine is a different call site than the one that
+        actually wrote the row, so it never had the original caller's raw
+        `kind`/`reason` to begin with; the race means it can't).
+
+        One known, accepted loss from that: if the original write upgraded a
+        `PROVIDER_QUOTA` classification to the outer `"budget"` kind
+        (`classify.terminated_kind_for`), this rebuild's `card.kind` comes
+        back as `"budget"` rather than the finer `"provider_quota"`
+        (`classify.classify()` trusts an explicit `kind_hint="budget"`
+        outright) — a slightly different title/icon than the original
+        broadcast would have shown, for this one reconstructed broadcast only.
+        Not worth widening `runs`' persisted shape to carry the pre-upgrade
+        `ErrorKind` just for a race this narrow: the outer `kind`/`actions`/
+        `retryable` a user actually acts on are unaffected (`BUDGET` and
+        `PROVIDER_QUOTA` share the same `("abandon",)` action set).
+        """
+        run_id = existing["id"]
+        reason = existing["terminated_reason"] or ""
+        step_seq = existing["terminated_step_seq"]
+        outer_kind = existing["terminated_kind"]
+        if classify.is_user_stop(outer_kind):
+            card = classify.build_user_card(reason)
+        else:
+            last_step = await run_in_db_thread(_last_step_for_run, self.ctx.db, run_id)
+            error_kind = classify.classify(
+                kind_hint=outer_kind,
+                reason=reason,
+                last_step_status=last_step["status"] if last_step else None,
+            )
+            card = classify.build_card(error_kind, reason=reason, step_seq=step_seq)
+        await self.ctx.server.broadcast(
+            existing["session_id"],
+            "run.terminated",
+            {
+                "run_id": run_id,
+                "turn_id": existing["turn_id"],
+                "kind": outer_kind,
+                "reason": reason,
+                "card": card.to_dict(),
+            },
+        )
+        self._terminated_broadcast_run_ids.add(run_id)
 
     async def _advance_queue(self, session_id: str) -> None:
         # Deliberately NOT called from `startup()` — this is what keeps normal
@@ -2154,22 +2262,49 @@ class SessionService:
         # be able to land the `CancelledError` *inside* `pop_next_queue_item`,
         # after the queued item had already been popped off `queue_items` but
         # before `_start_turn` ran — silently dropping a queued user message
-        # with no way to recover it, and separately (if the cancel instead
-        # landed mid-`_terminate_run`) could cut a Run off between its DB write
-        # and its broadcast, leaving the UI stuck on "运行中" forever (exactly
-        # what N07 exists to prevent) since `_terminate_run`'s idempotency
-        # guard would then treat *this* call as a no-op too.
+        # with no way to recover it.
         #
         # Reading `runs.status` right before deciding whether to cancel closes
-        # both: if the normal path already wrote 'terminated'/'completed', skip
+        # that: if the normal path already wrote 'terminated'/'completed', skip
         # the cancel (and the redundant force-terminate below) entirely and let
-        # that path's own broadcast stand — and because this read and the
-        # `task.cancel()` call that follows it have no `await` between them,
-        # nothing else can run on this single-threaded event loop in between to
-        # invalidate what was just read (asyncio only ever switches tasks at an
-        # `await`), so there is no re-introduced race here, only the same
-        # already-covered narrow one `_terminate_run`'s own idempotency guard
-        # documents.
+        # that path's own broadcast stand.
+        #
+        # Round-N2 review fix (#1, controller ruling R-N1): a since-corrected
+        # comment used to sit here claiming this read having no `await` before
+        # `task.cancel()` was *by itself* enough to rule out any race — wrong
+        # conclusion, and the wrong half of it is exactly what let round-2's
+        # own fix (see below) reintroduce a *different* bug this round's
+        # review caught: round-2 moved the `self._turn_tasks.get(session_id)`
+        # lookup several `await`s below this point (after this watchdog's own
+        # `_finalize_streamed_messages`/`_terminate_run` calls), so if the
+        # in-flight `prompt()` call made enough progress during those awaits to
+        # reach `finally: await self._advance_queue(...)` and pop+start the
+        # NEXT queued Turn, that late lookup would silently grab the NEW task
+        # (`self._turn_tasks[session_id]` already overwritten) instead of the
+        # actually-stuck one — cancelling a just-started, user-queued Turn with
+        # no error, no log, and no `run.terminated` for it (`CancelledError`
+        # isn't caught by `_run_turn`'s `except Exception`; this watchdog's own
+        # `_terminate_run` call is for the *crashed* Run, not that one).
+        #
+        # The fix is to capture (and, if needed, cancel) the task right here —
+        # immediately after this read, no `await` between them — which DOES
+        # correctly guarantee `self._turn_tasks.get(session_id)` is still the
+        # stuck task (nothing else can run on this single-threaded loop between
+        # two statements with no `await` in between; that part of the old
+        # reasoning was right). What it does NOT guarantee, and what the old
+        # comment's "⇒ 无竞态" conclusion got wrong, is that cancelling this
+        # task can't still land *inside* `mark_run_terminated`'s DB call —
+        # cancelling the asyncio Task can't stop a callable already running on
+        # `store/db.py`'s single DB worker thread (a real `ThreadPoolExecutor`
+        # future); the write keeps going to completion and commits, but the
+        # cancelled coroutine never reaches its own broadcast. That race is
+        # real regardless of the await-gap here, and closing it is no longer
+        # this function's job: `_terminate_run`'s own idempotency guard now
+        # tracks "written" vs. "broadcast" separately (R-N1) and rebroadcasts
+        # from the persisted row if this Run was already marked terminated but
+        # never actually broadcast — so cancelling immediately, right here, is
+        # safe again, without needing round-2's "finalize+terminate before
+        # cancel" reordering to *win* that race outright.
         current_run = await run_in_db_thread(queries.get_run, self.ctx.db, ctx_turn.run_id)
         if current_run is not None and current_run["status"] != "running":
             logger.debug(
@@ -2183,51 +2318,37 @@ class SessionService:
             f"{_WORKER_CRASH_GRACE_S}s; force-terminating the Run (N07)",
             extra={"detail": {"session_id": session_id, "returncode": returncode}},
         )
-        # Round-2 review fix (#7): this watchdog's own finalize+terminate now
-        # run BEFORE `task.cancel()`, not after. Round-1's fix closed only half
-        # the race: `current_run["status"]` above is read with no `await`
-        # before the (old) `task.cancel()` call, so nothing could invalidate
-        # *that* read in between — but by the time this deadline fires, the
-        # in-flight `prompt()` call's own `_terminate_run` may already be PAST
-        # its own idempotency check and genuinely blocked awaiting
-        # `run_in_db_thread(queries.mark_run_terminated, ...)` (a real
-        # `ThreadPoolExecutor` future — `store/db.py`'s single DB worker
-        # thread). Cancelling `_run_turn`'s task at that exact point doesn't
-        # stop the write (the callable is already running on the DB thread and
-        # keeps going to completion/commit) — it only raises `CancelledError`
-        # in the coroutine the instant that awaited future resolves, which
-        # lands *before* that call's own `run.terminated` broadcast. This
-        # watchdog would then reach ITS OWN `_terminate_run` call and find the
-        # idempotency guard already sees `status != 'running'` (the other
-        # call's write did land) and skip out as a no-op too — net result: DB
-        # says terminated, `run.terminated` broadcasts zero times, UI stuck on
-        # "运行中" forever (exactly what N07 exists to prevent), recoverable
-        # only by restarting the daemon.
+        task = self._turn_tasks.get(session_id)
+        if task is not None and not task.done():
+            # Cancelling (rather than awaiting) `_run_turn`'s own stuck task is
+            # what still lets its `finally: await self._advance_queue(...)` run
+            # and unstick the session's queue — `asyncio.CancelledError` isn't
+            # caught by that function's `except Exception`, so this can never
+            # turn into a second uncontrolled `_terminate_run` call from that
+            # task — at worst that task's own call, if it gets there first,
+            # no-ops (or rebroadcasts, R-N1) via `_terminate_run`'s idempotency
+            # guard.
+            task.cancel()
+        # Round-1 review fix (#7): every other termination path (`_run_turn`'s
+        # own `except (AcpError, AcpProtocolError)` and its catch-all backstop)
+        # calls this before `_terminate_run` — streamed `message.delta` text
+        # only lives on `ctx_turn` until finalized, so skipping it here (as
+        # this watchdog path used to) meant a Run force-terminated by N07 could
+        # drop assistant text the user had already watched stream past,
+        # forever, from the `messages` table (FR06 replay). Cancelling
+        # `_run_turn`'s task raises `CancelledError` in it — a `BaseException`,
+        # not caught by that function's `except Exception` — so it could never
+        # reach its own finalize call either; this watchdog has to do it.
         #
-        # Doing our own finalize+terminate first guarantees at least one
-        # `run.terminated` for this Run no matter how that race resolves — the
-        # worst case is now a rare *duplicate* broadcast (this call's, plus the
-        # interrupted call's own if `task.cancel()` below doesn't manage to
-        # interrupt it before its broadcast either), which the renderer already
-        # handles fine (`chatStore.ts`'s `upsertTimeline` keys termination
-        # entries by `run_id`, so a repeat just replaces the same entry) — a
-        # strictly better failure mode than "never at all".
+        # This call, and `_terminate_run` right after it, are what guarantee
+        # `run.terminated` broadcasts at least once for the crashed Run no
+        # matter how the race against the just-cancelled task's own write/
+        # broadcast resolves (R-N1's split idempotency guard) — replacing
+        # round-2's approach of reordering this call before the cancel above to
+        # *try* to win that race through ordering alone.
         await self._finalize_streamed_messages(ctx_turn)
         await self._terminate_run(
             ctx_turn,
             kind="error",
             reason=f"worker process exited unexpectedly (code {returncode})",
         )
-        task = self._turn_tasks.get(session_id)
-        if task is not None and not task.done():
-            # Still cancel the stuck task afterward — this is what lets its own
-            # `finally: await self._advance_queue(...)` run (or, if it's
-            # currently blocked on the now-already-written DB call above,
-            # short-circuits it before a redundant/racing second write) and
-            # unsticks the session's queue if `_run_turn` is truly hung rather
-            # than just momentarily slow. `asyncio.CancelledError` isn't caught
-            # by that function's `except Exception`, so this can never turn
-            # into a second uncontrolled `_terminate_run` call from that task —
-            # at worst that task's own call, if it gets there first, no-ops via
-            # the idempotency guard this function already passed above.
-            task.cancel()

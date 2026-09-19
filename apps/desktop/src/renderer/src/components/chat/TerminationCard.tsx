@@ -17,8 +17,17 @@ interface TerminationCardProps {
   /** Round-2 review #2/#6: which action already completed successfully for
    * this card, if any — renders a status line instead of live buttons so a
    * used-up card can never be actioned again, and so "放弃" has a visible
-   * effect even when the queue it cleared was already empty. */
-  handled?: CardAction
+   * effect even when the queue it cleared was already empty.
+   *
+   * Round-N2 review #2: `clearedQueueItems` is `session.retry(action:
+   * "abandon")`'s own `cleared_queue_items` count, threaded through from the
+   * RPC result — the "放弃" status line used to be a single unconditional
+   * sentence claiming the queue was cleared regardless of whether it actually
+   * had anything in it (or anything left in it, see 04-w5-interfaces.md
+   * §4.2's open item on `_advance_queue`), which is untrue in the common
+   * (empty-queue) case. Left `undefined` for `retry`/`switch_model`, which
+   * don't touch the queue. */
+  handled?: { action: CardAction; clearedQueueItems?: number }
 }
 
 /** Issue #22 (FR14, 04-w5-interfaces.md §4) — daemon classifies, this only
@@ -45,10 +54,17 @@ const ACTION_LABEL: Record<CardAction, string> = {
 }
 
 /** Round-2 review #2/#6: what a used-up card says instead of its buttons. */
-const HANDLED_LABEL: Record<CardAction, string> = {
+const HANDLED_LABEL: Record<'retry' | 'switch_model', string> = {
   retry: '已重试，新的对话已经开始。',
-  switch_model: '已换模型重试，新的对话已经开始。',
-  abandon: '已放弃，这条消息与排队中的后续指令已清空。'
+  switch_model: '已换模型重试，新的对话已经开始。'
+}
+
+/** Round-N2 review #2: "放弃" splits on the RPC's actual `cleared_queue_items`
+ * count instead of always claiming the queue was cleared — see the `handled`
+ * prop's doc comment above for why. */
+function abandonLabel(clearedQueueItems: number | undefined): string {
+  if (!clearedQueueItems) return '已放弃这条消息。'
+  return `已放弃，同时清空了排队中的 ${clearedQueueItems} 条后续指令。`
 }
 
 function ModelPicker({
@@ -176,7 +192,9 @@ export function TerminationCard({
         </details>
       )}
       {handled ? (
-        <div className="termination-card__handled">{HANDLED_LABEL[handled]}</div>
+        <div className="termination-card__handled">
+          {handled.action === 'abandon' ? abandonLabel(handled.clearedQueueItems) : HANDLED_LABEL[handled.action]}
+        </div>
       ) : picking ? (
         <ModelPicker
           providers={providers}

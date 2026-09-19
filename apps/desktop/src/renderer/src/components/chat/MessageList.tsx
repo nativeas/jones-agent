@@ -22,8 +22,10 @@ interface MessageListProps {
   onAbandon?: (turnId: string) => void
   /** Round-2 review #6: turn_ids currently awaiting a `session.retry` round-trip. */
   pendingTerminations?: Set<string>
-  /** Round-2 review #2/#6: turn_id → which action already completed for it. */
-  handledTerminations?: Map<string, CardAction>
+  /** Round-2 review #2/#6: turn_id → which action already completed for it
+   * (round-N2 review #2: plus `cleared_queue_items` for "放弃", see
+   * `TerminationCard`'s `handled` prop doc comment). */
+  handledTerminations?: Map<string, { action: CardAction; clearedQueueItems?: number }>
 }
 
 function renderEntry(entry: TimelineEntry, props: MessageListProps): JSX.Element {

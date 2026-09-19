@@ -184,7 +184,7 @@ describe('chatStore', () => {
 
     await useChatStore.getState().retryTermination(turnId!)
 
-    expect(useChatStore.getState().handledTerminations.get(turnId!)).toBe('retry')
+    expect(useChatStore.getState().handledTerminations.get(turnId!)).toEqual({ action: 'retry' })
     expect(useChatStore.getState().pendingTerminations.has(turnId!)).toBe(false)
   })
 
@@ -219,8 +219,30 @@ describe('chatStore', () => {
     // Round-2 review #2: even when the queue was already empty (the most
     // common case, not exercised by this particular scenario since it does
     // have a queued item), "放弃" needs SOME visible confirmation — marking
-    // the card handled is what drives that in TerminationCard.
-    expect(useChatStore.getState().handledTerminations.get(turnId!)).toBe('abandon')
+    // the card handled is what drives that in TerminationCard. Round-N2
+    // review #2: the RPC's own `cleared_queue_items` (1 here — the one
+    // queued message) rides along instead of being discarded.
+    expect(useChatStore.getState().handledTerminations.get(turnId!)).toEqual({
+      action: 'abandon',
+      clearedQueueItems: 1
+    })
+  })
+
+  it('round-N2 review #2: abandonTermination() with nothing queued reports clearedQueueItems: 0, not a false "已清空"', async () => {
+    const transport = new MockTransport({ schedule: (fn) => fn() })
+    await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
+    await useChatStore.getState().send('/error 网络中断')
+    const card = useChatStore.getState().timeline.find((e) => e.kind === 'termination')
+    const turnId = card?.kind === 'termination' ? card.card.turn_id : undefined
+    expect(turnId).toBeDefined()
+    expect(useChatStore.getState().queue).toHaveLength(0)
+
+    await useChatStore.getState().abandonTermination(turnId!)
+
+    expect(useChatStore.getState().handledTerminations.get(turnId!)).toEqual({
+      action: 'abandon',
+      clearedQueueItems: 0
+    })
   })
 
   it('removeQueueItem drops the item from the queue panel', async () => {
