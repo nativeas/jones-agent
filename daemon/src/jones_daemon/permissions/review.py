@@ -32,9 +32,11 @@ own docstring for why that floor is gone now, not merely widened).
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 # Round 5 (controller ruling R7, 2026-09-19, final): the terminal classifier
 # below must not use `shlex.split` any more — reuse `kernel/plugin/
@@ -48,6 +50,17 @@ from jones_daemon.kernel.plugin.jones_gate import _hard_deny, _transparency
 
 RiskLevel = Literal["low", "medium", "high"]
 
+# Round-1 post-merge-review fixes (2026-09-19, findings #1/#6/#8): this whole
+# browser section used to name Playwright-MCP tools (browser_take_screenshot,
+# browser_fill_form, browser_evaluate, ...) that don't exist in the alpha
+# (Hermes-native browser_*) toolset this branch actually shipped. 00-foundation.md
+# section 9.3 had already been rewritten to the real tool names but this
+# classifier never followed, so every real browser tool except browser_click/
+# browser_type was silently falling through to the medium catch-all at the
+# bottom of classify() instead of the tier section 9.3 actually specifies for
+# it. Rewritten below to match section 9.3 (round-3 rewrite) tool name for
+# tool name.
+
 # Tools whose read-only-ness is knowable from the name alone (no args needed) —
 # 00-foundation.md §9.2's rule-gate-eligible browser tools plus Hermes's two
 # read-only file tools. NOTE: these are classified `low` here for cases where a
@@ -57,8 +70,17 @@ RiskLevel = Literal["low", "medium", "high"]
 # outright per 00-foundation.md §9.2, so in practice only `read_file`/
 # `search_files` are likely to actually reach this function via that name set.
 _READ_ONLY_LOW = frozenset(
-    {"read_file", "search_files", "browser_navigate", "browser_snapshot",
-     "browser_take_screenshot", "browser_wait_for"}
+    {"read_file", "search_files", "browser_snapshot", "browser_get_images", "browser_vision"}
+)
+
+# section 9.3's "constant user gate" browser tools -- the tool name alone IS
+# the high-risk signal, never downgraded by args, never routed through
+# review-gate judgment. browser_cdp is the raw-CDP escape hatch (can bypass
+# every other semantic tier); the browser_vault_* four touch the credential
+# vault.
+_BROWSER_ALWAYS_HIGH = frozenset(
+    {"browser_cdp", "browser_vault_unlock", "browser_vault_fill",
+     "browser_vault_save_login", "browser_vault_enter_code"}
 )
 
 # 02-w3-interfaces.md §1.1: "终端命令是否含网络外发 curl|wget|ssh|scp"; round 4
@@ -68,22 +90,100 @@ _READ_ONLY_LOW = frozenset(
 # ssh scp nc rsync ftp）在 token 流任意位置出现 → high").
 _NETWORK_EGRESS_PROGRAMS = frozenset({"curl", "wget", "ssh", "scp", "nc", "rsync", "ftp"})
 
-# 00-foundation.md §9.2's user-gate condition ③ for `browser_evaluate`: "求值的
-# 表达式里含网络请求...或存储写入". Deliberately coarse (a substring scan, not a
-# JS parser) — same "v1 用确定性规则" scope as everything else in this module.
+# section 9.3's user-gate condition (3) for browser_console (evaluated WITH an
+# expression -- formerly wired to the nonexistent browser_evaluate tool,
+# findings #1/#8): "the evaluated expression touches a network request...or a
+# storage write". Deliberately coarse (a substring scan, not a JS parser) --
+# same "v1 uses deterministic rules" scope as everything else in this module.
 _JS_NETWORK_OR_STORAGE_MARKERS = (
     "fetch(", "XMLHttpRequest", "localStorage", "sessionStorage", "indexedDB",
     "document.cookie",
 )
 
-# 00-foundation.md §9.2's three-tier table for the browser tools that DO need
-# review-gate judgment (the read-only ones are in `_READ_ONLY_LOW` instead, and
-# `browser_evaluate` gets its own args-aware rule below).
+# section 9.3's review-gate tier for browser tools that have side effects but
+# whose tool name alone isn't a high-risk signal -- v1 has no model-backed
+# semantic judgment (this module's own docstring: "v1 uses deterministic rules
+# first...model judgment is a W4+ enhancement"), so these floor at `medium`;
+# the "is this actually a form submission" escalation section 9.3 describes is
+# explicitly model-judged, not a deterministic rule this function implements.
 _BROWSER_REVIEW_TOOLS = frozenset(
-    {"browser_click", "browser_fill_form", "browser_type", "browser_press_key",
-     "browser_drag", "browser_select_option", "browser_hover", "browser_file_upload",
-     "browser_tabs"}
+    {"browser_click", "browser_type", "browser_scroll", "browser_back", "browser_press",
+     "browser_dialog"}
 )
+
+_SAFE_URL_SCHEMES = frozenset({"http", "https"})
+
+
+def _looks_private_or_loopback(hostname: str | None) -> bool:
+    """Literal-string/IP check only -- no DNS resolution (`classify()` must
+    stay synchronous with no I/O). Catches the common literal spellings
+    (`localhost`, `127.0.0.1`, `10.x`, `192.168.x`, link-local, `::1`, ...);
+    does NOT catch a private hostname that only *resolves* to a private
+    address (would need a network lookup this function deliberately doesn't
+    do)."""
+    if not hostname:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return addr.is_private or addr.is_loopback or addr.is_link_local
+
+
+def _classify_browser_navigate(args: dict[str, Any]) -> Risk:
+    """Review finding #6 (critical): `capabilities/browser.py::
+    browser_worker_config` forces the worker config `browser.
+    allow_private_urls: true`, which is the ONLY thing gating Hermes's
+    `tools/url_safety.py::_is_safe_url` on a CDP-override backend -- that
+    function is also the only place Hermes rejects a non-http(s) scheme (e.g.
+    `file://`), so this branch's own config change silently disables it for
+    EVERY navigation, not just the private-IP ones the config name suggests.
+    A name-only `low` here (section 9.3's old text) would leave
+    `browser_navigate('file:///Users/x/.ssh/id_rsa')` auto-allowed in auto
+    mode with no `permission.requested` broadcast at all. This function is
+    the compensating control section 9.3 (round-1 fix) now requires: a
+    non-http(s) scheme, or a literal private/loopback host, escalates to the
+    user gate instead of auto-allowing."""
+    url = args.get("url")
+    if not isinstance(url, str) or not url:
+        return _medium("browser_navigate call with no resolvable url to classify")
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in _SAFE_URL_SCHEMES:
+        return _high(
+            f"browser_navigate targets a non-http(s) scheme ({scheme or '(none)'!r}) -- "
+            "this branch's forced browser.allow_private_urls disables Hermes's own "
+            "scheme check for this call (review finding #6)"
+        )
+    if _looks_private_or_loopback(parts.hostname):
+        return _high(
+            f"browser_navigate targets a private/loopback host ({parts.hostname!r}) -- "
+            "this branch's forced browser.allow_private_urls disables Hermes's own "
+            "SSRF check for this call (review finding #6)"
+        )
+    return _low(f"browser_navigate targets a public http(s) url (host={parts.hostname!r})")
+
+
+def _classify_browser_console(args: dict[str, Any]) -> Risk:
+    """section 9.3: browser_console is read-only (low) when neither
+    `expression` nor `clear` was passed (a plain log fetch); passing
+    `expression` evaluates arbitrary JS in the page, which needs the same
+    network/storage marker scan section 9.3 requires (formerly wired to the
+    nonexistent browser_evaluate tool -- findings #1/#8)."""
+    expression = args.get("expression")
+    clear = bool(args.get("clear"))
+    if not expression and not clear:
+        return _low("browser_console with no expression/clear is a read-only log fetch")
+    if not isinstance(expression, str) or not expression:
+        return _medium("browser_console(clear=True) has a side effect (clears console log)")
+    hit = [m for m in _JS_NETWORK_OR_STORAGE_MARKERS if m in expression]
+    if hit:
+        return _high(f"browser_console expression touches network/storage: {', '.join(hit)}")
+    return _medium(
+        "browser_console expression evaluation with no detected network/storage access"
+    )
 
 
 @dataclass(frozen=True)
@@ -290,15 +390,6 @@ def _classify_terminal(args: dict[str, Any]) -> Risk:
     )
 
 
-def _classify_browser_evaluate(args: dict[str, Any]) -> Risk:
-    expr = args.get("function") or args.get("expression") or args.get("code") or ""
-    expr = expr if isinstance(expr, str) else ""
-    hit = [m for m in _JS_NETWORK_OR_STORAGE_MARKERS if m in expr]
-    if hit:
-        return _high(f"evaluated expression touches network/storage: {', '.join(hit)}")
-    return _medium("browser_evaluate with no detected network/storage access")
-
-
 def classify(tool_name: str, args: dict[str, Any] | None, *, cwd: str | None = None) -> Risk:
     """Deterministic risk classification for the review gate. `args` may be
     `{}`/incomplete (e.g. a `write_file`/`patch` call whose real structured
@@ -313,11 +404,15 @@ def classify(tool_name: str, args: dict[str, Any] | None, *, cwd: str | None = N
         return _classify_write(args.get("path"), cwd=cwd)
     if tool_name == "terminal":
         return _classify_terminal(args)
-    if tool_name == "browser_evaluate":
-        return _classify_browser_evaluate(args)
+    if tool_name == "browser_navigate":
+        return _classify_browser_navigate(args)
+    if tool_name == "browser_console":
+        return _classify_browser_console(args)
+    if tool_name in _BROWSER_ALWAYS_HIGH:
+        return _high(f"{tool_name} is a constant user-gate tool (00-foundation.md §9.3)")
     if tool_name in _BROWSER_REVIEW_TOOLS:
         return _medium(f"{tool_name} has side effects and needs review")
-    # 00-foundation.md §9.2's fail-closed catch-all ("上面三档没有点名的任何工具
+    # 00-foundation.md §9.3's fail-closed catch-all ("上面几档没有点名的任何工具
     # ...一律用户闸") for anything this function doesn't specifically recognize —
     # `medium` (not `low`) so it never auto-bypasses in auto mode.
     return _medium(f"no specific risk rule for tool {tool_name!r}; defaulting to reviewed")

@@ -11,7 +11,14 @@ approach as `test_cap_browser_e2e.py`).
 
 Two independent things:
   - `test_web_search_results_meet_the_citation_reachability_bar`: real network,
-    real Hermes, `JONES_E2E=1` gated.
+    real Hermes, `JONES_E2E=1` gated. Review finding #4: 03-w4-interfaces.md §4
+    literally says "测报告中的引用 URL 可达率" (the URLs a generated REPORT
+    cites) — this branch has no report-generation feature to point that at, so
+    this test measures the reachability of `web_search_tool`'s raw result URLs
+    instead, as a documented downgrade of that acceptance criterion, not an
+    equivalent of it. `grounded-citations`' own `Sources:` list is built from
+    exactly these URLs, so the two sets should coincide in practice, but that
+    equivalence isn't proven here.
   - `test_web_search_tool_returns_a_provider_error_shape_when_nothing_resolves`:
     no network needed — deterministically forces "no provider available" by
     monkeypatching Hermes's own resolution seam, to lock in the exact
@@ -46,14 +53,31 @@ def _hermes_available() -> bool:
 
 
 def _url_reachable(url: str, timeout_s: float = 8.0) -> bool:
+    """Review findings #4/#13: the original `exc.code not in (0,)` check was
+    vacuously true for every `HTTPError` (`.code` is never `0`), so 404/410/500
+    dead links all counted as "reachable" and this test's PRD 12.3 90% bar
+    could not fail on connection-level success. A HEAD that comes back 405/501
+    (the METHOD itself rejected, not the resource) falls back to a real GET
+    before judging; 403/429 (bot-blocked/rate-limited, but the resource
+    unambiguously exists) still count reachable. Every other 4xx/5xx is a real
+    failure and must NOT be counted."""
     req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "jones-agent-e2e/1"})
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             return 200 <= resp.status < 400
     except urllib.error.HTTPError as exc:
-        # Some sites 405 a HEAD but are very much reachable — a real response
-        # (any status) beats a connection-level failure for this check's purpose.
-        return exc.code not in (0,)
+        if exc.code in (405, 501):
+            get_req = urllib.request.Request(
+                url, method="GET", headers={"User-Agent": "jones-agent-e2e/1"}
+            )
+            try:
+                with urllib.request.urlopen(get_req, timeout=timeout_s) as resp:
+                    return 200 <= resp.status < 400
+            except urllib.error.HTTPError as get_exc:
+                return get_exc.code in (403, 429)
+            except (urllib.error.URLError, OSError, ValueError):
+                return False
+        return exc.code in (403, 429)
     except (urllib.error.URLError, OSError, ValueError):
         return False
 

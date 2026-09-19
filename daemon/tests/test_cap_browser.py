@@ -11,6 +11,7 @@ gated on `JONES_E2E=1` + a real Chrome install.
 
 from __future__ import annotations
 
+import signal
 import sys
 import time
 from pathlib import Path
@@ -136,6 +137,87 @@ def test_ensure_started_reattaches_to_a_live_orphan_after_manager_replaced(tmp_p
         assert not spawn_calls, "must not spawn a second Chrome while the first is still alive"
     finally:
         old_manager.shutdown()
+
+
+def test_shutdown_of_a_reattached_orphan_sends_a_real_sigterm_via_recovered_pid(tmp_path):
+    """Review finding #10: after a simulated daemon restart, `ensure_started()`
+    reattaches with `handle.process is None` (no `Popen` object) — `shutdown()`
+    must still gracefully close it by recovering its real pid from Chrome's own
+    `SingletonLock` symlink, not permanently no-op and leak it."""
+    profile_dir = tmp_path / "profile"
+    old_manager = BrowserManager(
+        profile_dir, chrome_binary="fake-chrome-sentinel", spawn=_fake_spawn
+    )
+    old_handle = old_manager.ensure_started()
+    real_process = old_handle.process
+    assert real_process is not None
+
+    new_manager = BrowserManager(
+        profile_dir, chrome_binary="fake-chrome-sentinel", spawn=_fake_spawn
+    )
+    new_handle = new_manager.ensure_started()
+    assert new_handle.process is None
+    assert new_handle.pid == real_process.pid, "must recover the real pid from SingletonLock"
+
+    new_manager.shutdown(timeout_s=5.0)
+
+    real_process.wait(timeout=3)
+    assert real_process.poll() is not None, "the orphan must actually receive SIGTERM/SIGKILL"
+
+
+def test_shutdown_of_reattached_orphan_without_recoverable_pid_is_a_safe_noop(tmp_path):
+    """The degraded case: no `SingletonLock` to read (e.g. an unusual Chrome
+    variant, or a permissions issue) — `shutdown()` must not crash and must not
+    touch a process it can't identify, just warn and clear its own handle."""
+    profile_dir = tmp_path / "profile"
+    old_manager = BrowserManager(
+        profile_dir, chrome_binary="fake-chrome-sentinel", spawn=_fake_spawn
+    )
+    old_handle = old_manager.ensure_started()
+    real_process = old_handle.process
+    try:
+        (profile_dir / "SingletonLock").unlink()
+
+        new_manager = BrowserManager(
+            profile_dir, chrome_binary="fake-chrome-sentinel", spawn=_fake_spawn
+        )
+        new_handle = new_manager.ensure_started()
+        assert new_handle.process is None
+        assert new_handle.pid == -1, "pid must not be recoverable without SingletonLock"
+
+        new_manager.shutdown()  # must not raise
+        assert real_process.poll() is None, "must never touch a process it can't identify"
+    finally:
+        real_process.send_signal(signal.SIGTERM)
+        real_process.wait(timeout=3)
+
+
+def test_launch_cleans_up_process_when_devtools_port_written_but_cdp_never_answers(tmp_path):
+    """Review findings #3/#11: the "port file appeared, CDP never answered"
+    failure path in `_launch` used to `raise` without cleanup, leaking the
+    half-started process (which still holds the profile's single-instance
+    lock) — unlike the sibling "port file never appeared" path just above it,
+    which already cleaned up."""
+    spawned: list = []
+
+    def _no_cdp_spawn(argv, **kwargs):
+        proc = _fake_spawn([*argv, "--fake-no-cdp-response"], **kwargs)
+        spawned.append(proc)
+        return proc
+
+    manager = BrowserManager(
+        tmp_path / "profile",
+        chrome_binary="fake-chrome-sentinel",
+        spawn=_no_cdp_spawn,
+        launch_timeout_s=2.0,
+    )
+    with pytest.raises(BrowserLaunchError, match="CDP did not answer"):
+        manager.ensure_started()
+
+    assert spawned, "spawn must have been called"
+    process = spawned[0]
+    process.wait(timeout=3)
+    assert process.poll() is not None, "the half-started Chrome must be cleaned up, not leaked"
 
 
 def test_ensure_started_launches_fresh_when_stale_devtools_port_file_present(tmp_path):

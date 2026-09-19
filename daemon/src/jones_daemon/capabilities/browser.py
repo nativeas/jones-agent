@@ -152,6 +152,45 @@ def _probe_cdp_alive(port: int) -> bool:
         return False
 
 
+_SINGLETON_LOCK_FILE = "SingletonLock"
+
+
+def _read_singleton_lock_pid(profile_dir: Path) -> int | None:
+    """Review finding #10: recover the real pid of a Chrome we reattached to
+    (never spawned ourselves, so we have no `Popen` handle for it) from
+    Chrome's own single-instance guard. `<profile_dir>/SingletonLock` is a
+    symlink Chrome creates whose target is `<hostname>-<pid>` of whichever
+    process holds the profile — reading it is the only way to get a pid back
+    for an orphan, and without one `shutdown()` could only ever no-op for it
+    (permanently, for the rest of this machine's life: once reattached, always
+    reattached — see `shutdown()`'s docstring for why that used to mean the
+    §9.1 login-state guarantee silently stopped applying after the first
+    daemon restart)."""
+    target = None
+    try:
+        target = os.readlink(profile_dir / _SINGLETON_LOCK_FILE)
+    except OSError:
+        return None
+    # Target is "<hostname>-<pid>"; hostname itself may contain "-", so split
+    # from the right.
+    _, _, pid_str = target.rpartition("-")
+    if not pid_str.isdigit():
+        return None
+    return int(pid_str)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists, just not ours to signal-probe further than this — treat as
+        # alive (matches os.kill's own semantics: EPERM means the pid exists).
+        return True
+    return True
+
+
 SpawnFn = Callable[..., subprocess.Popen]
 
 
@@ -204,12 +243,30 @@ class BrowserManager:
         existing = _read_devtools_active_port(self._profile_dir)
         if existing is not None and _probe_cdp_alive(existing[0]):
             port, ws_path = existing
+            # Review finding #10: recover a real pid so `shutdown()` can still
+            # gracefully SIGTERM this Chrome later — without it, this instance
+            # would have no way to ever signal a process it didn't spawn.
+            recovered_pid = _read_singleton_lock_pid(self._profile_dir)
+            if recovered_pid is None:
+                logger.warning(
+                    "browser: reattached to a live orphan Chrome but could not recover "
+                    "its pid from SingletonLock — shutdown() will not be able to signal "
+                    "it (review finding #10)",
+                    extra={"detail": {"profile_dir": str(self._profile_dir)}},
+                )
             logger.info(
                 "browser: reattached to a live orphan Chrome",
-                extra={"detail": {"profile_dir": str(self._profile_dir), "port": port}},
+                extra={
+                    "detail": {
+                        "profile_dir": str(self._profile_dir),
+                        "port": port,
+                        "recovered_pid": recovered_pid,
+                    }
+                },
             )
             self._handle = BrowserHandle(
-                pid=-1, profile_dir=self._profile_dir, port=port, ws_path=ws_path, process=None
+                pid=recovered_pid if recovered_pid is not None else -1,
+                profile_dir=self._profile_dir, port=port, ws_path=ws_path, process=None,
             )
             return self._handle
 
@@ -270,6 +327,16 @@ class BrowserManager:
             )
         port, ws_path = port_info
         if not _probe_cdp_alive(port):
+            # Review findings #3/#11: unlike the "port file never appeared" path
+            # just above, this one used to `raise` without cleanup — the process
+            # was still alive and holding the profile's single-instance lock, so
+            # the NEXT `ensure_started()` would find a dead port, cold-start a
+            # second Chrome against the same `--user-data-dir`, and hit exactly
+            # the single-instance-lock failure mode docs/spikes/
+            # 04-browser-login-state.md documents (real Chrome gets forwarded to
+            # the stuck first instance and exits immediately).
+            with _terminate_best_effort(process):
+                pass
             raise BrowserLaunchError(
                 f"Chrome wrote {_DEVTOOLS_ACTIVE_PORT_FILE} (port={port}) but CDP did not answer"
             )
@@ -283,12 +350,34 @@ class BrowserManager:
         return self._handle
 
     def shutdown(self, *, timeout_s: float = DEFAULT_SHUTDOWN_TIMEOUT_S) -> None:
-        """SIGTERM, wait, SIGKILL on timeout. No-op if this manager didn't spawn
-        the process itself (a reattached orphan — see module docstring; killing a
-        process this instance doesn't own would be a different daemon's browser
-        the next time it starts, not a leak this instance is responsible for)."""
+        """SIGTERM, wait, SIGKILL on timeout.
+
+        Review finding #10: a reattached orphan (`handle.process is None` — see
+        module docstring) is NOT skipped any more. Jones's profile directory is
+        a single-instance-locked exclusive dir (this module never launches a
+        second Chrome against one another live Chrome already holds — see
+        `ensure_started()`), so whatever Chrome is holding it IS this Jones
+        install's browser by construction; the original "killing a process we
+        don't own would be a different daemon's browser" concern doesn't apply
+        here. If `ensure_started()` recovered a real pid for it (from Chrome's
+        `SingletonLock`), signal that pid directly instead of skipping — this is
+        what keeps the §9.1 "graceful shutdown, not SIGKILL" login-state
+        guarantee applying after a daemon restart, not just for the process
+        this instance itself spawned. Only a genuinely unrecoverable pid (no
+        `SingletonLock`, or unparseable) still no-ops, with a warning."""
         handle = self._handle
-        if handle is None or handle.process is None:
+        if handle is None:
+            return
+        if handle.process is None:
+            if handle.pid <= 0:
+                logger.warning(
+                    "browser: no pid recovered for this reattached orphan Chrome — "
+                    "cannot shut it down gracefully, leaving it running",
+                    extra={"detail": {"profile_dir": str(handle.profile_dir)}},
+                )
+                self._handle = None
+                return
+            self._shutdown_by_pid(handle.pid, timeout_s=timeout_s)
             self._handle = None
             return
         process = handle.process
@@ -310,6 +399,29 @@ class BrowserManager:
         process.kill()
         process.wait()
         self._handle = None
+
+    def _shutdown_by_pid(self, pid: int, *, timeout_s: float) -> None:
+        """Same SIGTERM→wait→SIGKILL sequence as the Popen path above, but
+        signaled directly by pid (review finding #10) since a reattached
+        orphan has no `Popen` object to call `.send_signal()`/`.wait()` on."""
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return  # already gone
+        logger.info("browser: shutting down reattached Jones Chrome", extra={"detail": {"pid": pid}})
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not _pid_alive(pid):
+                return
+            time.sleep(_PORT_POLL_INTERVAL_S)
+        logger.warning(
+            "browser: SIGTERM did not exit reattached Chrome in time, sending SIGKILL",
+            extra={"detail": {"pid": pid, "timeout_s": timeout_s}},
+        )
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 class _terminate_best_effort:
@@ -371,7 +483,28 @@ def browser_worker_config(ctx: object, session: object = None) -> dict:
     Ensures the browser is actually running (lazy start) before returning, so a
     worker that gets this config can attach immediately; on launch failure this
     raises `BrowserLaunchError` — callers must turn that into an explicit error
-    card (§9 "诚实失败"), never omit the browser toolset silently.
+    card (§9 "诚实失败"), never omit the browser toolset silently, and — per §6
+    ("浏览器起不来 → 明确错误卡片", not "会话起不来") — that error card must be
+    scoped to the browser toolset for this session, not fail the worker spawn
+    / session start entirely: a Chrome-less machine should still get a working,
+    browser-less session.
+
+    **Review finding #12 — two things any caller MUST account for, not just
+    "call it"**:
+    1. This function is BLOCKING (`subprocess.Popen` + `urllib.request.urlopen`
+       liveness polling, up to `launch_timeout_s`; ~0.76s measured cold start,
+       10s worst case). A caller on the daemon's asyncio event loop must run it
+       off-thread (e.g. `asyncio.to_thread(browser_worker_config, ...)`) —
+       calling it directly from an `async def` stalls every RPC and
+       `session/update` broadcast in the daemon for the duration (§3/§6's
+       broadcast latency budget).
+    2. It eagerly launches a headed Chrome window on ITS OWN first call, with
+       no regard for whether the calling Agent's tool whitelist even includes
+       any `browser_*` tool — a caller that invokes this unconditionally for
+       every session start will pop a visible Chrome window for every session,
+       browser tools or not. A caller should gate this behind "does this
+       Agent's toolset actually include browser tools", not call it
+       unconditionally.
     """
     user_root = getattr(ctx, "user_root", ctx)
     if callable(user_root):
