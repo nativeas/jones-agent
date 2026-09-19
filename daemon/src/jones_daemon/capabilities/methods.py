@@ -22,7 +22,13 @@ from jones_daemon.capabilities import registry
 from jones_daemon.context import DaemonContext
 from jones_daemon.permissions import gate_config
 from jones_daemon.projects.service import ProjectService
-from jones_daemon.rpc.errors import INVALID_PARAMS, NOT_FOUND, RpcError
+from jones_daemon.rpc.errors import (
+    CAPABILITY_DRIFT,
+    INVALID_PARAMS,
+    MCP_SERVER_DOWN,
+    NOT_FOUND,
+    RpcError,
+)
 from jones_daemon.rpc.server import Connection, RpcServer
 from jones_daemon.sessions import queries
 from jones_daemon.store import run_in_db_thread
@@ -82,6 +88,18 @@ def _build_result(ctx: DaemonContext, session_id: str) -> dict[str, Any]:
     snapshot = _read_jones_tools(hermes_home)
     actual_tools: list[str] | None = None
     actual_mcp_servers: set[str] | None = None
+    # Review round-2 finding #3: MCP discovery is asynchronous
+    # (`acp_adapter/entry.py` starts it on a background thread; the snapshot's
+    # probe Turn only bounds it to ~1.5s before giving up) — an EMPTY
+    # `mcp_servers` list in a snapshot taken before discovery finished is NOT
+    # evidence a configured server is down, it's evidence discovery hadn't
+    # reported back yet. `_tools_snapshot.py`'s `on_session_start` records
+    # whether discovery had actually completed when it wrote the snapshot;
+    # only when that's true does an absent-but-configured server become the
+    # STRONGER "confirmed down" claim (`McpServerState.reachable=False`) —
+    # otherwise `reachable` stays `None` ("not checked either way"), same as
+    # when there's no snapshot at all.
+    mcp_discovery_complete = False
     if snapshot is not None:
         raw_tools = snapshot.get("tools")
         if isinstance(raw_tools, list) and all(isinstance(t, str) for t in raw_tools):
@@ -89,8 +107,10 @@ def _build_result(ctx: DaemonContext, session_id: str) -> dict[str, Any]:
         raw_servers = snapshot.get("mcp_servers")
         if isinstance(raw_servers, list) and all(isinstance(s, str) for s in raw_servers):
             actual_mcp_servers = set(raw_servers)
+        mcp_discovery_complete = snapshot.get("mcp_discovery_complete") is True
 
     mcp_states: list[registry.McpServerState] = []
+    confirmed_down: list[str] = []
     for entry in ctx.config.mcp_servers(project_id):
         if not isinstance(entry, dict):
             continue
@@ -99,8 +119,10 @@ def _build_result(ctx: DaemonContext, session_id: str) -> dict[str, Any]:
             continue
         enabled = entry.get("enabled", True) is not False
         reachable: bool | None = None
-        if enabled and actual_mcp_servers is not None:
+        if enabled and actual_mcp_servers is not None and mcp_discovery_complete:
             reachable = name in actual_mcp_servers
+            if not reachable:
+                confirmed_down.append(name)
         mcp_states.append(registry.McpServerState(name=name, enabled=enabled, reachable=reachable))
 
     # Skill tool enumeration is #18/K's (`skills.worker_skill_dirs` isn't landed
@@ -115,8 +137,23 @@ def _build_result(ctx: DaemonContext, session_id: str) -> dict[str, Any]:
         mode=mode, tool_allowlist=tool_allowlist, rules=rules,
         mcp_servers=mcp_states, skill_tools=skill_tools,
     )
-    result = registry.reconcile(expected, actual_tools)
-    return {"session_id": session_id, **result.to_json()}
+    # `tool_allowlist`/`rules` passed through so a `mcp:<server>` placeholder
+    # that expands into real per-tool names gets `enabled` RECOMPUTED per real
+    # name rather than inheriting the placeholder's own value (controller
+    # ruling R-H2 — see `registry.reconcile`'s docstring).
+    result = registry.reconcile(
+        expected, actual_tools, tool_allowlist=tool_allowlist, rules=rules
+    )
+    return {
+        "session_id": session_id,
+        **result.to_json(),
+        # Consumed by the RPC wrapper below (back on the event loop) to decide
+        # whether an `mcp_server_down` `daemon.error` is warranted — controller
+        # ruling R-H4 ("不允许只 warning"). Real evidence only (see the
+        # `mcp_discovery_complete` handling above) — never asserted from an
+        # absent/incomplete snapshot.
+        "_confirmed_down_mcp_servers": confirmed_down,
+    }
 
 
 def register(server: RpcServer, ctx: DaemonContext) -> None:
@@ -125,15 +162,40 @@ def register(server: RpcServer, ctx: DaemonContext) -> None:
         if not isinstance(session_id, str) or not session_id:
             raise RpcError(INVALID_PARAMS, "session_id is required", {"params": params})
         result = await run_in_db_thread(_build_result, ctx, session_id)
+        confirmed_down = result.pop("_confirmed_down_mcp_servers")
+        # `daemon.error` payload shape per 00-foundation.md §4.2/§4.3:
+        # `{code, message, detail}` — controller ruling R-H3 (this used to be a
+        # bespoke `{reason, session_id, drift}` shape that didn't match the
+        # contract every other `daemon.error` emitter uses). Broadcast via
+        # `broadcast_all` (R-H3), not the per-session `broadcast` above: a
+        # client watching a DIFFERENT session should still learn this
+        # session's tool assembly disagreed with what the transparency page
+        # promised, or that a configured MCP server is confirmed down — both
+        # are daemon-wide "honest failure" signals (DEV.md 工程原则 #4), not
+        # per-session chatter. `_build_result` runs on the DB thread and can't
+        # safely call the async `RpcServer.broadcast_all` itself — do it here,
+        # back on the event loop, after the DB-thread call returns.
         if result["drift"]:
             # G21: a non-empty drift is a real "the transparency page and what
-            # the model actually got don't match" signal (DEV.md 工程原则 #4:
-            # 诚实失败). `_build_result` runs on the DB thread and can't safely
-            # call the async `RpcServer.broadcast` itself — do it here, back on
-            # the event loop, after the DB-thread call returns.
-            await ctx.server.broadcast(
-                session_id, "daemon.error",
-                {"reason": "capability_drift", "session_id": session_id, "drift": result["drift"]},
+            # the model actually got don't match" signal.
+            await ctx.server.broadcast_all(
+                "daemon.error",
+                {
+                    "code": CAPABILITY_DRIFT,
+                    "message": f"session {session_id}: tool assembly drifted from what "
+                    "capability.list expected",
+                    "detail": {"session_id": session_id, "drift": result["drift"]},
+                },
+            )
+        for server_name in confirmed_down:
+            await ctx.server.broadcast_all(
+                "daemon.error",
+                {
+                    "code": MCP_SERVER_DOWN,
+                    "message": f"session {session_id}: configured MCP server "
+                    f"{server_name!r} did not register any tools",
+                    "detail": {"session_id": session_id, "mcp_server": server_name},
+                },
             )
         return result
 

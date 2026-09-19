@@ -106,7 +106,7 @@ Electron main ──(socket client)──> daemon
 
 ### 4.3 错误码
 
-JSON-RPC 标准码 + 应用码：`1001 not_found`、`1002 invalid_state`（如对纯对话模式发工具调用）、`1003 permission_denied`、`1004 provider_error`、`1005 budget_exceeded`、`1006 kernel_error`、`1007 too_many_requests`（单连接在途请求数超过上限，见 foundation 实现的每连接并发闸）。`data` 里带人可读 `message` 与结构化 `detail`。
+JSON-RPC 标准码 + 应用码：`1001 not_found`、`1002 invalid_state`（如对纯对话模式发工具调用）、`1003 permission_denied`、`1004 provider_error`、`1005 budget_exceeded`、`1006 kernel_error`、`1007 too_many_requests`（单连接在途请求数超过上限，见 foundation 实现的每连接并发闸）、`1008 mcp_server_down`、`1009 capability_drift`（H/#17 §2、§8 新增：G21「诚实失败」信号，`capability.list` 的对账结果与 worker 启动/mcp.json 解析失败路径都会广播，走 `RpcServer.broadcast_all`——见 03-w4-interfaces.md §8）。`data` 里带人可读 `message` 与结构化 `detail`。
 
 ## 5. 领域模型 → SQLite schema v1（PRD 7）
 

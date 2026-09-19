@@ -57,7 +57,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import uuid4
 
-from . import _config, _hard_deny, _review_payload, _rules, _tools_snapshot
+from . import _config, _hard_deny, _policy, _review_payload, _rules, _tools_snapshot
 
 # Reserved tool name the daemon uses to prove this plugin is loaded (never a real
 # tool a worker would otherwise dispatch). Kept in sync by hand with
@@ -213,8 +213,19 @@ def _decide(tool_name: str, args: dict | None, tool_call_id: str) -> dict | None
     # it here, ahead of both the allow-bypass AND the edit-approval-deferral
     # branches, is what makes it apply uniformly to every path through this
     # function that could otherwise let a tool run.
+    #
+    # Controller ruling R-H2 (round-2 review, 2026-09-19): this used to be a
+    # plain `allowlist and tool_name not in allowlist` check — "empty
+    # allowlist = unrestricted" for EVERY tool, MCP/Skill included. That
+    # contradicted N15 ("第三方工具默认不进白名单") on the enforcement side
+    # while `capabilities/registry.py`'s transparency-page computation
+    # enforced N15 on the display side only — the two disagreed about what
+    # "enabled" means for a third-party tool (round-1 review findings #1/#7).
+    # `_policy.tool_allowed` is the one function both sides now call; see its
+    # module docstring for the full policy and why it has to live in this
+    # package rather than being imported from `jones_daemon`.
     allowlist = config.get("tool_allowlist") or []
-    if allowlist and tool_name not in allowlist:
+    if not _policy.tool_allowed(tool_name, allowlist):
         return _block(f"tool {tool_name!r} is not in this session's Agent tool whitelist")
 
     if (

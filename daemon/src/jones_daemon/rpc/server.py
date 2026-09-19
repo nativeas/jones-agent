@@ -146,6 +146,29 @@ class RpcServer:
                     },
                 )
 
+    async def broadcast_all(self, method: str, params: Any) -> None:
+        """Push a notification to EVERY currently-connected client, regardless
+        of `session.subscribe` state (controller ruling R-H3, Issue #17/#19).
+
+        `broadcast()` above only reaches connections subscribed to one
+        specific `session_id` — right for a per-session event like `message.
+        delta`, wrong for a daemon-wide `daemon.error` a client should see
+        even if it hasn't subscribed to (or has a different session focused
+        than) the one that triggered it (e.g. `mcp_server_down`/
+        `capability_drift`, 00-foundation.md §4.3's "永不静默" for exactly this
+        reason). Same additive-only, best-effort-per-connection shape as
+        `broadcast()` (01-w2-interfaces.md §2 "加法不改法" — this file is the
+        one every W2+ branch may extend, never rewrite)."""
+        targets = list(self._connections)
+        for conn in targets:
+            try:
+                await conn.notify(method, params)
+            except (ConnectionError, OSError) as exc:
+                logger.debug(
+                    "broadcast_all to a connection failed, skipping",
+                    extra={"detail": {"method": method, "error": str(exc)}},
+                )
+
     async def start(self) -> None:
         if self.socket_path.exists():
             self.socket_path.unlink()

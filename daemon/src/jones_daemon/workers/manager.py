@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any
 
 from jones_daemon.capabilities import mcp_config
-from jones_daemon.context import ConfigResolver
 from jones_daemon.kernel.acp_client import AcpClient, AcpError, AcpProtocolError
 from jones_daemon.logging import get_logger
 
@@ -148,6 +147,17 @@ def _prepare_hermes_home(
     """
     hermes_home.mkdir(parents=True, exist_ok=True)
     hermes_home.chmod(0o700)
+    # Review round-2 finding #3: `HERMES_HOME` is persisted by `session_id`
+    # (`_hermes_home_for` below), so a worker restart (crash recovery, a
+    # config change) reuses the same directory a PREVIOUS worker generation's
+    # `on_session_start` hook already wrote `jones_tools.json` into. Without
+    # this, a `capability.list` call made before the new worker's own first
+    # Turn would read the OLD generation's snapshot as if it were current —
+    # reporting last generation's tools/MCP servers (or their absence) as
+    # "actual", not "not yet known" (`registry.reconcile`'s honest `actual_
+    # available=False` default only works if the file is actually gone).
+    for stale in (hermes_home / "jones_tools.json", hermes_home / "jones_tools.json.tmp"):
+        stale.unlink(missing_ok=True)
     plugin_dst = hermes_home / "plugins" / "jones_gate"
     if plugin_dst.exists():
         shutil.rmtree(plugin_dst)
@@ -232,21 +242,12 @@ class WorkerManager:
         worker_cmd: list[str] | None = None,
         idle_timeout_s: float = DEFAULT_IDLE_TIMEOUT_S,
         startup_timeout_s: float = DEFAULT_STARTUP_TIMEOUT_S,
-        config: ConfigResolver | None = None,
     ) -> None:
         self._user_root = user_root
         self._on_session_update = on_session_update
         self._on_request_permission = on_request_permission
         self._on_worker_crash = on_worker_crash
         self._worker_cmd = worker_cmd or [sys.executable, "-m", "acp_adapter.entry"]
-        # Issue #17/FR13 (03-w4-interfaces.md §2): resolves `ctx.config.mcp_servers
-        # (project_id)` at spawn time so `_prepare_hermes_home` can write them into
-        # the worker's isolated `config.yaml`. `None` (every existing test's
-        # `WorkerManager(...)` call, and any caller with no MCP config to offer)
-        # means "don't resolve MCP servers" — `_spawn_and_check` degrades to an
-        # empty list, not an error; a worker with no configured MCP servers is a
-        # completely ordinary, supported case.
-        self._config = config
         self._idle_timeout_s = idle_timeout_s
         self._startup_timeout_s = startup_timeout_s
         self._workers: dict[str, Worker] = {}
@@ -289,8 +290,31 @@ class WorkerManager:
             worker.last_active = time.monotonic()
 
     async def ensure_started(
-        self, session_id: str, *, cwd: str, project_id: str | None = None
+        self, session_id: str, *, cwd: str, mcp_servers: list[dict[str, Any]] | None = None
     ) -> Worker:
+        """`mcp_servers` (Issue #17/FR13, 03-w4-interfaces.md §2; review round-2
+        finding #4): the project's already-resolved `ctx.config.mcp_servers(
+        project_id)` list, or `None` for "no MCP config to offer" (every
+        existing caller with nothing to configure — a completely ordinary,
+        supported case). Resolving this is deliberately the CALLER's job, not
+        this method's: `ConfigResolver.mcp_servers()` ultimately does a real
+        sqlite read (`DefaultConfigResolver._project_path`), and `store/db.py`
+        connections are `check_same_thread=True` — created on, and only usable
+        from, the dedicated DB thread (`__main__.py`'s comment on `connect()`,
+        `DefaultConfigResolver`'s own module docstring). `WorkerManager` runs
+        entirely on the asyncio event loop thread; a PREVIOUS round of this
+        branch had this method call `self._config.mcp_servers(project_id)`
+        directly here, which reproducibly raised `sqlite3.ProgrammingError:
+        SQLite objects created in a thread can only be used in that same
+        thread` on every real (non-test-double) `ConfigResolver` — silently
+        caught by `_spawn_and_check`'s `except Exception` below and logged as
+        a mere warning, so FR13's MCP wiring never actually took effect on the
+        production path even though every test passed (the test doubles never
+        touch sqlite). The fix is structural, not a wider `try`: the resolved
+        VALUE crosses into this method, already computed off-loop by the
+        caller (`sessions/service.py::_run_turn`, via `store.run_in_db_thread`)
+        — this method and `_spawn_and_check` below never call a `ConfigResolver`
+        themselves again."""
         existing = self._workers.get(session_id)
         if existing is not None:
             return existing
@@ -299,7 +323,7 @@ class WorkerManager:
             existing = self._workers.get(session_id)
             if existing is not None:
                 return existing
-            worker = await self._spawn_and_check(session_id, cwd=cwd, project_id=project_id)
+            worker = await self._spawn_and_check(session_id, cwd=cwd, mcp_servers=mcp_servers)
             self._workers[session_id] = worker
             watch_task = asyncio.create_task(self._watch_exit(worker))
             self._background_tasks.add(watch_task)
@@ -318,25 +342,11 @@ class WorkerManager:
         return self._user_root / "workers" / session_id / "hermes"
 
     async def _spawn_and_check(
-        self, session_id: str, *, cwd: str, project_id: str | None = None
+        self, session_id: str, *, cwd: str, mcp_servers: list[dict[str, Any]] | None = None
     ) -> Worker:
         t0 = time.monotonic()
         hermes_home = self._hermes_home_for(session_id)
-        mcp_servers: list[dict[str, Any]] = []
-        if self._config is not None and project_id is not None:
-            try:
-                mcp_servers = self._config.mcp_servers(project_id)
-            except Exception:
-                # A broken mcp.json must not block a worker from starting at all
-                # (DEV.md 工程原则 #4: 诚实失败 — logged, not silently ignored;
-                # the session still gets a worker with zero MCP tools rather than
-                # failing to start entirely over an unrelated config file).
-                logger.warning(
-                    "failed to resolve mcp_servers for project; starting worker "
-                    "with no MCP servers configured",
-                    extra={"detail": {"project_id": project_id}},
-                    exc_info=True,
-                )
+        mcp_servers = mcp_servers or []
         try:
             _prepare_hermes_home(hermes_home, mcp_servers=mcp_servers)
         except OSError as exc:

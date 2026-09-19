@@ -124,19 +124,86 @@ def test_reconcile_expands_mcp_placeholder_into_real_tool_names_when_enabled():
     assert all(t.actually_loaded for t in result.tools if t.source == "mcp")
 
 
-def test_reconcile_flags_drift_when_hidden_mcp_server_loaded_anyway():
-    """A G21 violation: the registry expected this server hidden (not in the
-    allowlist) but the worker actually registered its tools."""
+def test_reconcile_does_not_flag_drift_when_hidden_mcp_server_loaded_anyway():
+    """Controller ruling R-H1: "expected hidden but Hermes assembled it into
+    the schema anyway" is the ORDINARY case, not a G21 violation — Jones has
+    no config-level lever to drop a tool from the model's schema, only from
+    what `_decide` will let a call through to run (see registry.py's module
+    docstring). The registry still reports `enabled=False`/`actually_loaded=
+    True` on the entry so the transparency page shows the true schema
+    visibility; it just doesn't count toward `drift`."""
     expected = registry.expected_capabilities(
         mode="auto", tool_allowlist=[],  # unrestricted for builtins, but N15 still
         # hides MCP by default -> "echo" is expected disabled.
         mcp_servers=[registry.McpServerState(name="echo")],
     )
-    result = registry.reconcile(expected, ["mcp__echo__ping"])
-    assert "mcp__echo__ping" in result.drift
+    # Full builtin schema too, or every one of the 36 `BUILTIN_TOOLS` names
+    # would show up as "expected enabled but never loaded" drift — unrelated
+    # noise for a test about the MCP-hidden-but-loaded direction specifically.
+    result = registry.reconcile(expected, [*registry.BUILTIN_TOOLS, "mcp__echo__ping"])
+    assert "mcp__echo__ping" not in result.drift
+    assert result.drift == []
     entry = next(t for t in result.tools if t.name == "mcp__echo__ping")
     assert entry.enabled is False
     assert entry.actually_loaded is True
+
+
+def test_reconcile_no_drift_for_default_config_full_builtin_schema():
+    """Controller ruling R-H1's acceptance bar: a completely default session
+    (unrestricted Agent, no MCP servers, no rules) where the worker actually
+    assembled every `BUILTIN_TOOLS` name into the schema — the ordinary,
+    everyday shape of `jones_tools.json` — must report an EMPTY drift. Before
+    this round's fix, this exact input produced 0 drift only by accident (no
+    allowlist narrowing); `test_capability_list_...` in
+    `test_capabilities_methods.py` covers the narrowed-allowlist case that
+    used to manufacture drift on every single call."""
+    expected = registry.expected_capabilities(mode="auto", tool_allowlist=[])
+    result = registry.reconcile(expected, list(registry.BUILTIN_TOOLS))
+    assert result.drift == []
+
+
+def test_reconcile_conditional_builtin_absence_is_not_drift():
+    """A `CONDITIONAL_BUILTIN_TOOLS` name (e.g. `web_search`, gated on a
+    configured search API key Jones doesn't set up by default) being expected
+    enabled but never actually loaded is a known-explainable state (R-H1), not
+    a G21 anomaly — it's still visible via `actually_loaded: false`."""
+    expected = registry.expected_capabilities(mode="auto", tool_allowlist=[])
+    actual = [n for n in registry.BUILTIN_TOOLS if n != "web_search"]
+    result = registry.reconcile(expected, actual)
+    assert "web_search" not in result.drift
+    assert result.drift == []
+    entry = next(t for t in result.tools if t.name == "web_search")
+    assert entry.enabled is True
+    assert entry.actually_loaded is False
+
+
+def test_reconcile_still_flags_drift_when_a_core_builtin_never_loads():
+    """The other direction R-H1 keeps: a tool with no environment dependency
+    (not in `CONDITIONAL_BUILTIN_TOOLS`) that's expected enabled but never
+    actually assembled is a real anomaly worth flagging."""
+    expected = registry.expected_capabilities(mode="auto", tool_allowlist=[])
+    actual = [n for n in registry.BUILTIN_TOOLS if n != "read_file"]
+    result = registry.reconcile(expected, actual)
+    assert result.drift == ["read_file"]
+
+
+def test_reconcile_recognizes_tool_search_bridge_names_as_explainable():
+    """Hermes's own Tool Search bridge (`tool_search`/`tool_describe`/
+    `tool_call`) replaces every deferrable tool's real schema entry once any
+    MCP server is configured (review round-2 finding #6). Even though
+    `_tools_snapshot.py`'s real fix is to bypass that assembly
+    (`skip_tool_search_assembly=True`), the registry must not manufacture
+    `unknown_tool` drift for these three names if they ever do show up in a
+    snapshot (R-H1's defense-in-depth)."""
+    expected = registry.expected_capabilities(mode="task", tool_allowlist=["read_file"])
+    result = registry.reconcile(
+        expected, ["read_file", "tool_search", "tool_describe", "tool_call"]
+    )
+    assert result.drift == []
+    bridge_names = registry._policy.TOOL_SEARCH_BRIDGE_NAMES
+    bridge = {t.name: t for t in result.tools if t.name in bridge_names}
+    assert set(bridge) == {"tool_search", "tool_describe", "tool_call"}
+    assert all(e.enabled and e.actually_loaded and e.hidden_reason is None for e in bridge.values())
 
 
 def test_reconcile_attributes_unmatched_mcp_shaped_name_by_prefix():

@@ -333,42 +333,37 @@ def test_prepare_hermes_home_skill_symlink_failure_does_not_raise(tmp_path, monk
     assert not (hermes_home / "skills" / "some-skill").exists()
 
 
-async def test_ensure_started_resolves_mcp_servers_from_injected_config(tmp_path, monkeypatch):
-    """`WorkerManager(config=...)` + `ensure_started(..., project_id=...)`
-    (03-w4-interfaces.md §2) — the real spawn path threads `ctx.config.
-    mcp_servers(project_id)` into the worker's `config.yaml`."""
+async def test_ensure_started_writes_the_mcp_servers_it_was_given(tmp_path, monkeypatch):
+    """`ensure_started(..., mcp_servers=...)` (03-w4-interfaces.md §2; review
+    round-2 finding #4 / controller ruling R-H4): the real spawn path writes
+    an ALREADY-RESOLVED `mcp_servers` list into the worker's `config.yaml`.
+    Resolving `ctx.config.mcp_servers(project_id)` itself is no longer
+    `WorkerManager`'s job — see `ensure_started`'s own docstring for why (a
+    real `ConfigResolver` does synchronous sqlite I/O that must not run on
+    this class's event-loop thread) — that now happens in `sessions/
+    service.py::_run_turn`, off-loop, before this method is ever called; see
+    `test_sessions_service.py` for the caller-side degrade-on-failure
+    coverage that scenario used to (incorrectly) live here as."""
     import yaml
 
-    class _FakeConfig:
-        def mcp_servers(self, project_id):
-            assert project_id == "proj1"
-            return [{"name": "echo", "command": "python3", "args": [], "env": {}}]
-
     monkeypatch.setenv("FAKE_ACP_MODE", "normal")
-    manager = WorkerManager(
-        user_root=tmp_path,
-        on_session_update=_noop_update,
-        on_request_permission=_noop_permission,
-        on_worker_crash=_noop_crash,
-        worker_cmd=[sys.executable, _FAKE_AGENT],
-        startup_timeout_s=5.0,
-        config=_FakeConfig(),
-    )
+    manager = _make_manager(tmp_path)
     await manager.start()
     try:
-        worker = await manager.ensure_started("s1", cwd="/tmp", project_id="proj1")
+        worker = await manager.ensure_started(
+            "s1", cwd="/tmp",
+            mcp_servers=[{"name": "echo", "command": "python3", "args": [], "env": {}}],
+        )
         parsed = yaml.safe_load((worker.hermes_home / "config.yaml").read_text(encoding="utf-8"))
         assert parsed["mcp_servers"] == {"echo": {"command": "python3", "args": [], "env": {}}}
     finally:
         await manager.stop()
 
 
-async def test_ensure_started_without_config_or_project_id_has_no_mcp_servers(
-    tmp_path, monkeypatch
-):
-    """Every pre-existing test's `WorkerManager(...)` call (no `config=`) — and any
-    `ensure_started` call with no `project_id` — must keep behaving exactly as
-    before this Issue's change: an empty `mcp_servers:` dict, never an error."""
+async def test_ensure_started_without_mcp_servers_has_none(tmp_path, monkeypatch):
+    """Every pre-existing test's `ensure_started(...)` call (no `mcp_servers=`)
+    must keep behaving exactly as before this Issue's change: an empty
+    `mcp_servers:` dict, never an error."""
     import yaml
 
     monkeypatch.setenv("FAKE_ACP_MODE", "normal")
@@ -378,31 +373,5 @@ async def test_ensure_started_without_config_or_project_id_has_no_mcp_servers(
         worker = await manager.ensure_started("s1", cwd="/tmp")
         parsed = yaml.safe_load((worker.hermes_home / "config.yaml").read_text(encoding="utf-8"))
         assert parsed["mcp_servers"] == {}
-    finally:
-        await manager.stop()
-
-
-async def test_ensure_started_survives_a_broken_config_resolver(tmp_path, monkeypatch):
-    """DEV.md 工程原则 #4: a broken `mcp.json` (or any `ConfigResolver.mcp_servers`
-    failure) must not prevent the worker from starting at all."""
-
-    class _BrokenConfig:
-        def mcp_servers(self, project_id):
-            raise ValueError("simulated malformed mcp.json")
-
-    monkeypatch.setenv("FAKE_ACP_MODE", "normal")
-    manager = WorkerManager(
-        user_root=tmp_path,
-        on_session_update=_noop_update,
-        on_request_permission=_noop_permission,
-        on_worker_crash=_noop_crash,
-        worker_cmd=[sys.executable, _FAKE_AGENT],
-        startup_timeout_s=5.0,
-        config=_BrokenConfig(),
-    )
-    await manager.start()
-    try:
-        worker = await manager.ensure_started("s1", cwd="/tmp", project_id="proj1")
-        assert worker is not None
     finally:
         await manager.stop()

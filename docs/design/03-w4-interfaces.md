@@ -100,3 +100,78 @@ Hermes 已经带全了能力域（`toolsets.py::_HERMES_CORE_TOOLS`：`read_file
   一个 stdio + 一个 HTTP echo server 都能被 `tools.mcp_tool_discovery.
   register_mcp_servers` 正确连接，工具名为 `mcp__<server>__<tool>`（
   `tools/mcp_tool_schema.py::MCP_TOOL_NAME_PREFIX`/`build_mcp_tool_name`）。
+
+## 8. 第一轮评审修复后对 §2/§7 的再次修正（2026-09-19，控制者裁定 R-H1～R-H6）
+
+第一轮评审（7 条意见）发现 §2/实现之间还有更深的漂移：N15 只在透明页成立、
+drift 定义把「策略」和「schema」混为一谈、`jones_tools.json` 是一次性快照、
+`_spawn_and_check` 在 event loop 上直接调用会做 sqlite I/O 的 `ConfigResolver`。
+控制者裁定 R-H1～R-H6（逐条不可推翻）落地如下：
+
+- **R-H2（策略单一事实源）**：新增 `kernel/plugin/jones_gate/_policy.py`
+  （零 `jones_daemon` 依赖，随 `_prepare_hermes_home` 的 `shutil.copytree`
+  一起分发进 worker）承载 `BUILTIN_TOOLS`/`tool_allowed()`——N15 与
+  `mcp:<server>` 占位符语义的唯一实现。`kernel/plugin/jones_gate/__init__.py::
+  _decide` 与 `capabilities/registry.py` 都从这里调用同一个函数（`capabilities/
+  policy.py` 是给守护进程侧调用者用的薄转发层，说明见该文件 docstring）。round-1
+  的 bug（registry 注释声称与 `_decide` 侧的 `_tool_permitted` 保持同步，但那个
+  函数从未存在过）由此从根上解决——不再有两份独立实现可以漂移。新增
+  `daemon/tests/test_capabilities_policy_gate_agreement.py`：直接驱动真实
+  `_on_pre_tool_call`，对同一份 `tool_allowlist` 断言透明页 `enabled` 与闸的真实
+  verdict 一致（含 `mcp:<server>` 占位符 vs 精确工具名两种写法）。
+- **R-H1（drift 语义重定义）**：`capabilities/registry.py::reconcile()` 不再把
+  「期望隐藏但 Hermes 装配了」算作 drift（`tool_allowlist` 只是执行期拦截，从不
+  影响 schema 可见性——这本来就是 N15 的前提，见 §2）。`drift` 现在只保留两类：
+  期望启用却从未装配、装配了但注册表完全无法解释的名字。`_policy.py` 新增
+  `CONDITIONAL_BUILTIN_TOOLS`（source-verified 对每个 `BUILTIN_TOOLS` 名字核对
+  `check_fn`，标出依赖 Jones 尚未接线的子系统——浏览器 profile、connector
+  gateway、搜索 Key、vision 模型——的 11 个名字）与 `TOOL_SEARCH_BRIDGE_NAMES`
+  （`tool_search`/`tool_describe`/`tool_call`），两者的缺席/出现都不再计入
+  drift。默认配置（空白名单、无 MCP）下 `reconcile()` 必须返回空 drift，新增
+  `test_reconcile_no_drift_for_default_config_full_builtin_schema` 断言。
+- **R-H3/R-H4（daemon.error 契约 + MCP 诚实失败）**：`daemon.error` 载荷改为
+  `{code, message, detail}`（00-foundation.md §4.2/§4.3）。新增应用码
+  `MCP_SERVER_DOWN = 1008`、`CAPABILITY_DRIFT = 1009`——R-H3 原文写的是
+  「1007 capability_drift、1008 mcp_server_down」，但 `rpc/errors.py` 的
+  `TOO_MANY_REQUESTS` 在本分支存在之前就已经是 1007（W2/A/#10 落地并测试过）；
+  沿用 R-H3 会静默改变一个已上线错误码的含义，属于「前提错了」而非裁定本身有
+  分歧，按 DEV.md 工程原则 #2 改前提，取下两个空闲码。`rpc/server.py` 新增
+  `RpcServer.broadcast_all(method, params)`（server 级，不看 `session.subscribe`
+  订阅状态）——`capability.list` 的 drift/`mcp_server_down` 广播都改走这条，
+  `_run_turn` 里 `ctx.config.mcp_servers()` 解析失败时也广播一次 `mcp_server_down`
+  （R-H4「不允许只 warning」，取代原先纯 `logger.warning`）。
+- **round-2 finding #3（`jones_tools.json` 一次性快照）**：`_tools_snapshot.py`
+  的 `on_session_start` 新增 `mcp_discovery_complete: bool` 字段（源码核对
+  `hermes_cli.mcp_startup.mcp_discovery_in_flight`/`join_mcp_discovery`，与
+  Hermes 自己的 late-refresh 调度器同一 API），`capabilities/methods.py` 只在
+  这个字段为真时才把「未出现在快照里」升级成 `hidden_reason=mcp_server_down`
+  /`daemon.error(1008)`，否则视为「未知，不是确认宕机」（`McpServerState.
+  reachable=None`）。`_prepare_hermes_home` 在重建 HERMES_HOME 时显式删除旧的
+  `jones_tools.json`/`.tmp`，避免 worker 重启后读到上一代快照。
+- **round-2 finding #6（Tool Search 折叠）**：`_compute_tool_names()` 调用
+  `model_tools.get_tool_definitions(..., skip_tool_search_assembly=True)`
+  （source-verified，Hermes 自己的 MCP bridge dispatch 也用同一参数取未折叠
+  目录，`model_tools.py:709`）——MCP 工具的真实名字不再被 `tool_search`/
+  `tool_describe`/`tool_call` 三个 bridge 工具顶替。
+- **round-2 finding #4（FR13 在生产路径上因 sqlite 线程违规从未真正生效）**：
+  `WorkerManager` 不再持有 `ConfigResolver`，`ensure_started`/`_spawn_and_check`
+  的 `project_id` 参数改成直接接收已解析好的 `mcp_servers: list[dict]`。真正
+  的解析挪到 `sessions/service.py::_run_turn`——`await run_in_db_thread(ctx.
+  config.mcp_servers, project_id)`，在 event loop 上永不再直接调用
+  `ConfigResolver`。`WorkerManager.__init__` 的 `config` 参数随之移除（round-1
+  加的那个签名扩展被撤销——它本身就是这个 bug 的接线点）。
+- **R-H5（#35 的 `shutdown()` 修复）**：控制者裁定保留 round-1 对
+  `sessions/service.py::SessionService.shutdown()` 的改动（等待 `_turn_tasks`）
+  ——代码审查认为它本身成立，本节把它记为 H 在 `sessions/service.py` 这个非
+  独占文件上的、经控制者授权的改动（DEV.md「改接口先改文档」的补记）。#35 本身
+  不因此关闭：round-1 报告已如实说明未能构造出「改前必现、改后必不现」的确定性
+  复现，这次也没有新证据改变这个结论——控制者会把 #35 继续留开。
+- **R-H6（rebase onto main）**：本轮在动手前先 `git rebase main`——main 已合入
+  K（`skills/service.py::worker_skill_dirs` 落地、透明页渲染器已就绪）；rebase
+  过程中的两处真实冲突（`__main__.py` 的 `register_capabilities`/
+  `register_skills` 都要保留；`uv.lock` 因 worktree 路径深度不同产生的
+  editable-path 差异，用 `uv lock` 针对本机真实 `hermes-agent` checkout 重新
+  解析，未手工拼接）已解决，记录在此供后续分支参考。`skills.worker_skill_dirs`
+  → `_prepare_hermes_home(skill_dirs=...)` 的实际接线本轮仍未做（没有评审意见
+  要求，避免超出本轮修复范围）——`_prepare_hermes_home` 的 `skill_dirs` 参数
+  已经是真实可用的集成点，见 round-1 报告"没做什么"一节，现状不变。

@@ -35,15 +35,28 @@ def _fake_hermes_modules(monkeypatch):
 
     model_tools_mod = types.ModuleType("model_tools")
 
-    def _get_tool_definitions(*, enabled_toolsets, quiet_mode=True):
+    def _get_tool_definitions(
+        *, enabled_toolsets, quiet_mode=True, skip_tool_search_assembly=False
+    ):
         state["last_enabled_toolsets"] = enabled_toolsets
+        state["last_skip_tool_search_assembly"] = skip_tool_search_assembly
         return state["tools"]
 
     model_tools_mod.get_tool_definitions = _get_tool_definitions
 
+    mcp_startup_mod = types.ModuleType("hermes_cli.mcp_startup")
+    mcp_startup_mod.mcp_discovery_in_flight = lambda: state.get("discovery_in_flight", False)
+    mcp_startup_mod.join_mcp_discovery = lambda timeout=None: not state.get(
+        "discovery_in_flight", False
+    )
+    hermes_cli_pkg = types.ModuleType("hermes_cli")
+    hermes_cli_pkg.mcp_startup = mcp_startup_mod
+
     monkeypatch.setitem(sys.modules, "tools", tools_pkg)
     monkeypatch.setitem(sys.modules, "tools.mcp_tool_discovery", mcp_discovery_mod)
     monkeypatch.setitem(sys.modules, "model_tools", model_tools_mod)
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli_pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli.mcp_startup", mcp_startup_mod)
     return state
 
 
@@ -55,7 +68,45 @@ def test_on_session_start_writes_jones_tools_json(tmp_path, monkeypatch, _fake_h
     assert written["session_id"] == "s1"
     assert sorted(written["tools"]) == ["mcp__echo__ping", "read_file"]
     assert written["mcp_servers"] == ["echo"]
+    assert written["mcp_discovery_complete"] is True
     assert isinstance(written["written_at"], float)
+
+
+def test_on_session_start_requests_unfolded_schema_via_skip_tool_search_assembly(
+    tmp_path, monkeypatch, _fake_hermes_modules
+):
+    """Review round-2 finding #6: without this, Hermes's own Tool Search
+    bridge folds every MCP tool's real name away behind `tool_search`/
+    `tool_describe`/`tool_call` the moment any MCP server is configured —
+    defeating this hook's entire "what got REALLY assembled" purpose."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _tools_snapshot.on_session_start(session_id="s1")
+    assert _fake_hermes_modules["last_skip_tool_search_assembly"] is True
+
+
+def test_on_session_start_records_discovery_incomplete(tmp_path, monkeypatch, _fake_hermes_modules):
+    """Review round-2 finding #3: a slow MCP server still mid-handshake when
+    this hook fires must be recorded as "discovery incomplete", not silently
+    indistinguishable from "confirmed nothing there"."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _fake_hermes_modules["discovery_in_flight"] = True
+    _tools_snapshot.on_session_start(session_id="s1")
+    written = json.loads((tmp_path / "jones_tools.json").read_text(encoding="utf-8"))
+    assert written["mcp_discovery_complete"] is False
+
+
+def test_on_session_start_records_discovery_incomplete_when_unimportable(
+    tmp_path, monkeypatch, _fake_hermes_modules
+):
+    """`hermes_cli.mcp_startup` being unimportable must never be read as
+    "discovery complete" — that's the one claim `McpServerState.reachable`
+    requires real evidence for (`capabilities/registry.py`)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setitem(sys.modules, "hermes_cli.mcp_startup", None)
+    monkeypatch.setitem(sys.modules, "hermes_cli", None)
+    _tools_snapshot.on_session_start(session_id="s1")
+    written = json.loads((tmp_path / "jones_tools.json").read_text(encoding="utf-8"))
+    assert written["mcp_discovery_complete"] is False
 
 
 def test_on_session_start_expands_enabled_toolsets_with_connected_mcp_servers(

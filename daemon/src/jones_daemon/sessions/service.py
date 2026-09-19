@@ -66,7 +66,13 @@ from jones_daemon.projects.service import ProjectService
 from jones_daemon.providers.resolver import ProviderNotConfiguredError
 from jones_daemon.replay import retention as replay_retention
 from jones_daemon.replay import store as replay_store
-from jones_daemon.rpc.errors import INVALID_PARAMS, INVALID_STATE, NOT_FOUND, RpcError
+from jones_daemon.rpc.errors import (
+    INVALID_PARAMS,
+    INVALID_STATE,
+    MCP_SERVER_DOWN,
+    NOT_FOUND,
+    RpcError,
+)
 from jones_daemon.sessions import queries
 from jones_daemon.store import run_in_db_thread
 from jones_daemon.workers.manager import WorkerManager, WorkerStartupError
@@ -216,12 +222,6 @@ class SessionService:
             on_request_permission=self._on_request_permission,
             on_worker_crash=self._on_worker_crash,
             worker_cmd=worker_cmd,
-            # Issue #17/FR13 (03-w4-interfaces.md §2, H's branch — see that PR's
-            # report "契约变更" for why this one-line addition to a file H doesn't
-            # otherwise own was necessary): lets `WorkerManager._spawn_and_check`
-            # resolve `ctx.config.mcp_servers(project_id)` and write them into the
-            # worker's `config.yaml`.
-            config=ctx.config,
         )
         self._active_turns: dict[str, _TurnContext] = {}
         self._turn_tasks: dict[str, asyncio.Task[None]] = {}
@@ -911,9 +911,49 @@ class SessionService:
                         ctx_turn, kind="error", reason=f"provider_error: {message}"
                     )
                     return
+                # Review round-2 finding #4 / controller ruling R-H4: resolve
+                # `ctx.config.mcp_servers(project_id)` HERE, off the event
+                # loop, and pass the already-resolved value into
+                # `ensure_started` — `WorkerManager` itself never touches a
+                # `ConfigResolver` again (see `ensure_started`'s docstring for
+                # why calling it directly on the event loop reproducibly threw
+                # `sqlite3.ProgrammingError` against every real, non-test-double
+                # `ConfigResolver` and made FR13's MCP wiring dead on the
+                # production path despite every test passing).
+                try:
+                    mcp_servers = await run_in_db_thread(
+                        self.ctx.config.mcp_servers, session["project_id"]
+                    )
+                except Exception as exc:  # noqa: BLE001 - a broken mcp.json must not
+                    # block the worker from starting at all (DEV.md 工程原则 #4:
+                    # 诚实失败 — reported via `daemon.error`, not silently
+                    # swallowed to a log line the way a previous round of this
+                    # branch did; R-H4 "不允许只 warning"). The session still
+                    # gets a worker with zero MCP tools rather than failing to
+                    # start entirely over an unrelated config file.
+                    logger.warning(
+                        "failed to resolve mcp_servers for project; starting worker "
+                        "with no MCP servers configured",
+                        extra={"detail": {"project_id": session["project_id"]}},
+                        exc_info=True,
+                    )
+                    mcp_servers = []
+                    await self.ctx.server.broadcast_all(
+                        "daemon.error",
+                        {
+                            "code": MCP_SERVER_DOWN,
+                            "message": f"session {session_id}: failed to resolve this "
+                            "project's configured MCP servers; starting with none",
+                            "detail": {
+                                "session_id": session_id,
+                                "project_id": session["project_id"],
+                                "error": str(exc),
+                            },
+                        },
+                    )
                 try:
                     worker = await self.worker_manager.ensure_started(
-                        session_id, cwd=cwd, project_id=session["project_id"]
+                        session_id, cwd=cwd, mcp_servers=mcp_servers
                     )
                 except WorkerStartupError as exc:
                     await self._terminate_run(

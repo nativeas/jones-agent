@@ -49,6 +49,48 @@ agent that never loads real Hermes plugins at all — see `docs/DEV.md`'s
 file. `capabilities/registry.py::reconcile()` treats a missing `jones_tools.
 json` as "actual assembly not yet known" (not as "zero tools", and not as an
 error) — see that function's docstring.
+
+## `skip_tool_search_assembly=True` (review round-2 finding #6)
+
+Hermes's own Tool Search bridge (`tools/tool_search.py::assemble_tool_defs`,
+wired into `model_tools.get_tool_definitions` by default) activates whenever
+ANY "deferrable" (non-core) tool is enabled — true for every session with even
+one MCP server configured, i.e. this Issue's entire point. Once active, the
+model's REAL schema swaps every deferrable tool's own definition out for three
+generic bridge tools (`tool_search`/`tool_describe`/`tool_call`) — so calling
+`get_tool_definitions` the naive way here would make a snapshot that NEVER
+contains a real `mcp__<server>__<tool>` name for any session with an MCP
+server attached, which is exactly backwards for a hook whose entire purpose is
+proving what got REALLY assembled (G21). `get_tool_definitions` takes a
+`skip_tool_search_assembly: bool` parameter for precisely this
+(`model_tools.py`, source-verified against `ee4452991d17534aa561f31ee55596d082aa94e7`
+— Hermes's own MCP bridge-dispatch code path uses the same flag internally,
+`model_tools.py:709`, to get the real per-tool catalog for its own purposes)
+— passed `True` below to get the raw, unfolded tool list instead.
+
+## `mcp_discovery_complete` (review round-2 finding #3)
+
+MCP discovery is asynchronous (`acp_adapter/entry.py` starts it on a
+background thread at worker startup; `ensure_mcp_discovery_before_agent_build`
+only bounds the FIRST turn's wait to ~1.5s before giving up and letting the
+turn proceed). This hook's own snapshot write happens once, at the start of
+the very first real Turn (the startup self-check probe,
+`workers/manager.py::_startup_self_check`) — a slow MCP server can easily
+still be mid-handshake at that exact moment, in which case
+`get_registered_mcp_server_names()` legitimately, correctly returns a set that
+doesn't (yet) include it. Without a signal distinguishing "discovery hadn't
+finished when this was written" from "discovery finished and genuinely found
+nothing", `capabilities/methods.py` would have no way to tell "still starting
+up" apart from "confirmed dead" — and `McpServerState`'s own docstring is
+explicit that only the latter may assert `hidden_reason="mcp_server_down"`.
+`hermes_cli.mcp_startup.mcp_discovery_in_flight()` (a live, public,
+non-underscore query Hermes's own late-refresh scheduler,
+`acp_adapter/server.py::_schedule_mcp_late_refresh`, already calls for the
+same reason) answers exactly this — recorded here as `mcp_discovery_complete:
+bool` in the written payload. Best-effort, same as everything else in this
+hook: unimportable or erroring `hermes_cli.mcp_startup` records `False` (never
+`True`) — "can't tell" must never be read downstream as "confirmed done",
+since that's the one claim `McpServerState` requires real evidence for.
 """
 
 from __future__ import annotations
@@ -83,7 +125,13 @@ def _compute_tool_names() -> list[str] | None:
         import model_tools
 
         tools = model_tools.get_tool_definitions(
-            enabled_toolsets=enabled_toolsets, quiet_mode=True
+            enabled_toolsets=enabled_toolsets, quiet_mode=True,
+            # Review round-2 finding #6 — see module docstring's
+            # "skip_tool_search_assembly=True" section: without this, every
+            # MCP/deferrable tool's real name is folded away behind the
+            # `tool_search`/`tool_describe`/`tool_call` bridge the moment any
+            # MCP server is configured, defeating this hook's entire purpose.
+            skip_tool_search_assembly=True,
         )
     except Exception:
         return None
@@ -94,6 +142,31 @@ def _compute_tool_names() -> list[str] | None:
         if isinstance(t, dict) and isinstance(t.get("function"), dict)
     }
     return sorted(n for n in names if isinstance(n, str) and n)
+
+
+def _mcp_discovery_complete() -> bool:
+    """`True` only when we have real evidence MCP discovery has actually
+    finished — see module docstring's "mcp_discovery_complete" section.
+    Never raises; `False` (never a guessed `True`) on any failure to check."""
+    try:
+        from hermes_cli.mcp_startup import join_mcp_discovery, mcp_discovery_in_flight
+    except Exception:
+        return False
+    try:
+        # A short, bounded wait: this hook already runs at the start of the
+        # first real Turn (after `ensure_mcp_discovery_before_agent_build`'s
+        # own ~1.5s bound has already had its chance), so a slow server is
+        # more likely done than not by now — this just closes a small race
+        # rather than committing to a long block on a hook Hermes's own
+        # `invoke_hook` never awaits anyway (fire-and-forget from the caller's
+        # perspective; a slow join here only delays THIS hook's own return).
+        join_mcp_discovery(timeout=1.0)
+    except Exception:
+        pass
+    try:
+        return not mcp_discovery_in_flight()
+    except Exception:
+        return False
 
 
 def on_session_start(session_id: str = "", **_kwargs: Any) -> None:
@@ -120,6 +193,7 @@ def on_session_start(session_id: str = "", **_kwargs: Any) -> None:
             "session_id": session_id,
             "tools": names,
             "mcp_servers": mcp_names,
+            "mcp_discovery_complete": _mcp_discovery_complete(),
             "written_at": time.time(),
         }
         target = home / _FILE_NAME

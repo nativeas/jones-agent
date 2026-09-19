@@ -65,13 +65,17 @@ def http_echo_server():
 async def test_stdio_and_http_mcp_tools_are_both_callable_by_a_real_worker(
     tmp_path, http_echo_server
 ):
-    class _McpConfigResolver:
-        def mcp_servers(self, project_id: str | None) -> list[dict[str, Any]]:
-            return [
-                {"name": "stdio_echo", "transport": "stdio",
-                 "command": sys.executable, "args": [_STDIO_SERVER], "env": {}},
-                {"name": "http_echo", "transport": "http", "url": http_echo_server, "headers": {}},
-            ]
+    # `WorkerManager` no longer resolves `ConfigResolver.mcp_servers()` itself
+    # (review round-2 finding #4 / controller ruling R-H4: that call does real
+    # sqlite I/O and must run off the event loop, in `sessions/service.py::
+    # _run_turn` via `store.run_in_db_thread`, not inside `WorkerManager`) — an
+    # e2e test drives `ensure_started` the same way that caller now does, with
+    # an already-resolved list.
+    mcp_servers: list[dict[str, Any]] = [
+        {"name": "stdio_echo", "transport": "stdio",
+         "command": sys.executable, "args": [_STDIO_SERVER], "env": {}},
+        {"name": "http_echo", "transport": "http", "url": http_echo_server, "headers": {}},
+    ]
 
     events: list[dict[str, Any]] = []
 
@@ -92,11 +96,12 @@ async def test_stdio_and_http_mcp_tools_are_both_callable_by_a_real_worker(
         on_request_permission=on_permission,
         on_worker_crash=on_crash,
         startup_timeout_s=30.0,
-        config=_McpConfigResolver(),
     )
     await manager.start()
     try:
-        worker = await manager.ensure_started("e2e-mcp-1", cwd=str(tmp_path), project_id="p1")
+        worker = await manager.ensure_started(
+            "e2e-mcp-1", cwd=str(tmp_path), mcp_servers=mcp_servers
+        )
         assert worker.acp_session_id is not None
 
         response = await worker.client.prompt(worker.acp_session_id, _PROMPT)

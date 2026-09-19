@@ -51,9 +51,13 @@ class FakeServer:
 
     def __init__(self) -> None:
         self.broadcasts: list[tuple[str, str, Any]] = []
+        self.broadcast_alls: list[tuple[str, Any]] = []
 
     async def broadcast(self, session_id: str, method: str, params: Any) -> None:
         self.broadcasts.append((session_id, method, params))
+
+    async def broadcast_all(self, method: str, params: Any) -> None:
+        self.broadcast_alls.append((method, params))
 
     def events(self, method: str) -> list[tuple[str, Any]]:
         return [(sid, p) for sid, m, p in self.broadcasts if m == method]
@@ -637,6 +641,61 @@ async def test_provider_error_terminates_the_run_before_spawning_a_worker(tmp_pa
         assert "provider_error" in terminated[0][1]["reason"]
         # The worker must never have been spawned for this Session.
         assert service.worker_manager.get(session_id) is None
+    finally:
+        await service.shutdown()
+
+
+async def test_run_turn_survives_a_broken_config_resolver_and_reports_it(tmp_path, monkeypatch):
+    """Review round-2 finding #4 / controller ruling R-H4: `ctx.config.
+    mcp_servers(project_id)` is now resolved by `_run_turn` itself, off the
+    event loop (`run_in_db_thread`) — this used to be `WorkerManager`'s job,
+    called directly on the loop, which reproducibly raised `sqlite3.
+    ProgrammingError` against any REAL `ConfigResolver` (not a test double)
+    and was silently caught as a mere warning, so FR13's MCP wiring never
+    actually took effect on the production path. This test exercises the
+    degrade-gracefully contract that moved here (DEV.md 工程原则 #4: 诚实失败
+    — a broken `mcp.json` must not block the worker from starting, but must
+    not be silent either, R-H4 "不允许只 warning")."""
+
+    class _BrokenConfig:
+        def settings(self, project_id):
+            return {}
+
+        def permissions(self, project_id):
+            return {}
+
+        def mcp_servers(self, project_id):
+            raise ValueError("simulated malformed mcp.json")
+
+    service = await _make_service(tmp_path, monkeypatch)
+    service.ctx.config = _BrokenConfig()
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="broken-mcp-config")
+        await service.send(session_id, "hello")
+        await _wait_until(
+            lambda: any(
+                m == "run.terminated" or m == "message.completed"
+                for _sid, m, _p in service.ctx.server.broadcasts
+            )
+        )
+
+        # The worker still started (a broken mcp.json degrades to zero MCP
+        # servers, it never blocks the Turn) — no `run.terminated{kind:
+        # "error"}` for this session.
+        assert not [
+            p for sid, m, p in service.ctx.server.broadcasts
+            if m == "run.terminated" and sid == session_id
+        ]
+        assert service.worker_manager.get(session_id) is not None
+
+        # But it must not be silent (R-H4): a real `daemon.error` reports it.
+        down = [
+            p for m, p in service.ctx.server.broadcast_alls
+            if m == "daemon.error" and p["code"] == 1008
+        ]
+        assert down
+        assert down[0]["detail"]["session_id"] == session_id
     finally:
         await service.shutdown()
 
