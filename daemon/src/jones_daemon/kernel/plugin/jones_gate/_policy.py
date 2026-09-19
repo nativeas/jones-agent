@@ -90,6 +90,31 @@ BUILTIN_TOOLS: tuple[str, ...] = (
     "session_search",
     "execute_code", "delegate_task",
     "manage_connections",
+    # Issue #21 (04-w5-interfaces.md §3, M row): the `media-gen` bundled Skill
+    # documents these three as Hermes tools an Agent should reach for directly
+    # rather than Jones re-implementing image/audio/video rendering. Listing
+    # them here is a POLICY-layer allow (N15/`tool_allowed`: builtin names are
+    # auto-allowed under an empty `tool_allowlist`) so that IF a session's
+    # schema ever does include one of these — a future ACP-toolset override
+    # lever, or a differently-configured worker — `jones_gate` does not treat
+    # it as an unlisted third-party tool. It is NOT, by itself, a claim that
+    # an ordinary ACP-launched Jones worker can call them TODAY: source check
+    # against the installed `hermes-agent` checkout (`acp_adapter/session.py:
+    # 393`) shows every ACP session's `enabled_toolsets` is hard-coded to
+    # `["hermes-acp", ...configured mcp servers]`, with no `config.yaml` field
+    # or ACP protocol field that lets Jones add another built-in toolset —
+    # and `toolsets.py`'s `hermes-acp` (`_CODING_TOOLS` minus `clarify`)
+    # explicitly excludes `image_generate`/`text_to_speech` by name
+    # (`_core_without("image_generate", "text_to_speech", ...)`);
+    # `video_generate` was never in `_CODING_TOOLS`'s parent
+    # `_HERMES_CORE_TOOLS` to begin with. See `skills/bundled/media-gen/
+    # SKILL.md`'s "已知限制" section for the full source citations and why
+    # closing that gap is out of this Issue's scope. Added to
+    # `CONDITIONAL_BUILTIN_TOOLS` below for the same reason browser_*/
+    # web_search are there: their absence from a real worker's assembled
+    # schema is the NORMAL case for every deployment today, not a G21
+    # anomaly `reconcile()` should flag as drift.
+    "image_generate", "text_to_speech", "video_generate",
 )
 
 # Source-verified against `ee4452991d17534aa561f31ee55596d082aa94e7`'s
@@ -156,6 +181,11 @@ CONDITIONAL_BUILTIN_TOOLS: frozenset[str] = frozenset(
         "browser_type", "browser_scroll", "browser_back", "browser_press",
         "browser_get_images", "browser_vision", "browser_console",
         "browser_exec",
+        # Issue #21 — see BUILTIN_TOOLS' comment on these same three names:
+        # every ACP-launched worker excludes them from its schema today (a
+        # hard-coded Hermes fact, not a per-deployment config gap), so their
+        # absence must not read as G21 drift.
+        "image_generate", "text_to_speech", "video_generate",
     }
 )
 

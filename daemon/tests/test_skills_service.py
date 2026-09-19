@@ -12,6 +12,22 @@ from jones_daemon import paths
 from jones_daemon.skills import service
 
 
+@pytest.fixture(autouse=True)
+def _empty_bundled_skills_dir(tmp_path, monkeypatch):
+    """This suite is about the project/user tiers' own scanning rules — issue
+    #21 gave the real `BUNDLED_SKILLS_DIR` actual content (`office-docs`/
+    `media-gen`), so every `list_skills(project_path=None)` call below would
+    otherwise also see those two builtin entries, which is not what any test
+    here is asserting about. Point it at a fresh empty dir for this file only
+    (`test_bundled_skills.py` is where the builtin tier's real content is
+    actually exercised) — `worker_skill_dirs()`'s own tests below still pass:
+    they only assert `BUNDLED_SKILLS_DIR` is *included as a directory*, which
+    an empty existing dir satisfies exactly like a populated one."""
+    empty = tmp_path / "empty-bundled-skills"
+    empty.mkdir()
+    monkeypatch.setattr(service, "BUNDLED_SKILLS_DIR", empty)
+
+
 def _write_skill(root: Path, name: str, *, description: str = "示例 skill") -> Path:
     skill_dir = root / name
     skill_dir.mkdir(parents=True, exist_ok=True)

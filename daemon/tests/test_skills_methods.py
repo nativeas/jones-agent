@@ -70,9 +70,16 @@ async def test_skill_list_without_project_id_sees_only_user_and_builtin_tiers(se
     res = await _call(server.socket_path, "skill.list", {})
 
     assert "error" not in res
-    names = {s["name"] for s in res["result"]["skills"]}
-    assert names == {"weekly-report"}
-    assert res["result"]["skills"][0]["tier"] == "user"
+    skills = res["result"]["skills"]
+    names = {s["name"] for s in skills}
+    # `office-docs`/`media-gen` are issue #21's real bundled Skills — this
+    # test's own name ("...builtin tiers") always meant to include whatever
+    # ships in the builtin tier, not assert it empty.
+    assert names == {"weekly-report", "office-docs", "media-gen"}
+    by_name = {s["name"]: s for s in skills}
+    assert by_name["weekly-report"]["tier"] == "user"
+    assert by_name["office-docs"]["tier"] == "builtin"
+    assert by_name["media-gen"]["tier"] == "builtin"
 
 
 async def test_skill_list_with_project_id_includes_the_project_tier(server_and_dir):
@@ -84,9 +91,13 @@ async def test_skill_list_with_project_id_includes_the_project_tier(server_and_d
 
     res = await _call(server.socket_path, "skill.list", {"project_id": project_id["id"]})
 
-    names = {s["name"] for s in res["result"]["skills"]}
-    assert names == {"deploy"}
-    assert res["result"]["skills"][0]["tier"] == "project"
+    skills = res["result"]["skills"]
+    names = {s["name"] for s in skills}
+    # Project tier plus the builtin tier's real content (issue #21) — no user
+    # skill was written in this test, so "deploy" + the two bundled Skills.
+    assert names == {"deploy", "office-docs", "media-gen"}
+    by_name = {s["name"]: s for s in skills}
+    assert by_name["deploy"]["tier"] == "project"
 
 
 async def test_skill_list_with_unknown_project_id_errors_instead_of_silently_ignoring_it(
