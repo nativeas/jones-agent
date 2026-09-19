@@ -20,9 +20,13 @@ import json
 import sqlite3
 from typing import Any
 
+from jones_daemon import paths
 from jones_daemon.agents.store import AgentStore
 from jones_daemon.config.ids import new_ulid, now_iso
+from jones_daemon.logging import get_logger
 from jones_daemon.rpc.errors import INVALID_PARAMS, INVALID_STATE, NOT_FOUND, RpcError
+
+logger = get_logger("agents")
 
 # Built-in default Agent, seeded by migration 004 (docs/design/01-w2-interfaces.md
 # §2: A's 002 migration references this same fixed id for the main session before C
@@ -67,6 +71,12 @@ class AgentService:
     # -- DB index -------------------------------------------------------------
 
     def _upsert_index_row(self, agent: dict[str, Any], *, project_id: str | None) -> None:
+        # `agents.name` is `NOT NULL` (001_init.sql) — reject a malformed record
+        # here, with a message that says what's wrong, instead of letting a hand-
+        # edited `agent.yaml` with a missing/null `name` reach the DB and blow up
+        # as a raw sqlite3.IntegrityError on the daemon's startup path (review #4).
+        if not agent.get("name"):
+            raise ValueError(f"agent {agent.get('id')!r} is missing required field 'name'")
         exists = self._conn.execute(
             "SELECT 1 FROM agents WHERE id = ?", (agent["id"],)
         ).fetchone()
@@ -104,25 +114,74 @@ class AgentService:
         vanished out from under it (e.g. a hand-deleted directory) — `agent.delete`
         is the only path that removes a row, keeping "deleted via the API" and
         "file went missing on disk" distinguishable rather than silently pruning.
+
+        Two failure-isolation properties, both load-bearing on the daemon startup
+        path (review #4 — a hand-edited agent.yaml or an unreachable project
+        directory must not stop the daemon from binding its socket):
+          - Projects whose resolved agents directory *is* the user-level agents
+            directory are skipped in the per-project pass (review #1). This is the
+            real shape for `proj_default`, whose `path` is the user's home
+            directory (§2/§4): `paths.project_agents_dir(home)` and
+            `paths.agents_dir()` are then literally the same directory, already
+            covered by the `project_path=None` pass above — scanning it again
+            would silently re-home every user-level agent (`agent_default`
+            included) under `proj_default`'s `project_id`.
+          - Each agent (`_sync_one`) and each project's directory listing is
+            isolated in its own try/except: a bad `agent.yaml` (unparsable YAML,
+            a non-mapping top level, a missing `name`) or an unreadable project
+            path (an unmounted external volume) is logged as a warning and
+            skipped, not raised — "文件为事实源 + 允许手改" (PRD 10.3) means a
+            typo in one file can't be allowed to take the whole daemon down.
         """
         synced = 0
         for agent_id in self._store.list_ids(project_path=None):
-            data = self._store.read(agent_id, project_path=None)
-            if data is None:
-                continue
-            self._upsert_index_row(data, project_id=None)
-            synced += 1
-
-        for project in self._conn.execute("SELECT id, path FROM projects").fetchall():
-            for agent_id in self._store.list_ids(project_path=project["path"]):
-                data = self._store.read(agent_id, project_path=project["path"])
-                if data is None:
-                    continue
-                self._upsert_index_row(data, project_id=project["id"])
+            if self._sync_one(agent_id, project_path=None, project_id=None):
                 synced += 1
+
+        user_agents_dir = paths.agents_dir(create=False).resolve()
+        for project in self._conn.execute("SELECT id, path FROM projects").fetchall():
+            if paths.project_agents_dir(project["path"], create=False).resolve() == user_agents_dir:
+                continue
+            try:
+                agent_ids = self._store.list_ids(project_path=project["path"])
+            except OSError as exc:
+                logger.warning(
+                    "failed to list agents for project, skipping",
+                    extra={
+                        "detail": {
+                            "project_id": project["id"],
+                            "path": project["path"],
+                            "error": str(exc),
+                        }
+                    },
+                )
+                continue
+            for agent_id in agent_ids:
+                if self._sync_one(agent_id, project_path=project["path"], project_id=project["id"]):
+                    synced += 1
 
         self._conn.commit()
         return synced
+
+    def _sync_one(self, agent_id: str, *, project_path: str | None, project_id: str | None) -> bool:
+        try:
+            data = self._store.read(agent_id, project_path=project_path)
+            if data is None:
+                return False
+            self._upsert_index_row(data, project_id=project_id)
+            return True
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            logger.warning(
+                "failed to sync agent from file, skipping",
+                extra={
+                    "detail": {
+                        "agent_id": agent_id,
+                        "project_id": project_id,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return False
 
     def ensure_default_agent_file(self) -> None:
         """Materialize `agent_default`'s agent.yaml from the DB row if no file

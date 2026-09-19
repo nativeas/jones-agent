@@ -1,3 +1,5 @@
+import shutil
+
 import pytest
 
 from jones_daemon.agents.store import AgentStore
@@ -98,3 +100,52 @@ def test_list_ids_only_counts_directories_with_an_agent_yaml(home):
         project_path=None,
     )
     assert store.list_ids(project_path=None) == ["real"]
+
+
+# -- review #5: read paths must not mkdir --------------------------------------
+
+
+def test_list_ids_on_an_untouched_project_does_not_create_dot_jones(tmp_path):
+    store = AgentStore()
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    assert store.list_ids(project_path=str(project_dir)) == []
+    assert not (project_dir / ".jones").exists()
+
+
+def test_read_on_an_untouched_project_does_not_create_dot_jones(tmp_path):
+    store = AgentStore()
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    assert store.read("nope", project_path=str(project_dir)) is None
+    assert not (project_dir / ".jones").exists()
+
+
+def test_list_ids_does_not_resurrect_a_deleted_project_directory(tmp_path):
+    store = AgentStore()
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    store.write(
+        {
+            "id": "a1",
+            "name": "A",
+            "persona": None,
+            "tone": None,
+            "principles": None,
+            "tool_allowlist": [],
+            "skills": [],
+            "model_pref": {},
+            "created_at": "t0",
+            "updated_at": "t0",
+        },
+        project_path=str(project_dir),
+    )
+    assert (project_dir / ".jones" / "agents").exists()
+
+    shutil.rmtree(project_dir)  # user deletes/unmounts the whole project directory
+    assert not project_dir.exists()
+
+    assert store.list_ids(project_path=str(project_dir)) == []
+    assert not project_dir.exists()  # not recreated by the read

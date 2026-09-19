@@ -4,6 +4,7 @@ import sqlite3
 import pytest
 
 from jones_daemon import paths
+from jones_daemon.agents.service import AgentService
 from jones_daemon.projects.service import DEFAULT_PROJECT_ID, ProjectService
 from jones_daemon.rpc.errors import RpcError
 from jones_daemon.store import apply_pending, connect
@@ -108,6 +109,22 @@ def test_delete_refuses_when_sessions_still_reference_the_project(conn, tmp_path
 
     with pytest.raises(RpcError):
         service.delete(project["id"])
+
+
+def test_delete_refuses_when_a_project_scoped_agent_still_references_the_project(conn, tmp_path):
+    # Reproduces review round 1, finding #6: `agents.project_id` is a
+    # `REFERENCES projects(id)` FK too (001_init.sql), not just `sessions`; an
+    # unchecked DELETE used to surface as a raw sqlite3.IntegrityError instead of
+    # this application-level RpcError.
+    projects = ProjectService(conn)
+    workdir = tmp_path / "myproj"
+    workdir.mkdir()
+    project = projects.create(str(workdir))
+
+    AgentService(conn).upsert({"name": "ProjAgent", "project_id": project["id"]})
+
+    with pytest.raises(RpcError):
+        projects.delete(project["id"])
 
 
 def test_delete_refuses_the_default_project(conn):

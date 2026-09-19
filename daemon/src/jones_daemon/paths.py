@@ -55,7 +55,13 @@ def secrets_dir() -> Path:
     return _ensure(user_root() / "secrets", mode=0o700)
 
 
-def agents_dir() -> Path:
+def agents_dir(*, create: bool = True) -> Path:
+    """`create=False` returns the path without touching the filesystem — for
+    read-only callers (AgentStore.read/list_ids) that must not resurrect a
+    directory a user deleted, or fail with PermissionError just from being asked
+    where something *would* live (see agents/store.py)."""
+    if not create:
+        return user_root() / "agents"
     _ensure_root()
     return _ensure(user_root() / "agents")
 
@@ -106,9 +112,15 @@ def sock_file() -> Path:
 # --- project-level accessors -------------------------------------------------
 
 
-def project_root(project_path: str | os.PathLike[str]) -> Path:
-    """Return `<project_path>/.jones`, created on first access."""
-    return _ensure(Path(project_path).expanduser() / ".jones")
+def project_root(project_path: str | os.PathLike[str], *, create: bool = True) -> Path:
+    """Return `<project_path>/.jones`, created on first access.
+
+    `create=False` skips the `mkdir` entirely — a read-only caller asking "where
+    would this project's files live" must not have the side effect of recreating
+    `<project_path>/.jones` for a project directory the user has since deleted or
+    unmounted (see agents/store.py, docs/design/01-w2-interfaces.md §4 review)."""
+    path = Path(project_path).expanduser() / ".jones"
+    return _ensure(path) if create else path
 
 
 def project_settings_path(project_path: str | os.PathLike[str]) -> Path:
@@ -123,8 +135,10 @@ def project_mcp_path(project_path: str | os.PathLike[str]) -> Path:
     return project_root(project_path) / "mcp.json"
 
 
-def project_agents_dir(project_path: str | os.PathLike[str]) -> Path:
-    return _ensure(project_root(project_path) / "agents")
+def project_agents_dir(project_path: str | os.PathLike[str], *, create: bool = True) -> Path:
+    root = project_root(project_path, create=create)
+    agents = root / "agents"
+    return _ensure(agents) if create else agents
 
 
 def project_skills_dir(project_path: str | os.PathLike[str]) -> Path:

@@ -15,6 +15,9 @@ from typing import Any
 import yaml
 
 from jones_daemon import paths
+from jones_daemon.logging import get_logger
+
+logger = get_logger("agents")
 
 AGENT_FILENAME = "agent.yaml"
 
@@ -35,36 +38,56 @@ _FIELDS = (
 )
 
 
-def _agents_dir(project_path: str | None) -> Path:
-    return paths.project_agents_dir(project_path) if project_path else paths.agents_dir()
+def _agents_dir(project_path: str | None, *, create: bool = True) -> Path:
+    if project_path:
+        return paths.project_agents_dir(project_path, create=create)
+    return paths.agents_dir(create=create)
 
 
-def _agent_dir(agent_id: str, *, project_path: str | None) -> Path:
-    return _agents_dir(project_path) / agent_id
+def _agent_dir(agent_id: str, *, project_path: str | None, create: bool = True) -> Path:
+    return _agents_dir(project_path, create=create) / agent_id
 
 
 class AgentStore:
     def read(self, agent_id: str, *, project_path: str | None) -> dict[str, Any] | None:
-        file_path = _agent_dir(agent_id, project_path=project_path) / AGENT_FILENAME
+        # Read-only: never mkdir the agents tree just to look inside it (see
+        # paths.py — a deleted/unmounted project directory must stay deleted, not
+        # get its `.jones/agents/` resurrected by a startup scan).
+        file_path = (
+            _agent_dir(agent_id, project_path=project_path, create=False) / AGENT_FILENAME
+        )
         if not file_path.exists():
             return None
-        raw = yaml.safe_load(file_path.read_text(encoding="utf-8")) or {}
+        try:
+            raw = yaml.safe_load(file_path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            logger.warning(
+                "failed to parse agent.yaml, skipping",
+                extra={"detail": {"path": str(file_path), "error": str(exc)}},
+            )
+            return None
+        if not isinstance(raw, dict):
+            logger.warning(
+                "agent.yaml did not contain a mapping, skipping",
+                extra={"detail": {"path": str(file_path)}},
+            )
+            return None
         return {field: raw.get(field) for field in _FIELDS}
 
     def write(self, agent: dict[str, Any], *, project_path: str | None) -> None:
-        agent_dir = _agent_dir(agent["id"], project_path=project_path)
+        agent_dir = _agent_dir(agent["id"], project_path=project_path)  # create=True: writing
         agent_dir.mkdir(parents=True, exist_ok=True)
         record = {field: agent.get(field) for field in _FIELDS}
         text = yaml.safe_dump(record, sort_keys=False, allow_unicode=True)
         (agent_dir / AGENT_FILENAME).write_text(text, encoding="utf-8")
 
     def delete(self, agent_id: str, *, project_path: str | None) -> None:
-        agent_dir = _agent_dir(agent_id, project_path=project_path)
+        agent_dir = _agent_dir(agent_id, project_path=project_path, create=False)
         if agent_dir.exists():
             shutil.rmtree(agent_dir)
 
     def list_ids(self, *, project_path: str | None) -> list[str]:
-        base = _agents_dir(project_path)
+        base = _agents_dir(project_path, create=False)
         if not base.exists():
             return []
         return sorted(

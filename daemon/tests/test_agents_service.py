@@ -182,3 +182,148 @@ def test_ensure_default_agent_file_materializes_the_file_once(conn):
     )
     service.ensure_default_agent_file()
     assert service._store.read(DEFAULT_AGENT_ID, project_path=None)["name"] == "Edited By User"
+
+
+# -- review #1: proj_default's path collides with the user-level agents dir ---
+
+
+def test_sync_from_files_does_not_reassign_user_level_agents_when_proj_default_collides_with_home(
+    tmp_path, monkeypatch
+):
+    """Reproduces review round 1, finding #1: in the real default shape (JONES_HOME
+    unset), `user_root()` is `Path.home() / ".jones"` and `proj_default.path` is
+    `Path.home()` — so `paths.project_agents_dir(proj_default.path)` and
+    `paths.agents_dir()` resolve to the *same* directory. `sync_from_files`'s
+    per-project pass must not re-upsert user-level agents (including
+    `agent_default`) under `proj_default`'s `project_id`. Reproduced here without
+    touching the real $HOME by pointing JONES_HOME at `<home>/.jones` and seeding
+    `proj_default` at `<home>` — the exact shape `paths.user_root()` produces by
+    default.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setenv("JONES_HOME", str(home / ".jones"))
+    c = connect(paths.db_path())
+    apply_pending(c)
+    try:
+        ProjectService(c).ensure_default_project(str(home))
+        assert (
+            paths.project_agents_dir(home, create=False).resolve()
+            == paths.agents_dir(create=False).resolve()
+        )  # sanity: this test actually reproduces the collision
+
+        service = AgentService(c)
+        service.ensure_default_agent_file()
+        created = service.upsert({"name": "MyUserAgent"})
+
+        service.sync_from_files()
+
+        assert service.get(DEFAULT_AGENT_ID)["project_id"] is None
+        assert service.get(created["id"])["project_id"] is None
+        user_level_ids = {a["id"] for a in service.list(None)}
+        assert {DEFAULT_AGENT_ID, created["id"]} <= user_level_ids
+    finally:
+        c.close()
+
+
+# -- review #4: startup sync isolates per-agent / per-project failures --------
+
+
+def test_sync_from_files_skips_an_agent_yaml_missing_the_required_name_field(conn, tmp_path):
+    service = AgentService(conn)
+    agents_dir = paths.agents_dir()
+    (agents_dir / "broken").mkdir()
+    (agents_dir / "broken" / "agent.yaml").write_text("name: null\npersona: x\n")
+
+    synced = service.sync_from_files()  # must not raise sqlite3.IntegrityError
+
+    assert synced == 0
+    assert conn.execute("SELECT 1 FROM agents WHERE id = 'broken'").fetchone() is None
+
+
+def test_sync_from_files_skips_an_agent_yaml_with_invalid_syntax(conn, tmp_path):
+    service = AgentService(conn)
+    agents_dir = paths.agents_dir()
+    (agents_dir / "badyaml").mkdir()
+    (agents_dir / "badyaml" / "agent.yaml").write_text("name: [unterminated\n")
+
+    synced = service.sync_from_files()  # must not raise yaml.YAMLError
+
+    assert synced == 0
+
+
+def test_sync_from_files_skips_an_agent_yaml_whose_top_level_is_not_a_mapping(conn, tmp_path):
+    service = AgentService(conn)
+    agents_dir = paths.agents_dir()
+    (agents_dir / "listtop").mkdir()
+    (agents_dir / "listtop" / "agent.yaml").write_text("- not\n- a\n- mapping\n")
+
+    synced = service.sync_from_files()  # must not raise AttributeError
+
+    assert synced == 0
+
+
+def test_sync_from_files_still_syncs_good_agents_alongside_a_broken_one(conn, tmp_path):
+    service = AgentService(conn)
+    agents_dir = paths.agents_dir()
+    (agents_dir / "broken").mkdir()
+    (agents_dir / "broken" / "agent.yaml").write_text("name: null\n")
+    service._store.write(
+        {
+            "id": "good",
+            "name": "Good",
+            "persona": None,
+            "tone": None,
+            "principles": None,
+            "tool_allowlist": [],
+            "skills": [],
+            "model_pref": {},
+            "created_at": "t0",
+            "updated_at": "t0",
+        },
+        project_path=None,
+    )
+
+    synced = service.sync_from_files()
+
+    assert synced == 1
+    assert service.get("good")["name"] == "Good"
+
+
+def test_sync_from_files_skips_a_project_whose_agents_dir_is_unreadable(
+    conn, tmp_path, monkeypatch
+):
+    projects = ProjectService(conn)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    project = projects.create(str(workdir))
+
+    service = AgentService(conn)
+    service._store.write(
+        {
+            "id": "good",
+            "name": "Good",
+            "persona": None,
+            "tone": None,
+            "principles": None,
+            "tool_allowlist": [],
+            "skills": [],
+            "model_pref": {},
+            "created_at": "t0",
+            "updated_at": "t0",
+        },
+        project_path=None,
+    )
+
+    original_list_ids = service._store.list_ids
+
+    def _list_ids_maybe_boom(*, project_path):
+        if project_path == project["path"]:
+            raise PermissionError("simulated: unreadable project directory")
+        return original_list_ids(project_path=project_path)
+
+    monkeypatch.setattr(service._store, "list_ids", _list_ids_maybe_boom)
+
+    synced = service.sync_from_files()  # must not raise PermissionError
+
+    assert synced == 1  # the user-level "good" agent still synced
+    assert service.get("good")["name"] == "Good"

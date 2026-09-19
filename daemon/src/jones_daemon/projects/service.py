@@ -90,12 +90,16 @@ class ProjectService:
         """Project 删除 = SQLite 行 + `<user_root>/projects/<id>/`（附件目录），不删
         用户目录里的 `.jones/`（那是用户数据，见 01-w2-interfaces.md §4）。
 
-        Refuses (诚实失败, not a silent cascade) rather than orphaning sessions that
-        still reference this project — `sessions.project_id` is `NOT NULL REFERENCES
-        projects(id)` (00-foundation.md §5) and this connection runs with
-        `PRAGMA foreign_keys=ON` (store/db.py), so an unchecked DELETE would simply
-        raise sqlite3.IntegrityError; this turns that into a clear application error
-        instead. Batch-archiving/deleting a Project's sessions first is a `session.*`
+        Refuses (诚实失败, not a silent cascade) rather than orphaning sessions or
+        agents that still reference this project — `sessions.project_id` and
+        `agents.project_id` are both `REFERENCES projects(id)` (00-foundation.md
+        §5) and this connection runs with `PRAGMA foreign_keys=ON` (store/db.py),
+        so an unchecked DELETE would simply raise sqlite3.IntegrityError; this
+        turns that into a clear application error instead — for *every* table that
+        can hold a `project_id`, not just sessions (a project with only a
+        project-scoped Agent and no sessions hit exactly this raw IntegrityError
+        before this check existed; see the branch report's review round 1).
+        Batch-archiving/deleting a Project's sessions first is a `session.*`
         operation (owned by branch A) — not implemented here since it isn't in the
         RPC v0 method table (design §4.1 lists only `project.list/create/delete`).
         """
@@ -111,6 +115,16 @@ class ProjectService:
                 INVALID_STATE,
                 f"project has {session_count} session(s); remove or reassign them first",
                 {"session_count": session_count},
+            )
+
+        agent_count = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM agents WHERE project_id = ?", (project_id,)
+        ).fetchone()["c"]
+        if agent_count:
+            raise RpcError(
+                INVALID_STATE,
+                f"project has {agent_count} agent(s); remove or reassign them first",
+                {"agent_count": agent_count},
             )
 
         self._conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))

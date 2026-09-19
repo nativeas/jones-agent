@@ -115,6 +115,45 @@ def test_permissions_with_no_project_id_returns_only_user_rules(conn):
 
     assert [r.match for r in result.rules] == ["rm"]
     assert result.warnings == ()
+    assert result.degraded is False
+
+
+def test_permissions_is_not_degraded_when_nothing_is_configured(conn):
+    # Missing file (never configured) must stay indistinguishable from "no
+    # restrictions" — degraded is specifically about a file that exists but is
+    # broken, not about the normal empty-config case.
+    resolver = DefaultConfigResolver(conn)
+    result = resolver.permissions(None)
+    assert result.rules == ()
+    assert result.degraded is False
+
+
+def test_permissions_is_degraded_when_user_level_permissions_json_fails_to_parse(conn):
+    # Review round 1, finding #7: a corrupt user-level permissions.json used to
+    # silently resolve to "no rules" (fail-open) with no way for a caller to tell
+    # that apart from "nothing configured". `degraded=True` is that signal — a
+    # caller (the W3 rule gate) is expected to fail closed on it.
+    (paths.config_dir() / "permissions.json").write_text("{not valid json")
+    resolver = DefaultConfigResolver(conn)
+
+    result = resolver.permissions(None)
+
+    assert result.rules == ()  # the corrupt file's rules are unavailable, as before
+    assert result.degraded is True
+    assert any("failed to parse" in w for w in result.warnings)
+
+
+def test_permissions_is_degraded_when_project_level_permissions_json_fails_to_parse(conn, project):
+    write_json(paths.config_dir() / "permissions.json", _rule("rm", "deny"))
+    paths.project_permissions_path(project["path"]).write_text('["not", "an", "object"]')
+    resolver = DefaultConfigResolver(conn)
+
+    result = resolver.permissions(project["id"])
+
+    # The (valid) user-level rule still applies — only the broken project-level
+    # file's contribution is lost.
+    assert [r.match for r in result.rules] == ["rm"]
+    assert result.degraded is True
 
 
 # -- mcp_servers(): plain override-by-name merge (not a permission) -----------

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from jones_daemon import paths
-from jones_daemon.config.jsonfile import logger, read_json
+from jones_daemon.config.jsonfile import logger, read_json, read_json_result
 from jones_daemon.rpc.errors import NOT_FOUND, RpcError
 
 # Built-in defaults for settings.json (design §4 addendum): every key a resolved
@@ -48,10 +48,20 @@ class PermissionRule:
 class Permissions:
     rules: tuple[PermissionRule, ...]
     # Human-readable notes about project-level rules that were dropped because they
-    # tried to loosen a user-level restriction (PRD 10.1). Also logged via
-    # `logger.warning` as they're produced — returned here too so callers (tests,
-    # a future settings UI) can surface them without scraping logs.
+    # tried to loosen a user-level restriction (PRD 10.1), *and* about a
+    # permissions.json that existed but failed to parse (see `degraded` below).
+    # Also logged via `logger.warning` as they're produced — returned here too so
+    # callers (tests, a future settings UI) can surface them without scraping logs.
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    # True when a permissions.json existed at some scope (user or project) but
+    # failed to parse, so `rules` is missing whatever that file would have
+    # contributed — as opposed to the normal "nothing configured" case, where
+    # `degraded` is False and an empty `rules` genuinely means no restrictions set.
+    # A caller deciding whether to allow a tool call (the W3 rule gate) MUST check
+    # this and fail closed (deny) when it's True — reading `rules` alone can't
+    # distinguish "no rules configured" from "rules unreadable", and treating the
+    # latter as the former is a fail-open hole (see docs/design review #7).
+    degraded: bool = False
 
 
 def _merge_permission_rules(
@@ -126,17 +136,45 @@ class DefaultConfigResolver:
         return merged
 
     def permissions(self, project_id: str | None) -> Permissions:
-        user_rules = read_json(paths.config_dir() / "permissions.json", {}).get("rules", [])
+        # Uses `read_json_result` (not the `read_json`/`{}` fallback every other
+        # config file here uses) specifically so a permissions.json that exists
+        # but fails to parse is distinguishable from one that was never
+        # configured — see `Permissions.degraded`'s docstring and design review
+        # #7: falling back silently here would drop every deny rule with no
+        # signal, which is a fail-open security bug, not a UX nicety.
+        user_data, user_ok = read_json_result(paths.config_dir() / "permissions.json")
+        user_rules = (user_data or {}).get("rules", [])
+
         project_path = self._project_path(project_id)
         project_rules: list[dict[str, Any]] = []
+        project_ok = True
         if project_path is not None:
-            project_rules = read_json(
-                paths.project_permissions_path(project_path), {}
-            ).get("rules", [])
-        result = _merge_permission_rules(user_rules, project_rules)
-        for warning in result.warnings:
+            project_data, project_ok = read_json_result(
+                paths.project_permissions_path(project_path)
+            )
+            project_rules = (project_data or {}).get("rules", [])
+
+        merged = _merge_permission_rules(user_rules, project_rules)
+        warnings = list(merged.warnings)
+        if not user_ok:
+            warnings.append(
+                "user-level permissions.json exists but failed to parse; its rules "
+                "are unavailable this resolve (degraded — treat as fail-closed, not "
+                "as \"no rules configured\")"
+            )
+        if not project_ok:
+            warnings.append(
+                f"project-level permissions.json for project_id={project_id!r} exists "
+                "but failed to parse; its rules are unavailable this resolve (degraded)"
+            )
+        for warning in warnings:
             logger.warning(warning, extra={"detail": {"project_id": project_id}})
-        return result
+
+        return Permissions(
+            rules=merged.rules,
+            warnings=tuple(warnings),
+            degraded=not user_ok or not project_ok,
+        )
 
     def mcp_servers(self, project_id: str | None) -> list[dict[str, Any]]:
         user_servers = read_json(paths.config_dir() / "mcp.json", {}).get("servers", [])
