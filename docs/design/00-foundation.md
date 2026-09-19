@@ -85,7 +85,7 @@ Electron main ──(socket client)──> daemon
 | `permission.decide` | `{request_id, decision: "allow"\|"deny", remember?: "session"\|"project"}` | `PermissionDecision` |
 | `provider.list` / `provider.set_key` / `provider.delete_key` | `{provider, key?}` | `{provider, has_key, key_hint}`（hint 只给末 4 位，PRD FR04） |
 | `model.list` | `{provider?}` | `Model[]` |
-| `capability.list` | `{session_id}` | `{tools: [{name, source, enabled, hidden_reason?}]}`（FR16） |
+| `capability.list` | `{session_id}` | `{tools: [{name, source, enabled, hidden_reason?, actually_loaded: bool}], drift: string[]}`（FR16、G21——评审第 3 轮 #7：此行原缺 `drift`/`actually_loaded`，与 03-w4 §2 的定义不一致，renderer 若信了这张表会对未定义字段解引用；H 落地时按这行实现） |
 | `skill.list` | `{project_id?}` | `{skills: [{name, description, tier: "project"\|"user"\|"builtin", source_path, valid, error?}]}`（FR12，issue #18/#19；`project_id` 缺省时只看用户级+内置两层） |
 | `cron.list` / `cron.upsert` / `cron.delete` / `cron.run_now` | `Cron` | `Cron` |
 | `settings.get` / `settings.set` | `{scope: "user"\|"project", project_id?, patch}` | `Settings` |

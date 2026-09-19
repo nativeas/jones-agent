@@ -23,7 +23,7 @@ export function StepCard({ step }: { step: Step }): JSX.Element {
         <div className="step-card__body">
           <div>
             <b>参数：</b>
-            {step.args_summary}
+            {Object.keys(step.args).length > 0 ? JSON.stringify(step.args) : '（无参数）'}
           </div>
           {step.result_summary && (
             <div>

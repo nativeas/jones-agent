@@ -113,7 +113,7 @@ export function CapabilitySettings({ transport }: { transport: RpcTransport }): 
         <button onClick={refresh}>刷新</button>
       </div>
 
-      {capability && capability.drift.length > 0 && (
+      {capability && (capability.drift?.length ?? 0) > 0 && (
         <div className="capability-settings__drift-warning" role="alert">
           <strong>装配对账不一致（G21）：</strong>
           <ul>
@@ -141,7 +141,7 @@ export function CapabilitySettings({ transport }: { transport: RpcTransport }): 
               </tr>
             </thead>
             <tbody>
-              {capability.tools.map((t) => (
+              {(capability.tools ?? []).map((t) => (
                 <tr key={t.name} className={t.enabled ? undefined : 'capability-table__row--hidden'}>
                   <td>{t.name}</td>
                   <td>{SOURCE_LABEL[t.source] ?? t.source}</td>

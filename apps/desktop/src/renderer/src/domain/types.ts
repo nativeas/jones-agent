@@ -61,12 +61,22 @@ export interface Message {
 
 export type StepStatus = 'running' | 'completed' | 'failed'
 
+/** 评审第 3 轮 important：`args_summary: string` never existed on the wire —
+ * `steps` table column is `args_json` (`store/migrations/001_init.sql`),
+ * `sessions/queries.py::_d()` decodes it under the key `args` into a plain
+ * object, never a pre-summarized string (verified against source, same
+ * "renderer type vs. daemon `_d()` reality" class of bug #34 was). Same
+ * fix as #34: align the type with what daemon actually sends instead of an
+ * imagined field. Whether daemon should ALSO send a human-summarized string
+ * is a contract decision outside this branch's `domain/types.ts`/`StepCard.tsx`
+ * ownership (steps 广播 owned by A/G, see this PR's report) — this only
+ * stops the renderer from reading a field that was always `undefined`. */
 export interface Step {
   id: string
   run_id: string
   seq: number
   tool: string
-  args_summary: string
+  args: Record<string, unknown>
   result_summary: string | null
   duration_ms: number | null
   status: StepStatus
@@ -96,12 +106,17 @@ export type PermissionRiskLevel = 'low' | 'medium' | 'high' | 'unclassified'
  * `permission_pending()` both do `tool_call = params.get("toolCall") or {}`
  * and pass it straight through) — every field is optional because nothing on
  * the renderer side may assume Hermes populated a given one for a given tool.
- * `rawInput` is intentionally left untyped/unread by this app: per
- * 03-w4-interfaces.md §5 ("不要在 renderer 里猜测解析"), decoding it (it can
- * be either a `{"tool","arguments"}` shape or a plugin-approval-rule shape
- * with the real tool/args packed into `description`, see
- * docs/design/02-w3-interfaces.md §1.2) is daemon-side work that hasn't
- * landed — see this PR's report. */
+ * `rawInput` is left untyped (`unknown`) because it's a discriminated-by-shape
+ * payload, not because it's unread: for the `write_file`/`patch` edit-approval
+ * shape (`{"tool","arguments"}`) this app still doesn't decode it — real
+ * structured args land there directly from Hermes and decoding it would be
+ * genuine shape-guessing (03-w4-interfaces.md §5); but for the plugin-
+ * approval-rule shape (`{"command","description"}`, every other escalated
+ * tool) `description` carries a `JONES_REVIEW_V1:{...}` payload whose format
+ * Jones itself defines (`_review_payload.py`, docs/design/02-w3-interfaces.md
+ * §1.2) — `PermissionPanel.tsx`'s `decodeReviewPayload` decodes that one
+ * (评审第 3 轮 critical), which is why this field stays `unknown` rather than
+ * fully unread. */
 export interface ToolCallInfo {
   toolCallId?: string
   title?: string

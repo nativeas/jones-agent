@@ -139,6 +139,85 @@ def test_list_skills_prunes_excluded_dirs_instead_of_walking_into_them(tmp_path,
     assert not any(p.name == "node_modules" or "node_modules" in p.parts for p in visited)
 
 
+def test_list_skills_lists_a_top_level_skill_literally_named_scripts(tmp_path, monkeypatch):
+    """评审第 3 轮 #2/#5 (G21): the previous version of `_EXCLUDED_DIR_NAMES`
+    pruned `scripts`/`references`/`templates`/`assets` unconditionally at any
+    depth — including a TOP-LEVEL skill legitimately named one of those.
+    Hermes's own scanner (`agent/skill_utils.py::iter_skill_index_files`)
+    only prunes them when the directory being walked has its OWN `SKILL.md`
+    (a skill's progressive-disclosure support dir), so a standalone
+    `~/.jones/skills/scripts/SKILL.md` is one Hermes loads. Real-scanner
+    parity check from the review: K scanner used to see `['normal']`, Hermes
+    saw `['linked', 'normal', 'scripts']` for the same directory tree — this
+    test is the `'scripts'` half of that gap."""
+    monkeypatch.setenv("JONES_HOME", str(tmp_path / "home"))
+    _write_skill(paths.skills_dir(), "normal")
+    _write_skill(paths.skills_dir(), "scripts")
+
+    result = service.list_skills(project_path=None)
+
+    assert {e["name"] for e in result} == {"normal", "scripts"}
+
+
+def test_list_skills_prunes_support_dirs_only_inside_their_own_skill(tmp_path, monkeypatch):
+    """The other half of #2/#5: `references/templates/assets/scripts` nested
+    INSIDE a skill that itself has `SKILL.md` (Hermes's actual "progressive
+    disclosure" use case) must still be pruned — conditional pruning, not no
+    pruning at all."""
+    monkeypatch.setenv("JONES_HOME", str(tmp_path / "home"))
+    skill_dir = _write_skill(paths.skills_dir(), "with-scripts")
+    # A stray SKILL.md-shaped file under the skill's OWN `scripts/` support
+    # dir must not be listed as a second, separate skill.
+    _write_skill(skill_dir / "scripts", "nested-fake")
+
+    result = service.list_skills(project_path=None)
+
+    assert [e["name"] for e in result] == ["with-scripts"]
+
+
+def test_list_skills_follows_symlinked_skill_dirs(tmp_path, monkeypatch):
+    """评审第 3 轮 #2/#5: `os.walk(..., followlinks=True)`, matching Hermes's
+    own scan — a skill directory linked into `~/.jones/skills/` (a natural
+    way to reuse an existing skill checkout without copying it) must be
+    listed, not silently skipped the way `followlinks=False` (the previous
+    behavior, and `os.walk`'s own default) would skip it."""
+    monkeypatch.setenv("JONES_HOME", str(tmp_path / "home"))
+    real_skill_dir = tmp_path / "elsewhere" / "linked-skill"
+    _write_skill(real_skill_dir.parent, "linked-skill")
+    (paths.skills_dir() / "linked-skill").symlink_to(real_skill_dir, target_is_directory=True)
+    _write_skill(paths.skills_dir(), "normal")
+
+    result = service.list_skills(project_path=None)
+
+    assert {e["name"] for e in result} == {"linked-skill", "normal"}
+
+
+def test_list_skills_marks_a_non_utf8_skill_invalid_without_failing_the_whole_scan(
+    tmp_path, monkeypatch
+):
+    """评审第 3 轮 #4: a non-UTF-8 `SKILL.md` must not take down the entire
+    `skill.list` response — `read_text(encoding="utf-8")` raises
+    `UnicodeDecodeError` (a `ValueError` subclass, not `OSError`), which the
+    previous `except OSError` in `_scan_tier` did not catch, so it propagated
+    all the way out of `list_skills()` and every OTHER, well-formed skill
+    went missing too. 03-w4-interfaces.md §6: "Skill 格式错 → 列出并标
+    invalid，不静默跳过"."""
+    monkeypatch.setenv("JONES_HOME", str(tmp_path / "home"))
+    _write_skill(paths.skills_dir(), "good-skill", description="正常的 skill")
+    bad_dir = paths.skills_dir() / "bad-encoding"
+    bad_dir.mkdir(parents=True)
+    (bad_dir / "SKILL.md").write_bytes(b"---\nname: bad\xff\xfe\n---\n")
+
+    result = service.list_skills(project_path=None)
+
+    assert len(result) == 2
+    good = next(e for e in result if e["name"] == "good-skill")
+    assert good["valid"] is True
+    bad = next(e for e in result if str(bad_dir) in e["source_path"])
+    assert bad["valid"] is False
+    assert bad["error"] is not None
+
+
 def test_worker_skill_dirs_orders_project_before_user_before_builtin(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("JONES_HOME", str(home))
@@ -164,7 +243,10 @@ def test_worker_skill_dirs_orders_project_before_user_before_builtin(tmp_path, m
 
     dirs = service.worker_skill_dirs(ctx, session)
 
-    assert dirs == [
+    # 评审第 3 轮 #8: project 拆成独立字段，不再混在一个扁平列表里。
+    assert dirs.project == paths.project_skills_dir(str(project_dir))
+    assert dirs.trusted == [paths.skills_dir(), service.BUNDLED_SKILLS_DIR]
+    assert dirs.all_dirs() == [
         paths.project_skills_dir(str(project_dir)),
         paths.skills_dir(),
         service.BUNDLED_SKILLS_DIR,
@@ -198,8 +280,9 @@ def test_worker_skill_dirs_dedups_the_default_projects_dir_against_the_user_dir(
 
     dirs = service.worker_skill_dirs(ctx, session)
 
-    # project dir collapsed into user dir
-    assert dirs == [paths.skills_dir(), service.BUNDLED_SKILLS_DIR]
+    # project dir collapsed into user dir — not a distinct project tier
+    assert dirs.project is None
+    assert dirs.trusted == [paths.skills_dir(), service.BUNDLED_SKILLS_DIR]
 
 
 def test_worker_skill_dirs_without_a_project_id_skips_the_project_tier(tmp_path, monkeypatch):
@@ -210,7 +293,8 @@ def test_worker_skill_dirs_without_a_project_id_skips_the_project_tier(tmp_path,
 
     dirs = service.worker_skill_dirs(ctx, {"project_id": None})
 
-    assert dirs == [paths.skills_dir(), service.BUNDLED_SKILLS_DIR]
+    assert dirs.project is None
+    assert dirs.trusted == [paths.skills_dir(), service.BUNDLED_SKILLS_DIR]
 
 
 def test_worker_skill_dirs_propagates_not_found_for_a_deleted_project(
@@ -256,5 +340,6 @@ def test_worker_skill_dirs_omits_and_does_not_recreate_an_unpopulated_project_di
 
     dirs = service.worker_skill_dirs(ctx, {"project_id": "p1"})
 
-    assert dirs == [paths.skills_dir(), service.BUNDLED_SKILLS_DIR]
+    assert dirs.project is None
+    assert dirs.trusted == [paths.skills_dir(), service.BUNDLED_SKILLS_DIR]
     assert not (project_dir / ".jones").exists()

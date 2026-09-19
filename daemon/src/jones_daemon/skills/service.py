@@ -18,8 +18,28 @@ filters. Re-deriving all of that here would be exactly the "重写 Hermes 已有
 工具" DEV.md forbids (工程原则 #1) — the actual load-time source of truth is
 Hermes itself, once `worker_skill_dirs()` below hands it the right
 directories. This scanner only needs to answer "does a SKILL.md exist here
-and does its frontmatter parse" for the settings page; edge cases in that
-differ-from-Hermes list are called out in this PR's report.
+and does its frontmatter parse" for the settings page.
+
+**评审第 3 轮 #2/#5 收口**：本模块曾承诺"differ-from-Hermes 的 edge case
+写进报告"，但报告里从没真的列过——这里补上，逐条写清是"已对齐"还是"已知
+接受的差异"：
+- 排除目录名单（`_EXCLUDED_DIR_NAMES`）、`references/templates/assets/
+  scripts` 的条件剪枝（`_SKILL_SUPPORT_DIR_NAMES`，仅当当前目录自带
+  `SKILL.md` 才剪）、符号链接（`followlinks=True`）——**已对齐**，见
+  `_iter_skill_md_files` 与上面两个常量各自的注释。
+- **已知接受的差异（未对齐，故意）**：Hermes 的 `_org/` 组织镜像目录
+  （`ORG_MIRROR_DIR_NAME`）是 token 门控的——只有 `read_active_org_id()`
+  读到的那一个组织子目录会被扫描，未激活的组织镜像即使物理存在也不会被
+  Hermes 加载。这个扫描器没有实现这层门控：如果 `~/.jones/skills/_org/`
+  下真的出现这种目录结构（目前 Jones 没有任何代码会创建它——组织同步是
+  Hermes 自己的功能，Jones 未接入），本扫描器会把未激活组织的 skill 也列
+  出来，比 Hermes 实际加载的多列（反方向漂移：多列不存在的，不是漏列
+  存在的）。接受理由：① 触发条件（`~/.jones/skills/` 下出现 `_org/` 子目录
+  且其中有未激活组织的内容）在 Jones 当前功能集下不会自然发生；② 完整
+  实现需要读 `.active_org` marker 并复刻 `ORG_MIRROR_DIR_NAME`/
+  `ORG_ACTIVE_MARKER` 一整套逻辑，属于"重写 Hermes 已有工具"的复杂度
+  （DEV.md 工程原则 #1），换来的只是一个目前不会触发的差异。若 Jones 之后
+  接入组织同步功能，需要回来补这一层。
 
 **评审第 1 轮 #5 更正**：上一版这里写着"Hermes 的真实扫描还会用
 `skills_guard` 这个内容扫描器隔离项目级 skill"——这句话不对，已核对源码
@@ -95,17 +115,35 @@ from jones_daemon import paths
 # rather than special-casing "builtin isn't there yet".
 BUNDLED_SKILLS_DIR = Path(__file__).resolve().parent / "bundled"
 
-# Directory names a scan never descends into: VCS/dependency/cache noise, plus
-# Hermes's own progressive-disclosure support dirs (`references/` etc.) so a
-# stray `SKILL.md`-shaped file inside one of those doesn't get listed as its
-# own skill (mirrors, loosely, `agent.skill_utils.EXCLUDED_SKILL_DIRS` /
-# `SKILL_SUPPORT_DIRS` in the installed hermes-agent — see module docstring
-# for why this is a preview scan, not a claim of exact parity).
+# Directory names a scan never descends into, at ANY depth — VCS/dependency/
+# cache noise. **评审第 3 轮 #2/#5**: this set now mirrors the installed
+# hermes-agent's `agent/skill_utils.py::EXCLUDED_SKILL_DIRS` exactly (name
+# for name — `.archive`/`.curator_backups`/`site-packages`/`.tox`/`.nox` were
+# previously missing here, which was reverse drift: this scanner would list a
+# skill nested under one of those that Hermes's own walk would never reach).
+# `references`/`templates`/`assets`/`scripts` are deliberately NOT in this
+# set — see `_SKILL_SUPPORT_DIR_NAMES` below for why they need different,
+# conditional treatment instead of unconditional pruning.
 _EXCLUDED_DIR_NAMES = frozenset({
-    ".git", ".github", ".hub", ".venv", "venv", "node_modules", "__pycache__",
-    ".pytest_cache", ".mypy_cache", ".ruff_cache", "references", "templates",
-    "assets", "scripts",
+    ".git", ".github", ".hub", ".archive", ".curator_backups",
+    ".venv", "venv", "node_modules", "site-packages", "__pycache__",
+    ".tox", ".nox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
 })
+
+# Hermes's own progressive-disclosure support dirs inside a skill package
+# (`agent/skill_utils.py::SKILL_SUPPORT_DIRS`) — loaded explicitly via
+# `skill_view(skill, file_path=...)`, never scanned as standalone skills.
+# **评审第 3 轮 #2/#5 (was a false negative, not just a false positive)**:
+# the previous version of this module pruned these names unconditionally at
+# any depth, same as `_EXCLUDED_DIR_NAMES` — but Hermes's own
+# `iter_skill_index_files` (skill_utils.py:776) only prunes them when the
+# directory *currently being walked* has its own `SKILL.md`
+# (`has_skill_md and d in SKILL_SUPPORT_DIRS`). A TOP-LEVEL skill legitimately
+# named `scripts/` (or `references/`, etc. — an unusual but valid skill name,
+# same as any other word) is one Hermes loads and the previous unconditional
+# version of this scanner could never list — the exact class of bug the
+# transparency page (G21) exists to catch, not merely a cosmetic mismatch.
+_SKILL_SUPPORT_DIR_NAMES = frozenset({"references", "templates", "assets", "scripts"})
 
 
 def _iter_skill_md_files(root: Path):
@@ -115,13 +153,28 @@ def _iter_skill_md_files(root: Path):
     *results*, after rglob had already descended into every `node_modules`/
     `.venv`/`__pycache__` it found), which is the exact noise this exclusion
     list exists to avoid. Pruning `dirnames` during the walk means an
-    excluded directory is never opened at all."""
+    excluded directory is never opened at all.
+
+    评审第 3 轮 #2/#5: `followlinks=True` (was `False`, the `os.walk` default)
+    to match Hermes's own `iter_skill_index_files` (skill_utils.py:770) — a
+    skill directory reached via a symlink (a common way to reuse an existing
+    skill checkout without duplicating it) is one Hermes loads at runtime;
+    this scanner must not silently omit it from the transparency page. Same
+    section: `_SKILL_SUPPORT_DIR_NAMES` is pruned only when the CURRENT
+    directory has its own `SKILL.md`, matching Hermes's conditional pruning
+    instead of the previous unconditional-at-any-depth behavior — see that
+    set's own comment."""
     if not root.is_dir():
         return
     hits: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in _EXCLUDED_DIR_NAMES)
-        if "SKILL.md" in filenames:
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        has_skill_md = "SKILL.md" in filenames
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _EXCLUDED_DIR_NAMES
+            and not (has_skill_md and d in _SKILL_SUPPORT_DIR_NAMES)
+        )
+        if has_skill_md:
             hits.append(Path(dirpath) / "SKILL.md")
     yield from sorted(hits)
 
@@ -177,7 +230,18 @@ def _scan_tier(root: Path, tier: str) -> list[SkillEntry]:
     for skill_md in _iter_skill_md_files(root):
         try:
             text = skill_md.read_text(encoding="utf-8")
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # 评审第 3 轮 #4: `ValueError` alongside `OSError` — a non-UTF-8
+            # `SKILL.md` raises `UnicodeDecodeError` (a `ValueError` subclass,
+            # not an `OSError`), which the previous `except OSError` did not
+            # catch: it propagated out of `_scan_tier` → `list_skills()` →
+            # the `skill.list` RPC handler as an uncaught INTERNAL_ERROR,
+            # taking down the ENTIRE listing (every other, well-formed skill
+            # included) instead of surfacing just this one entry as invalid.
+            # 03-w4-interfaces.md §6 ("Skill 格式错 → 列出并标 invalid，不
+            # 静默跳过") and this function's own docstring promise apply to
+            # any unreadable `SKILL.md`, encoding errors included, not only
+            # `OSError`.
             entries.append(SkillEntry(
                 name=skill_md.parent.name, description="", tier=tier,
                 source_path=str(skill_md), valid=False, error=f"读取失败：{exc}",
@@ -244,23 +308,62 @@ def list_skills(*, project_path: str | None) -> list[dict[str, Any]]:
     return result
 
 
-def worker_skill_dirs(ctx: Any, session: dict[str, Any]) -> list[Path]:
+@dataclass(frozen=True)
+class WorkerSkillDirs:
+    """**评审第 3 轮 #8**: `project`/`trusted` split out instead of one flat
+    list — `worker_skill_dirs()` used to return project-tier-then-user-then-
+    builtin as a single `list[Path]`, which made including the project tier
+    in `skills.external_dirs` an invisible side effect of `for d in
+    worker_skill_dirs(...): ...` rather than a conscious choice. The project
+    tier is Jones's own least-trusted Skill source (it comes from whatever
+    `.jones/skills/` a cloned repo happens to contain — see `service.py`'s
+    module docstring, "评审第 1 轮 #5"): a caller must now name `.project`
+    explicitly to include it.
+
+    This split does NOT itself decide whether the project tier should be
+    on by default — that's still an open product/security decision for H's
+    `_prepare_hermes_home` integration and the controller (see this PR's
+    report: 项目级 Skill 目前无信任门，对等于 N15 对第三方 MCP 工具"默认不
+    启用"的要求）。`worker_skill_dirs()` still has zero callers as of this
+    branch, so this is the cheap moment to make that choice a deliberate
+    line of code at the call site rather than a silent default baked into
+    this function — not a claim that the policy question itself is settled.
+    """
+
+    project: Path | None
+    trusted: list[Path]
+
+    def all_dirs(self) -> list[Path]:
+        """Old flat-list behavior (project first, then `trusted`) for a
+        caller/test that explicitly wants "everything, no opinion on trust" —
+        NOT what H should reach for without thinking about it (see class
+        docstring)."""
+        return ([self.project] if self.project is not None else []) + list(self.trusted)
+
+
+def worker_skill_dirs(ctx: Any, session: dict[str, Any]) -> WorkerSkillDirs:
     """The Skill search roots H's `_prepare_hermes_home` should write as this
     worker's `skills.external_dirs` (see module docstring for why that's the
-    chosen integration point, not a symlink into `<HERMES_HOME>/skills`).
+    chosen integration point, not a symlink into `<HERMES_HOME>/skills`) —
+    split into `.project` (the project tier, or `None`) and `.trusted` (user
+    then builtin, in precedence order) so including the project tier is a
+    conscious choice at the call site (see `WorkerSkillDirs`'s docstring,
+    评审第 3 轮 #8).
 
-    Order = precedence (Hermes scans `external_dirs` in list order,
+    Precedence within `.trusted` (Hermes scans `external_dirs` in list order,
     first-wins by name, per `tools/skills_tool.py::_find_all_skills` —
-    verified against the installed checkout): project dir first (most
-    specific), then the user dir, then the builtin dir. Only directories that
-    actually exist are returned — checked with `is_dir()` for every tier
-    (not relied on as a side effect of `mkdir`-on-access: the project tier is
-    resolved with `create=False`, same read-only contract as `list_skills()`,
-    so a deleted/unmounted project directory is genuinely absent here, not
-    silently recreated — 评审第 1 轮 #2). An empty/missing builtin tier in W4
-    is normal, not an error (see `BUNDLED_SKILLS_DIR`'s comment); the default
-    Project's project dir is deduplicated against the user dir since they're
-    literally the same path (see `list_skills()`'s matching comment).
+    verified against the installed checkout): user dir before builtin dir.
+    `.project`, if a caller chooses to prepend it, is more specific than
+    either. Only directories that actually exist are returned — checked with
+    `is_dir()` for every tier (not relied on as a side effect of `mkdir`-on-
+    access: the project tier is resolved with `create=False`, same read-only
+    contract as `list_skills()`, so a deleted/unmounted project directory is
+    genuinely absent here, not silently recreated — 评审第 1 轮 #2). An
+    empty/missing builtin tier in W4 is normal, not an error (see
+    `BUNDLED_SKILLS_DIR`'s comment); when the default Project's directory is
+    literally the user skills dir (see `list_skills()`'s matching comment),
+    `.project` comes back `None` and the shared directory surfaces once, via
+    `.trusted`, not twice.
 
     Must be called on the DB thread (`store.run_in_db_thread`) — same
     constraint as `permissions/gate_config.py::build()`, which this function's
@@ -279,24 +382,28 @@ def worker_skill_dirs(ctx: Any, session: dict[str, Any]) -> list[Path]:
     if project_id:
         project_path = ProjectService(ctx.db).get(project_id)["path"]
 
-    candidates: list[Path] = []
+    project_dir: Path | None = None
     if project_path is not None:
-        project_dir = paths.project_skills_dir(project_path, create=False)
-        if project_dir.is_dir():
-            candidates.append(project_dir)
+        candidate = paths.project_skills_dir(project_path, create=False)
+        if candidate.is_dir():
+            project_dir = candidate
+
     # skills_dir() always ensures ~/.jones/skills exists (same as every other
     # user-level accessor in paths.py) — it is not a project path a user can
     # delete/unmount out from under this scan, so no create=False here.
-    candidates.append(paths.skills_dir())
+    trusted_candidates: list[Path] = [paths.skills_dir()]
     if BUNDLED_SKILLS_DIR.is_dir():
-        candidates.append(BUNDLED_SKILLS_DIR)
+        trusted_candidates.append(BUNDLED_SKILLS_DIR)
 
     seen: set[Path] = set()
-    ordered: list[Path] = []
-    for d in candidates:
+    if project_dir is not None:
+        seen.add(project_dir.resolve())
+    trusted: list[Path] = []
+    for d in trusted_candidates:
         resolved = d.resolve()
         if resolved in seen:
             continue
         seen.add(resolved)
-        ordered.append(d)
-    return ordered
+        trusted.append(d)
+
+    return WorkerSkillDirs(project=project_dir, trusted=trusted)
