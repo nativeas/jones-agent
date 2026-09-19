@@ -85,6 +85,17 @@ def _write_provider_key(
     `PROVIDER_ERROR` instead of a bare `INTERNAL_ERROR`; with `force=True`, the caller has already
     been told this discards the old vault, so `vault.reset()` bypasses the read that just failed
     and starts a fresh one containing only `vendor`'s key.
+
+    Round 2 review: the destructive "clear every other provider's `has_key`" UPDATE used to run
+    *before* `vault.reset()`, on this module's long-lived shared connection. If `reset()` itself
+    then raised (the data key being unavailable — not just unreadable ciphertext — fails it the
+    same way `vault.set()` just failed), that UPDATE was left sitting in an implicitly-open
+    transaction (`store/db.py::connect()` uses sqlite3's default isolation, so the first DML opens
+    one) with no rollback anywhere in this call stack, and got silently committed by the *next*,
+    completely unrelated `_write_provider_key`/`_clear_provider_key` call's `conn.commit()`. The
+    fix is ordering: only touch `providers` once `reset()` has actually succeeded, and if it still
+    fails, roll back before reporting — there is nothing to roll back to since we haven't written
+    anything, but a future DML added to this branch must not inherit an open transaction either.
     """
     try:
         vault.set(vendor, key)
@@ -98,14 +109,26 @@ def _write_provider_key(
                 "need to be re-entered",
                 {"vendor": vendor, "vault_unreadable": True},
             ) from exc
-        # The fresh vault holds only `vendor`'s key now — every other provider's `has_key` must
-        # drop to 0 too, or `providers` would keep claiming keys exist that no longer do anywhere
-        # (exactly the "db/vault out of sync" state resolver.py refuses to guess through).
+        try:
+            vault.reset({vendor: key})
+        except VaultError as reset_exc:
+            conn.rollback()
+            raise RpcError(
+                PROVIDER_ERROR,
+                f"the credential vault could not be rewritten even with force=true ({reset_exc}); "
+                "its data encryption key itself is unavailable (e.g. the OS keychain backend "
+                "cannot be reached), which force cannot recover from — no provider keys were "
+                "changed",
+                {"vendor": vendor, "vault_unreadable": True},
+            ) from reset_exc
+        # Only now that the fresh vault (holding only `vendor`'s key) is actually on disk does
+        # `providers` get to agree with it — every other provider's `has_key` must drop to 0, or
+        # `providers` would keep claiming keys exist that no longer do anywhere (exactly the
+        # "db/vault out of sync" state resolver.py refuses to guess through).
         conn.execute(
             "UPDATE providers SET has_key = 0, key_hint = NULL, updated_at = ? WHERE name != ?",
             (_now_iso(), vendor),
         )
-        vault.reset({vendor: key})
     hint = _key_hint(key)
     now = _now_iso()
     existing = conn.execute("SELECT id FROM providers WHERE name = ?", (vendor,)).fetchone()

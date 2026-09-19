@@ -13,9 +13,10 @@ import pytest
 
 from jones_daemon.logging import JsonLinesFormatter
 from jones_daemon.providers.catalog import VENDORS
-from jones_daemon.providers.methods import register
-from jones_daemon.rpc.errors import INVALID_PARAMS, NOT_FOUND, PROVIDER_ERROR
+from jones_daemon.providers.methods import _clear_provider_key, _write_provider_key, register
+from jones_daemon.rpc.errors import INVALID_PARAMS, NOT_FOUND, PROVIDER_ERROR, RpcError
 from jones_daemon.rpc.server import RpcServer
+from jones_daemon.secrets.vault import Vault, VaultError
 from jones_daemon.store.db import connect, run_in_db_thread
 from jones_daemon.store.migrator import apply_pending
 
@@ -211,6 +212,77 @@ async def test_delete_key_on_unreadable_vault_returns_provider_error_not_interna
     list_response = await _call(server.socket_path, "provider.list")
     row = next(r for r in list_response["result"] if r["provider"] == "anthropic")
     assert row["has_key"] is False
+
+
+# --- round 2 review: force=True must not leave a dangling transaction on the shared connection -
+# --- when vault.reset() itself fails too (not just the vault.set() that triggered force) -------
+
+
+class _ResetAlsoFailsVault(Vault):
+    """Stands in for the other of the two ways `vault.set()` raises `VaultError` (per
+    `secrets/vault.py`): not a merely-unreadable ciphertext (`_read_entries()` failing, which
+    `reset()` bypasses and recovers from — covered by the round 1 tests above), but the data key
+    itself being unavailable (e.g. the Keychain backend can't be reached at all). Both `set()` and
+    `reset()` go through `_key()` -> `_resolve_data_key()`, so both fail the same way — `force`
+    cannot save this case, and round 2's bug was that trying anyway left the shared connection
+    holding an uncommitted, unrelated-looking destructive UPDATE."""
+
+    def set(self, name, value):
+        raise VaultError("simulated: vault data key unavailable")
+
+    def reset(self, entries):
+        raise VaultError("simulated: vault data key unavailable")
+
+
+class _NoOpDeleteVault(Vault):
+    """A vault whose `delete()` always succeeds trivially — stands in for `_clear_provider_key`'s
+    own vault argument in the "later, unrelated call" half of the round 2 repro below; what that
+    call does to the vault is irrelevant, only its `conn.commit()` matters."""
+
+    def delete(self, name):
+        return False
+
+
+async def test_write_provider_key_force_rolls_back_when_reset_also_fails(conn):
+    # Seed two providers as already configured, exactly like a real vault holding real keys would
+    # leave `providers` before a doomed force-reset attempt on a third.
+    def _seed(c):
+        now = "2024-01-01T00:00:00Z"
+        for vendor in ("anthropic", "deepseek"):
+            c.execute(
+                "INSERT INTO providers (id, name, has_key, key_hint, default_model, "
+                "created_at, updated_at) VALUES (?, ?, 1, 'abcd', 'x', ?, ?)",
+                (f"provider_{vendor}", vendor, now, now),
+            )
+        c.commit()
+
+    await run_in_db_thread(_seed, conn)
+
+    with pytest.raises(RpcError) as excinfo:
+        await run_in_db_thread(
+            _write_provider_key,
+            conn,
+            _ResetAlsoFailsVault(Path("/unused")),
+            "openai",
+            "sk-openai-doesnotmatter",
+            force=True,
+        )
+    assert excinfo.value.code == PROVIDER_ERROR
+
+    def _rows(c):
+        return {r["name"]: r["has_key"] for r in c.execute("SELECT name, has_key FROM providers")}
+
+    # The bug itself: the destructive "clear every other provider" UPDATE must not be left
+    # sitting in an implicitly-open transaction on this shared, long-lived connection.
+    assert (await run_in_db_thread(lambda c: c.in_transaction, conn)) is False
+    # Nothing was even partially applied by the failed force attempt.
+    assert (await run_in_db_thread(_rows, conn)) == {"anthropic": 1, "deepseek": 1}
+
+    # The bug's actual symptom, reproduced exactly: a later, completely unrelated write on this
+    # same shared connection commits — before the fix, this is the call that silently persisted
+    # the dangling UPDATE from above and wiped out anthropic's `has_key` too.
+    await run_in_db_thread(_clear_provider_key, conn, _NoOpDeleteVault(Path("/unused")), "deepseek")
+    assert (await run_in_db_thread(_rows, conn)) == {"anthropic": 1, "deepseek": 0}
 
 
 async def test_model_list_for_known_provider(server):
