@@ -306,11 +306,38 @@ class AcpClient:
     async def new_session(
         self, cwd: str, mcp_servers: list[dict[str, Any]] | None = None
     ) -> dict[str, Any]:
-        return await self._call(
+        result = await self._call(
             _METHOD_SESSION_NEW,
             {"cwd": cwd, "mcpServers": mcp_servers or []},
             timeout=_HANDSHAKE_TIMEOUT_S,
         )
+        # Startup self-check (round-1 review finding #6, 2026-09-19; see
+        # docs/design/02-w3-interfaces.md §1.2 for the full writeup). Hermes's
+        # OWN `acp_adapter/edit_approval.py` auto-approves `write_file`/
+        # `patch` without ever sending `session/request_permission` whenever
+        # the ACP session mode isn't `"default"` (`accept_edits`/`dont_ask`
+        # -> `should_auto_approve_edit` returns `True` before this plugin's
+        # user/review gates ever see the call) — verified against the
+        # installed `hermes-agent` checkout. Nothing in this codebase ever
+        # calls `session/set_mode`, so this is a self-check against a
+        # regression (a stale worker, a future code path, a differently-
+        # configured Hermes build), not a currently reachable bypass — but
+        # DEV.md 工程原则 #4/00-foundation.md §8.1's bar for this class of
+        # thing is "显式关掉 + 启动自检证明", not "we don't call the API that
+        # would change it". `modes` absent from the response (the test
+        # fixture, or a Hermes build predating mode support) is NOT a
+        # violation — only an explicit non-`"default"` value is.
+        modes = result.get("modes")
+        if isinstance(modes, dict):
+            current_mode = modes.get("currentModeId")
+            if current_mode is not None and current_mode != "default":
+                raise AcpProtocolError(
+                    f"worker's ACP session mode is {current_mode!r}, not 'default' — "
+                    "refusing to use it: edit_approval.py auto-approves write_file/patch "
+                    "under this mode without ever asking the daemon "
+                    "(docs/design/02-w3-interfaces.md §1.2, review finding #6)"
+                )
+        return result
 
     async def prompt(
         self, session_id: str, text: str, *, message_id: str | None = None
