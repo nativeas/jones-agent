@@ -68,6 +68,7 @@
 ### 4.2 没做什么（契约要求但本分支未接线）
 
 - **11.2 的 Step 数 / 时长上限触发预算终止**：需要在 `_run_turn`/`_handle_tool_call_start` 里主动数 Step、算耗时并在触顶时调用 `_terminate_run(kind="budget", ...)`——这两个函数是 A/#10 的专属函数，04-w5-interfaces.md §1 没有把它们开放给 N；本分支只让 `_terminate_run` 在**收到** `kind="budget"` 时能正确出卡，没有新增任何调用点去触发它。同理 token 预算（Goal 层面）依赖 FR17（P1，未实现）。
+- **「换模型」（`retry(model_override=...)`）端到端不接线，不只是"没优化"**：`_run_turn` 读出 `self._turn_model_override.pop(turn_id, None)` 后，唯一用途是 `ctx.providers.resolve(model_pref)` 这个**预检**（校验 provider/model 是否可解析）——预检通过之后，真正 spawn worker 用的是 `workers/manager.py::_spawn_and_check` 调 `_worker_env(hermes_home)`（不带 `extra_env` 参数，该文件自己的 docstring 也写明 `extra_env` 留给"B/#7 落地后"），也就是说 worker 子进程实际使用的 provider/model 绑定从未换成用户选的那个，跑的还是 Agent 原本的 `model_pref`。round-1 评审指出：这意味着 `provider_auth`/`provider_quota`/`budget` 三类卡片唯一给出的操作（`switch_model`，故意不给裸"重试"）在 daemon 这一层验证会"成功"（`resolve()` 认可新 provider），但实际跑的模型没变，原因不消失，大概率再失败一次——这不是"接线不完善"的优化项，是这三类卡片当前唯一可用操作的实际效果与其承诺不符，须在契约与报告中显式记为已知限制（而不是当作"换模型已生效"展示）；把 `ProviderBinding`（env/hermes_config）真正接进 worker 的 spawn 路径不在 N/#22 的授权目录内（属于 A/#10），本分支不越权处理。
 - 见报告"没做什么及原因"获取完整清单（含已知的极窄双终止竞态、`_turn_model_override` 的有界内存泄漏等）。
 
 ## 5. O：存储收口（第 10 节）

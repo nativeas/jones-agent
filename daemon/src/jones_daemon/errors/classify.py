@@ -201,10 +201,24 @@ def _mask(value: str) -> str:
 _RE_SK_PREFIX = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 # AWS-style access key ids (used by some S3-compatible/media-gen backends).
 _RE_AKIA = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
+# Round-1 review fix (#2): Google AI Studio / Gemini keys (`AIzaSy...`) — a
+# formally-supported vendor (`providers/catalog.py`) whose HTTP error text
+# habitually echoes back the *whole request URL* including `?key=...`. Matched
+# both standalone (this pattern) and via the broadened `_RE_LABELED` below
+# (`key=AIza...`) as defense in depth.
+_RE_GEMINI = re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b")
 # `key=...` / `token=...` / `secret=...` / `Authorization: Bearer ...` style —
-# keeps the label, masks only the value.
+# keeps the label, masks only the value. Round-1 review fix (#2): the label
+# alternation used to require a "key"/"token" *compound* word
+# (`api_key`/`access_token`) and missed the bare `key=`/`token=` shape a lot of
+# real provider error text actually uses (e.g. Gemini's `?key=...` query
+# param, a bare `token=ghp_...` in a generic exception message) — despite the
+# module docstring and 04-w5-interfaces.md §4.1 both claiming that shape was
+# covered. `\bkey\b`/`\btoken\b` require a word boundary on both sides, so
+# this still can't match inside `keyboard`/`tokenizer` (no boundary exists
+# between two word characters).
 _RE_LABELED = re.compile(
-    r"(?i)\b(api[_-]?key|access[_-]?token|secret|authorization|bearer)\b"
+    r"(?i)\b(api[_-]?key|access[_-]?token|secret|authorization|bearer|key|token)\b"
     r"([\s:=\"']{1,5})([A-Za-z0-9_\-./+=]{12,})"
 )
 # `SOME_API_KEY=value` / `SOME_TOKEN=value` env-var-style assignments (matches
@@ -220,6 +234,7 @@ def redact_secrets(text: str) -> str:
         return text
     out = _RE_SK_PREFIX.sub(lambda m: _mask(m.group(0)), text)
     out = _RE_AKIA.sub(lambda m: _mask(m.group(0)), out)
+    out = _RE_GEMINI.sub(lambda m: _mask(m.group(0)), out)
     out = _RE_LABELED.sub(lambda m: f"{m.group(1)}{m.group(2)}{_mask(m.group(3))}", out)
     out = _RE_ENV_ASSIGNMENT.sub(lambda m: f"{m.group(1)}={_mask(m.group(2))}", out)
     return out
@@ -264,14 +279,18 @@ _AUTH_MARKERS = (
     "no key configured",
     "unknown provider",
 )
-_QUOTA_MARKERS = (
-    "429",
-    "rate limit",
-    "rate_limit",
-    "quota",
-    "insufficient_quota",
-    "too many requests",
-)
+# Round-1 review fix (#4): these used to be one undifferentiated tuple, so a
+# transient 429/rate-limit (wait a few seconds, retry — the standard recovery)
+# and a genuinely exhausted quota (retrying changes nothing) both produced the
+# same "额度已用尽" title with `retry` stripped from `actions` — untrue for the
+# rate-limit case, and in conflict with PRD 12.3 FR14's "重试 / 换模型 / 放弃三个
+# 可用操作". Both still classify to the same `ErrorKind.PROVIDER_QUOTA` (PRD 9.3
+# groups "远端 API Key 额度受限/被限流" together under 预算终止 — that part of the
+# original classification was correct), but `build_card()` below uses these two
+# separately to pick title/actions once it has the specific `reason` text.
+_RATE_LIMIT_MARKERS = ("429", "rate limit", "rate_limit", "too many requests")
+_QUOTA_EXHAUSTED_MARKERS = ("quota", "insufficient_quota")
+_QUOTA_MARKERS = _RATE_LIMIT_MARKERS + _QUOTA_EXHAUSTED_MARKERS
 
 
 def _match_any(haystack: str, markers: tuple[str, ...]) -> bool:
@@ -353,10 +372,26 @@ def build_user_card(reason: str) -> ErrorCard:
 
 def build_card(kind: ErrorKind, *, reason: str, step_seq: int | None) -> ErrorCard:
     redacted = redact_secrets(reason)
+    title = _TITLES[kind]
     actions = _actions_for(kind)
+    # Round-1 review fix (#4): a rate-limited (429/"too many requests") Run
+    # isn't "额度已用尽" and, unlike a truly exhausted quota, retrying it after a
+    # short wait is the textbook recovery — so give it back `retry` and an
+    # honest title. Only when the text names an actual limit hit and *not* an
+    # explicit quota-exhaustion word (`_QUOTA_EXHAUSTED_MARKERS`) — "429 ...
+    # insufficient_quota" (both present) still means "确实用尽了", and keeps the
+    # conservative no-retry treatment.
+    lowered = reason.lower()
+    if (
+        kind is ErrorKind.PROVIDER_QUOTA
+        and _match_any(lowered, _RATE_LIMIT_MARKERS)
+        and not _match_any(lowered, _QUOTA_EXHAUSTED_MARKERS)
+    ):
+        title = "请求过于频繁，请稍后再试"
+        actions = ("retry", "switch_model", "abandon")
     return ErrorCard(
         kind=kind.value,
-        title=_TITLES[kind],
+        title=title,
         message=_truncate(redacted, _MAX_MESSAGE_CHARS),
         step_seq=step_seq,
         raw_excerpt=_truncate(redacted, _MAX_EXCERPT_CHARS),

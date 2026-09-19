@@ -228,3 +228,68 @@ def test_build_card_raw_excerpt_is_bounded_and_redacted():
     card = classify.build_card(ErrorKind.PROVIDER_ERROR, reason=long_reason, step_seq=None)
     assert len(card.raw_excerpt) <= 2048
     assert "sk-ant-api03-" + ("A" * 40) not in card.raw_excerpt
+
+
+# -- Round-1 review fixes -------------------------------------------------------
+
+
+def test_redact_secrets_masks_gemini_key_in_echoed_request_url():
+    # Review #2, reproduced verbatim: Gemini's HTTP error text habitually
+    # echoes the whole request URL back, `?key=...` included.
+    text = (
+        "ACP prompt failed: 403 from "
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-3-pro:generateContent?key=AIzaSyB1234567890abcdefghijklmnopqrstu"
+    )
+    out = classify.redact_secrets(text)
+    assert "AIzaSyB1234567890abcdefghijklmnopqrstu" not in out
+    assert "***rstu" in out
+
+
+def test_redact_secrets_masks_bare_key_and_token_assignments():
+    # Review #2, reproduced verbatim: `_RE_LABELED` used to require a compound
+    # word (api_key/access_token) and missed the bare `key=`/`token=` shape the
+    # module docstring and 04-w5-interfaces.md §4.1 both claim is covered.
+    out = classify.redact_secrets(
+        "unexpected error: token=ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    )
+    assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in out
+    assert "token=" in out
+
+
+def test_redact_secrets_bare_key_token_does_not_mangle_keyboard_or_tokenizer():
+    text = "keyboard layout mismatch while loading the tokenizer config"
+    assert classify.redact_secrets(text) == text
+
+
+def test_rate_limit_without_quota_wording_gets_an_honest_title_and_retry():
+    # Review #4: a transient 429 is not "额度已用尽", and unlike a truly
+    # exhausted quota, waiting and retrying is the standard recovery — FR14
+    # promises "重试 / 换模型 / 放弃三个可用操作".
+    card = classify.build_card(
+        ErrorKind.PROVIDER_QUOTA, reason="ACP prompt failed: 429 Too Many Requests", step_seq=None
+    )
+    assert "retry" in card.actions
+    assert card.retryable is True
+    assert card.title != "额度已用尽"
+
+
+def test_rate_limit_with_explicit_quota_wording_stays_conservative():
+    # "429 ... insufficient_quota" together still means the quota is actually
+    # exhausted, not just rate-limited — keep the no-retry treatment.
+    card = classify.build_card(
+        ErrorKind.PROVIDER_QUOTA,
+        reason="ACP prompt failed: 429 insufficient_quota",
+        step_seq=None,
+    )
+    assert "retry" not in card.actions
+    assert card.retryable is False
+
+
+def test_plain_quota_exhaustion_still_has_no_retry_and_the_original_title():
+    card = classify.build_card(
+        ErrorKind.PROVIDER_QUOTA, reason="ACP prompt failed: insufficient_quota", step_seq=None
+    )
+    assert "retry" not in card.actions
+    assert card.retryable is False
+    assert card.title == "额度已用尽"

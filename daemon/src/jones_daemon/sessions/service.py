@@ -1421,11 +1421,23 @@ class SessionService:
                 last_step_status=last_step["status"] if last_step else None,
             )
             card = classify.build_card(error_kind, reason=reason, step_seq=step_seq)
-            # PRD 9.3 classifies "远端 API Key 额度受限/被限流" as a 预算终止, not
+            # PRD 9.3 classifies "远端 API Key 额度受限/被限流" as a 预算终止,不是
             # an 错误终止 — this can upgrade the outer `kind` from the caller's
             # own "error" to "budget" purely from the reason text, since no
             # existing call site has enough context to know that ahead of time.
             effective_kind = classify.terminated_kind_for(kind, error_kind)
+
+        # Round-1 review fix (#6): `card.message`/`card.raw_excerpt` above are
+        # built from a redacted copy of `reason`, but this function then used
+        # to pass the raw `reason` on to both `mark_run_terminated` (persisted
+        # verbatim into `runs.terminated_reason`, later included in
+        # `session.export`) and the `run.terminated` broadcast — a provider
+        # exception that echoes a full key back (exactly the case
+        # `redact_secrets` exists for, G03/N02) leaked it through both of
+        # those, unredacted, even though the card sitting right next to it in
+        # the same payload was clean. Redact once, reuse everywhere outside
+        # the card.
+        safe_reason = classify.redact_secrets(reason)
 
         await run_in_db_thread(
             queries.mark_run_terminated,
@@ -1433,7 +1445,7 @@ class SessionService:
             ctx_turn.run_id,
             ctx_turn.turn_id,
             kind=effective_kind,
-            reason=reason,
+            reason=safe_reason,
             terminated_step_seq=step_seq,
         )
         await self.ctx.server.broadcast(
@@ -1449,7 +1461,7 @@ class SessionService:
                 # this to call `session.retry` at all.
                 "turn_id": ctx_turn.turn_id,
                 "kind": effective_kind,
-                "reason": reason,
+                "reason": safe_reason,
                 "card": card.to_dict(),
             },
         )
@@ -2129,6 +2141,43 @@ class SessionService:
             await asyncio.sleep(_WORKER_CRASH_POLL_INTERVAL_S)
         if self._active_turns.get(session_id) is not ctx_turn:
             return
+        # Round-1 review fix (#3/#7): the deadline expiring only means "the
+        # in-flight `prompt()` call's own error path hasn't reached
+        # `_advance_queue`'s `self._active_turns.pop(session_id, ...)` yet" — it
+        # does *not* mean that path is still inside `prompt()` itself. It can
+        # just as well already be past `_terminate_run` (DB write done,
+        # `run.terminated` broadcast done or in flight) and sitting in
+        # `finally: await self._advance_queue(session_id)`, waiting on
+        # `self._lock(session_id)` or blocked on the `pop_next_queue_item` DB
+        # call — `_active_turns` isn't cleared until that function actually
+        # acquires the lock. Blindly `task.cancel()`-ing in that window used to
+        # be able to land the `CancelledError` *inside* `pop_next_queue_item`,
+        # after the queued item had already been popped off `queue_items` but
+        # before `_start_turn` ran — silently dropping a queued user message
+        # with no way to recover it, and separately (if the cancel instead
+        # landed mid-`_terminate_run`) could cut a Run off between its DB write
+        # and its broadcast, leaving the UI stuck on "运行中" forever (exactly
+        # what N07 exists to prevent) since `_terminate_run`'s idempotency
+        # guard would then treat *this* call as a no-op too.
+        #
+        # Reading `runs.status` right before deciding whether to cancel closes
+        # both: if the normal path already wrote 'terminated'/'completed', skip
+        # the cancel (and the redundant force-terminate below) entirely and let
+        # that path's own broadcast stand — and because this read and the
+        # `task.cancel()` call that follows it have no `await` between them,
+        # nothing else can run on this single-threaded event loop in between to
+        # invalidate what was just read (asyncio only ever switches tasks at an
+        # `await`), so there is no re-introduced race here, only the same
+        # already-covered narrow one `_terminate_run`'s own idempotency guard
+        # documents.
+        current_run = await run_in_db_thread(queries.get_run, self.ctx.db, ctx_turn.run_id)
+        if current_run is not None and current_run["status"] != "running":
+            logger.debug(
+                "N07 watchdog deadline reached but the Run was already "
+                "terminated by the in-flight prompt() call itself; not cancelling",
+                extra={"detail": {"session_id": session_id, "run_id": ctx_turn.run_id}},
+            )
+            return
         logger.warning(
             "worker crash not observed by the in-flight prompt() call within "
             f"{_WORKER_CRASH_GRACE_S}s; force-terminating the Run (N07)",
@@ -2145,6 +2194,17 @@ class SessionService:
             # much narrower race against the in-flight prompt() call's error
             # path finishing at almost the same instant this deadline expires).
             task.cancel()
+        # Round-1 review fix (#7): every other termination path (`_run_turn`'s
+        # own `except (AcpError, AcpProtocolError)` and its catch-all backstop)
+        # calls this before `_terminate_run` — streamed `message.delta` text
+        # only lives on `ctx_turn` until finalized, so skipping it here (as
+        # this watchdog path used to) meant a Run force-terminated by N07 could
+        # drop assistant text the user had already watched stream past,
+        # forever, from the `messages` table (FR06 replay). Cancelling
+        # `_run_turn`'s task raises `CancelledError` in it — a `BaseException`,
+        # not caught by that function's `except Exception` — so it could never
+        # reach its own finalize call either; this watchdog has to do it.
+        await self._finalize_streamed_messages(ctx_turn)
         await self._terminate_run(
             ctx_turn,
             kind="error",

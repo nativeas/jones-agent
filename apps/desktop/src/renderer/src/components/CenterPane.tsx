@@ -39,9 +39,23 @@ export function CenterPane({ transport }: CenterPaneProps): JSX.Element {
   // provider/model list — only providers with a configured Key are offered
   // (picking one without a Key would just fail `session.retry` the same way
   // the original Turn did).
+  // Round-1 review fix: the old selector was `(s) => s.providers.filter(...)`
+  // — zustand v5's `useStore` feeds the selector result straight into
+  // `useSyncExternalStore` with no memoization (v4's
+  // `useSyncExternalStoreWithSelector` cache is gone in v5), so a `.filter()`
+  // inside the selector returns a new array on every call. React's
+  // `checkIfSnapshotChanged` then sees a changed snapshot on every render,
+  // forever — `Maximum update depth exceeded` on mount, empty `providers` or
+  // not. Select the stable `providers` reference and filter in the component
+  // body instead.
   const settingsInit = useSettingsStore((s) => s.init)
-  const configuredProviders = useSettingsStore((s) => s.providers.filter((p) => p.has_key))
+  const providers = useSettingsStore((s) => s.providers)
   const models = useSettingsStore((s) => s.models)
+  // Issue #22 (04-w5-interfaces.md §4): the "换模型" card action needs a real
+  // provider/model list — only providers with a configured Key are offered
+  // (picking one without a Key would just fail `session.retry` the same way
+  // the original Turn did).
+  const configuredProviders = providers.filter((p) => p.has_key)
 
   useEffect(() => {
     void settingsInit(transport)

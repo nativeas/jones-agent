@@ -15,6 +15,7 @@ with `fake_acp_agent.py`'s `TOOL_EXCEPTION` prompt marker and a real
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -177,6 +178,41 @@ async def test_g08_key_invalid_fault_produces_a_provider_auth_card(tmp_path, mon
         await service.shutdown()
 
 
+async def test_terminate_run_redacts_the_reason_persisted_and_broadcast_too(
+    tmp_path, monkeypatch
+):
+    """Round-1 review fix (#6): `card.message`/`card.raw_excerpt` were already
+    built from a redacted copy of `reason`, but `_terminate_run` used to pass
+    the *raw* `reason` on to both `mark_run_terminated` (persisted verbatim
+    into `runs.terminated_reason`, later included whole in `session.export`)
+    and the `run.terminated` broadcast's own `reason` field — leaking a real
+    key sitting right next to the (correctly redacted) card in the very same
+    payload."""
+    resolver = _RaisingProviderResolver(
+        "401 Unauthorized: key=sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    )
+    service = await _make_service(tmp_path, monkeypatch, providers=resolver)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "hello")
+        await _wait_until(lambda: len(_terminated(service)) >= 1)
+
+        event = _terminated(service)[0]
+        assert "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" not in event["reason"]
+        assert "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" not in event["card"]["message"]
+
+        run_row = await run_in_db_thread(
+            service_module.queries.get_run, service.ctx.db, event["run_id"]
+        )
+        assert (
+            "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            not in run_row["terminated_reason"]
+        )
+    finally:
+        await service.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # G08 fault injection #3: 工具抛异常 (ACP tool_call returns an error)
 # ---------------------------------------------------------------------------
@@ -310,6 +346,161 @@ async def test_worker_crash_watchdog_backs_off_when_the_prompt_call_already_repo
 
         assert _terminated(service) == []
     finally:
+        await service.shutdown()
+
+
+async def test_worker_crash_watchdog_does_not_cancel_a_turn_already_terminated_in_the_db(
+    tmp_path, monkeypatch
+):
+    """Round-1 review fix (#3/#7): the narrower half of the same race as the
+    test above, that one didn't cover — `_active_turns[session_id]` can still
+    be *this exact* `ctx_turn` at the grace deadline even though the in-flight
+    `prompt()` path already ran `_terminate_run` to completion (DB write done)
+    and is now inside `finally: await self._advance_queue(...)`, not yet past
+    the `self._lock(session_id)` that would pop `_active_turns`. Manufactured
+    here by writing `runs.status='terminated'` directly (standing in for "the
+    normal path's `_terminate_run` already committed it") while leaving
+    `_active_turns`/`_turn_tasks` exactly as `_on_worker_crash` would find them
+    mid-race. Before the fix, the watchdog would `task.cancel()` the stuck
+    task unconditionally here — if that task were actually still inside
+    `_advance_queue`, the cancel could land between `pop_next_queue_item` and
+    `_start_turn`, dropping a queued item with no way to recover it."""
+    monkeypatch.setattr(service_module, "_WORKER_CRASH_GRACE_S", 0.2)
+    monkeypatch.setattr(service_module, "_WORKER_CRASH_POLL_INTERVAL_S", 0.02)
+    service = await _make_service(tmp_path, monkeypatch)
+    try:
+        session_id = await _new_session(service, title="s1")
+        run_id = "run_race01"
+        turn_id = "turn_race01"
+        await run_in_db_thread(
+            service_module.queries.create_turn_and_user_message,
+            service.ctx.db,
+            turn_id=turn_id,
+            message_id="msg_race01",
+            session_id=session_id,
+            text="hello",
+            queued=False,
+        )
+        await run_in_db_thread(
+            service_module.queries.create_run,
+            service.ctx.db,
+            run_id=run_id,
+            turn_id=turn_id,
+            session_id=session_id,
+        )
+        # Stand-in for "the in-flight prompt() path's own _terminate_run
+        # already wrote this" — `_active_turns` is deliberately left
+        # populated, matching the real race window.
+        await run_in_db_thread(
+            service_module.queries.mark_run_terminated,
+            service.ctx.db,
+            run_id,
+            turn_id,
+            kind="error",
+            reason="ACP prompt failed: connection closed",
+            terminated_step_seq=None,
+        )
+        ctx_turn = service_module._TurnContext(
+            turn_id=turn_id, run_id=run_id, session_id=session_id
+        )
+        service._active_turns[session_id] = ctx_turn
+
+        hung = asyncio.get_running_loop().create_future()
+        stuck_task = asyncio.create_task(asyncio.wait_for(hung, timeout=None))
+        service._turn_tasks[session_id] = stuck_task
+
+        await service._on_worker_crash(session_id, 137)
+
+        # The watchdog must back off entirely: no cancel (the queued-item-
+        # dropping window this reproduces), and no second `run.terminated`
+        # (that would be the "swallowed broadcast" half of review #7 — the
+        # in-flight path's own broadcast, not simulated by this direct DB
+        # write, is what's supposed to be the only one).
+        assert not stuck_task.cancelled()
+        assert not stuck_task.done()
+        assert _terminated(service) == []
+    finally:
+        hung.cancel()
+        stuck_task.cancel()
+        await service.shutdown()
+
+
+async def test_worker_crash_watchdog_finalizes_streamed_text_before_force_terminating(
+    tmp_path, monkeypatch
+):
+    """Round-1 review fix (#7): every other termination path finalizes
+    streamed `message.delta` text (`_finalize_streamed_messages`) before
+    `_terminate_run` — the watchdog's own force-termination path used to skip
+    straight to `_terminate_run`, so `CancelledError` on the stuck task (a
+    `BaseException`, never observed by `_run_turn`'s `except Exception`) meant
+    any assistant text the user had already watched stream past was silently
+    dropped from the `messages` table forever (FR06 replay)."""
+    monkeypatch.setattr(service_module, "_WORKER_CRASH_GRACE_S", 0.2)
+    monkeypatch.setattr(service_module, "_WORKER_CRASH_POLL_INTERVAL_S", 0.02)
+    service = await _make_service(tmp_path, monkeypatch)
+    try:
+        session_id = await _new_session(service, title="s1")
+        run_id = "run_stream01"
+        turn_id = "turn_stream01"
+        await run_in_db_thread(
+            service_module.queries.create_turn_and_user_message,
+            service.ctx.db,
+            turn_id=turn_id,
+            message_id="msg_stream01",
+            session_id=session_id,
+            text="hello",
+            queued=False,
+        )
+        await run_in_db_thread(
+            service_module.queries.create_run,
+            service.ctx.db,
+            run_id=run_id,
+            turn_id=turn_id,
+            session_id=session_id,
+        )
+        streamed_message_id = "msg_stream01_assistant"
+        await run_in_db_thread(
+            service_module.queries.insert_assistant_message,
+            service.ctx.db,
+            message_id=streamed_message_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            kind="text",
+        )
+        ctx_turn = service_module._TurnContext(
+            turn_id=turn_id,
+            run_id=run_id,
+            session_id=session_id,
+            assistant_message_id=streamed_message_id,
+            assistant_text="用户已经看到这段文字流过去了",
+        )
+        service._active_turns[session_id] = ctx_turn
+
+        hung = asyncio.get_running_loop().create_future()
+        stuck_task = asyncio.create_task(asyncio.wait_for(hung, timeout=None))
+        service._turn_tasks[session_id] = stuck_task
+
+        await service._on_worker_crash(session_id, 137)
+
+        assert len(_terminated(service)) == 1
+        completed = [p for _sid, m, p in service.ctx.server.broadcasts if m == "message.completed"]
+        assert any(p["id"] == streamed_message_id for p in completed)
+        row = await run_in_db_thread(
+            service_module.queries.get_session, service.ctx.db, session_id
+        )
+        assert row is not None  # sanity: DB still readable after the finalize write
+        persisted = await run_in_db_thread(
+            lambda conn: conn.execute(
+                "SELECT content_json FROM messages WHERE id = ?", (streamed_message_id,)
+            ).fetchone(),
+            service.ctx.db,
+        )
+        assert json.loads(persisted[0])["text"] == "用户已经看到这段文字流过去了"
+        # `_finalize_streamed_messages` resets this so a later, unrelated call
+        # can never re-finalize/re-broadcast the same message.
+        assert ctx_turn.assistant_message_id is None
+    finally:
+        hung.cancel()
         await service.shutdown()
 
 
