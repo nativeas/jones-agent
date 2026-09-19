@@ -85,19 +85,91 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
+# Review findings #7/#9 (2026-09-19): `_cwd_for_project` (sessions/service.py)
+# resolves the still-only-implemented DEFAULT_PROJECT_ID to `Path.home()` —
+# an 01-w2-interfaces.md-documented placeholder for real Project paths (C,
+# #8/#9), not a real workspace boundary. `_classify_write` below treats
+# "inside cwd" as `low` risk, so with that placeholder in place, EVERY path
+# under the user's entire home directory (`~/.ssh/authorized_keys`,
+# `~/.zshrc`, `~/Library/LaunchAgents/*.plist`, ...) was classified `low` in
+# auto mode, which `sessions/service.py::_on_request_permission` then
+# auto-allows with no `permission.requested` broadcast at all — the "工作区
+# 内写风险低" review-gate rule's premise ("workspace" is actually a bounded
+# project directory) silently false for the one Project that exists today.
+# Two independent, defense-in-depth fixes (both suggested by the review,
+# doing both is cheap and each covers a gap the other doesn't):
+_SENSITIVE_HOME_RELATIVE_PATHS = (
+    ".ssh", ".aws", ".gnupg",
+    ".zshrc", ".zshenv", ".zprofile", ".bashrc", ".bash_profile", ".bash_login", ".profile",
+    "Library/LaunchAgents", "Library/LaunchDaemons",
+    ".hermes", ".claude",
+)
+
+
+def _is_sensitive_home_path(resolved: Path) -> bool:
+    """A denylist that applies REGARDLESS of the workspace boundary below —
+    covers the case where a future real Project path legitimately contains
+    (or symlinks to) one of these, not just today's "workspace = home"
+    placeholder."""
+    try:
+        home = Path.home().resolve(strict=False)
+    except OSError:
+        return False
+    for rel in _SENSITIVE_HOME_RELATIVE_PATHS:
+        sensitive_root = home / rel
+        if resolved == sensitive_root or _is_relative_to(resolved, sensitive_root):
+            return True
+    return False
+
+
+def _workspace_root_too_wide(root: Path) -> bool:
+    """`True` when `root` (the resolved `cwd`) IS the user's home directory,
+    or is an ancestor of it — i.e. it's too broad to mean anything by "inside
+    the workspace". Covers today's actual placeholder value (`root == home`)
+    and the review's stated fallback ("home 的直接父级")."""
+    try:
+        home = Path.home().resolve(strict=False)
+    except OSError:
+        return False
+    return _is_relative_to(home, root)
+
+
 def _classify_write(path: Any, *, cwd: str | None) -> Risk:
     if not isinstance(path, str) or not path:
         return _medium("write-family tool call with no resolvable path")
+    try:
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            if cwd is None:
+                return _medium(
+                    f"path {path!r} not classified: this session's workspace root is unknown"
+                )
+            candidate = Path(cwd).expanduser() / candidate
+        resolved = candidate.resolve(strict=False)
+    except OSError:
+        return _high(f"could not resolve path {path!r} to classify it")
+
+    if _is_sensitive_home_path(resolved):
+        return _high(
+            f"path {path!r} resolves under a sensitive user-home location (~/.ssh, ~/.aws, "
+            "a shell rc file, ~/Library/LaunchAgents, ~/.hermes, ~/.claude, …) — never low "
+            "risk regardless of the workspace boundary (review finding #9)"
+        )
+
     if cwd is None:
         return _medium(f"path {path!r} not classified: this session's workspace root is unknown")
     try:
-        resolved = Path(path).expanduser()
-        if not resolved.is_absolute():
-            resolved = Path(cwd).expanduser() / resolved
-        resolved = resolved.resolve(strict=False)
         root = Path(cwd).expanduser().resolve(strict=False)
     except OSError:
-        return _high(f"could not resolve path {path!r} to classify it")
+        return _high(f"could not resolve workspace root {cwd!r} to classify {path!r}")
+
+    if _workspace_root_too_wide(root):
+        return _medium(
+            f"workspace root {cwd!r} is the user's home directory (or an ancestor of it) — "
+            "'inside the workspace' can't be treated as a low-risk boundary here (the "
+            "default Project's cwd is $HOME until real Project paths land, review "
+            "findings #7/#9)"
+        )
     if _is_relative_to(resolved, root):
         return _low(f"path {path!r} is inside the project workspace")
     return _high(f"path {path!r} escapes the project workspace ({cwd!r})")

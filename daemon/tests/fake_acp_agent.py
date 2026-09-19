@@ -54,6 +54,13 @@ Behavior is selected via the `FAKE_ACP_MODE` env var (default "normal"):
   capabilities `AcpClient.initialize()` declares unsupported) and writes the
   daemon's answer to stderr as one JSON line — exercises the daemon's honest
   "not supported" reply instead of a hang/crash (00-foundation.md §8.3).
+- "session_new_non_default_mode": pure addition, changes no existing
+  behavior (same pattern as "normal"'s `CUSTOM_PERMISSION_JSON` marker) —
+  `session/new`'s response carries `"modes": {"currentModeId":
+  "accept_edits"}`, simulating a worker whose ACP session mode isn't
+  `"default"` — exercises `AcpClient.new_session()`'s startup self-check
+  (Issue #11 round-1 review finding #6, docs/design/02-w3-interfaces.md
+  §1.2).
 """
 
 from __future__ import annotations
@@ -311,7 +318,10 @@ def _dispatch_loop() -> None:
                     continue  # never respond — exercises the daemon's handshake timeout
                 _respond(req_id, {"protocolVersion": 1, "agentCapabilities": {}})
             elif method == "session/new":
-                _respond(req_id, {"sessionId": "fake-session-1"})
+                result = {"sessionId": "fake-session-1"}
+                if MODE == "session_new_non_default_mode":
+                    result["modes"] = {"currentModeId": "accept_edits"}
+                _respond(req_id, result)
                 if MODE == "call_unsupported_method":
                     threading.Thread(target=_call_unsupported_method, daemon=True).start()
             elif method == "session/prompt":

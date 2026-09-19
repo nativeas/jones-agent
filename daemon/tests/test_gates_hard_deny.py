@@ -140,3 +140,64 @@ def test_command_not_touching_user_root_is_not_denied():
         "ls -la /tmp", user_root="~/.jones", project_permissions_path=None, cwd=None
     )
     assert not denied
+
+
+# Review finding #2 (2026-09-19): known shell-wrapper programs must be
+# unwrapped so the checks above see the real command being executed, not
+# just the wrapper invoking it.
+
+
+def test_bash_c_wrapped_rm_rf_is_denied():
+    verdict = _hard_deny.classify_command("bash -c 'rm -rf /Users/alice'")
+    assert verdict.denied
+
+
+def test_sh_c_wrapped_rm_rf_is_denied():
+    verdict = _hard_deny.classify_command('sh -c "rm -rf /Users/alice"')
+    assert verdict.denied
+
+
+def test_zsh_c_wrapped_rm_rf_is_denied():
+    verdict = _hard_deny.classify_command("zsh -c 'rm -rf /Users/alice'")
+    assert verdict.denied
+
+
+def test_nested_env_and_sh_c_wrapped_rm_rf_is_denied():
+    verdict = _hard_deny.classify_command("env FOO=1 sh -c 'rm -rf /Users/alice'")
+    assert verdict.denied
+
+
+def test_timeout_wrapped_rm_rf_is_denied():
+    verdict = _hard_deny.classify_command("timeout 10 rm -rf /Users/alice")
+    assert verdict.denied
+
+
+def test_nohup_wrapped_rm_rf_is_denied():
+    verdict = _hard_deny.classify_command("nohup rm -rf /Users/alice")
+    assert verdict.denied
+
+
+def test_xargs_rm_rf_is_denied_for_lack_of_a_provable_target():
+    # xargs' real targets come from stdin, invisible to static analysis — no
+    # visible target argument means `_rm_verdict` can't prove it's safe, and
+    # fails closed the same way a target-less `rm -rf` already does.
+    verdict = _hard_deny.classify_command("xargs rm -rf")
+    assert verdict.denied
+
+
+def test_find_delete_is_denied():
+    verdict = _hard_deny.classify_command("find . -delete")
+    assert verdict.denied
+
+
+def test_bash_c_wrapped_benign_command_is_not_denied():
+    verdict = _hard_deny.classify_command("bash -c 'echo hello'")
+    assert not verdict.denied
+
+
+def test_bash_c_wrapped_command_touching_user_root_is_denied():
+    denied = _hard_deny.command_touches_protected_path(
+        "bash -c 'cat ~/.jones/secrets/vault.enc'",
+        user_root="~/.jones", project_permissions_path=None, cwd=None,
+    )
+    assert denied

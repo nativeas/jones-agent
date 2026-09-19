@@ -75,6 +75,12 @@ _VALID_MODES = {"chat", "task", "auto"}
 DEFAULT_PROJECT_ID = "proj_default"
 DEFAULT_AGENT_ID = "agent_default"
 
+# Review finding #5 (2026-09-19): `acp_adapter/edit_approval.py::
+# make_acp_edit_approval_requester`'s own default `timeout` (installed
+# `hermes-agent` checkout), never overridden by `acp_adapter/server.py`'s
+# call site — see `_on_request_permission`'s docstring for the full story.
+_EDIT_APPROVAL_HERMES_TIMEOUT_SECONDS = 60.0
+
 
 def _extract_text(content: Any) -> str:
     if isinstance(content, dict):
@@ -107,16 +113,17 @@ def _select_permission_option(
     )
 
 
-def _extract_tool_call(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    """Recover the real tool name + args from an ACP `session/request_permission`
-    payload — Issue #11's review gate needs both, but they can arrive in
-    either of TWO independent shapes (00-foundation.md §7's "两套审批逻辑打架"
-    question; resolved on the plugin side in `kernel/plugin/jones_gate/
-    __init__.py`'s module docstring — "the write_file/patch special case"):
+def _extract_tool_call(params: dict[str, Any]) -> tuple[str, dict[str, Any], str | None]:
+    """Recover the real tool name + args (+ a mode hint, see below) from an
+    ACP `session/request_permission` payload — Issue #11's review gate needs
+    the first two, but they can arrive in either of TWO independent shapes
+    (00-foundation.md §7's "两套审批逻辑打架" question; resolved on the plugin
+    side in `kernel/plugin/jones_gate/__init__.py`'s module docstring — "the
+    write_file/patch special case"):
 
     1. `acp_adapter/edit_approval.py`'s dedicated `write_file`/`patch` path:
        `rawInput = {"tool": <name>, "arguments": {...}}` — real structured
-       args, no decoding needed.
+       args, no decoding needed. No mode hint travels this path (see below).
     2. `jones_gate`'s own generic escalation (every other tool, via
        `tools/approval.py::request_tool_approval`): `rawInput = {"command":
        "<tool_name> (plugin approval rule)", "description": <our encoded
@@ -127,25 +134,40 @@ def _extract_tool_call(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
        packed into it worker-side (the ONLY place that ever has the real
        args for tools going through this path).
 
-    Returns `("", {})` for anything that doesn't match either shape (a
+    Returns `("", {}, None)` for anything that doesn't match either shape (a
     future Hermes protocol change, or a malformed/truncated payload) — an
     empty tool name can never match a `_READ_ONLY_LOW`/name-based rule in
     `permissions/review.py::classify()`, so the caller correctly falls back
     to a non-`low` risk rather than silently guessing "safe" (DEV.md 工程
     原则 #4: 诚实失败).
+
+    The third element (review finding #13, 2026-09-19) is the session mode
+    the RULE gate saw when it decided to escalate this call — shape 2's
+    `_review_payload.encode()` already packs `mode` in alongside `tool`/
+    `args` (it's the same `jones_gate.json` snapshot `kernel/plugin/
+    jones_gate/__init__.py::_decide` read moments earlier); `None` when
+    unavailable (shape 1, or a malformed/legacy payload) — `_on_request_
+    permission`'s caller falls back to its OWN Turn-start snapshot in that
+    case rather than re-reading the session's live (possibly since-changed)
+    mode from the database, see that function's docstring for why.
     """
     raw_input = (params.get("toolCall") or {}).get("rawInput")
     if not isinstance(raw_input, dict):
-        return "", {}
+        return "", {}, None
     if "tool" in raw_input and "arguments" in raw_input:
         tool = raw_input.get("tool")
         args = raw_input.get("arguments")
-        return (tool if isinstance(tool, str) else "", args if isinstance(args, dict) else {})
+        return (
+            tool if isinstance(tool, str) else "",
+            args if isinstance(args, dict) else {},
+            None,
+        )
     description = raw_input.get("description")
     decoded = _review_payload.decode(description) if isinstance(description, str) else None
     if decoded is not None:
-        return decoded["tool"], decoded["args"]
-    return "", {}
+        mode = decoded.get("mode")
+        return decoded["tool"], decoded["args"], mode if isinstance(mode, str) else None
+    return "", {}, None
 
 
 @dataclass
@@ -206,6 +228,17 @@ class SessionService:
         # silently widen what's allowed). Read by `_refresh_gate_config`,
         # written by `_remember_allow`.
         self._session_remembered_rules: dict[str, list[dict[str, str]]] = {}
+        # Review finding #13 (2026-09-19): the mode `_refresh_gate_config`
+        # snapshotted into `jones_gate.json` for this session's currently
+        # (or about to be) running Turn — `send()` writes it right where it
+        # writes that file; `_on_request_permission` reads it back as a
+        # fallback when a request's own payload carries no mode hint (the
+        # edit_approval `{"tool","arguments"}` shape never does — see
+        # `_extract_tool_call`'s docstring), so a mid-Run `set_mode()` can't
+        # loosen a pending review-gate decision for an already-running Run
+        # by racing a live DB read, the same "正在执行中的 Run 不受影响"
+        # guarantee `_refresh_gate_config` already gives the rule gate.
+        self._turn_mode_snapshot: dict[str, str] = {}
 
     def _lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -401,7 +434,12 @@ class SessionService:
             # 模式检查一处调用 (02-w3-interfaces.md §1.1): rewrite this
             # session's rule-gate config before the Turn that's about to run
             # sees it — see `_refresh_gate_config`'s docstring for why this
-            # is the one place that call belongs.
+            # is the one place that call belongs. The mode snapshot recorded
+            # alongside it (review finding #13) MUST be written from this
+            # exact same `session["mode"]` read, not a fresh one — the whole
+            # point is that both gates agree on the mode this Turn started
+            # with, not just that they're both "recent".
+            self._turn_mode_snapshot[session_id] = session["mode"]
             await self._refresh_gate_config(session)
             self._start_turn(session_id, turn_id, text)
             return {"turn_id": turn_id, "queued": False}
@@ -683,7 +721,7 @@ class SessionService:
         user-level deny" — writing here never bypasses it, the merge simply
         drops an entry that would.
         """
-        tool_name, args = _extract_tool_call(entry.params)
+        tool_name, args, _mode_hint = _extract_tool_call(entry.params)
         if not tool_name:
             logger.warning(
                 "permission.decide remember=%r requested but the tool name could not be "
@@ -1125,19 +1163,49 @@ class SessionService:
         classification of the real tool call (recovered from whichever
         `rawInput` shape this request carries):
 
-          - low risk AND the session is in `auto` mode -> decide instantly
-            (`decided_by="rule"` — v1's review gate is a deterministic rule,
-            not a model, see `permissions/review.py`'s module docstring),
-            no `permission.requested` broadcast, no pending-approval UI ever
-            shown to the user (PRD 9.1's "自动模式规则闸内不弹" extended to
-            the review gate's own low-risk determination).
-          - everything else (medium/high risk, or `task` mode regardless of
-            risk) -> the pre-existing W2 user-gate flow: write
-            `permission_decisions(pending)`, broadcast `permission.requested`
-            (now carrying the real classified risk instead of
-            `"unclassified"`), and wait for `permission.decide` — bounded by
-            `settings.approval_timeout_minutes` when configured (PRD 9.4:
-            timeout can only ever resolve to `deny`, never an auto-allow).
+          - low risk AND the session is in `auto` OR `task` mode -> decide
+            instantly (`decided_by="rule"` — v1's review gate is a
+            deterministic rule, not a model, see `permissions/review.py`'s
+            module docstring), no `permission.requested` broadcast, no
+            pending-approval UI ever shown to the user. Review finding #4
+            (2026-09-19): PRD 9.1's task-mode row is explicit —
+            "允许；只读工具直接放行，改变外部世界的动作逐条走三道闸" — task
+            mode gates every ACTION that changes something outside the
+            session, not every tool call regardless of risk; a `chat`-mode
+            session never reaches this function at all (`kernel/plugin/
+            jones_gate` blocks every tool call before it can be escalated —
+            N12), so there is no mode left for which a `low`-risk call
+            (read-only, by `permissions/review.py::classify()`'s own
+            definition of what earns that level) should still interrupt the
+            user.
+          - everything else (medium/high risk, in any mode that still
+            reaches this function) -> the pre-existing W2 user-gate flow:
+            write `permission_decisions(pending)`, broadcast
+            `permission.requested` (now carrying the real classified risk
+            instead of `"unclassified"`), and wait for `permission.decide` —
+            bounded by `settings.approval_timeout_minutes` when configured
+            (PRD 9.4: timeout can only ever resolve to `deny`, never an
+            auto-allow) AND, for the `write_file`/`patch` edit-approval
+            shape specifically, by Hermes's OWN hardcoded 60s timeout on
+            that channel (see the `_EDIT_APPROVAL_HERMES_TIMEOUT_SECONDS`
+            comment below — review finding #5).
+
+        The MODE used for the branch above is deliberately not always a
+        fresh database read (review finding #13, 2026-09-19): `_extract_
+        tool_call`'s mode hint (decoded from the SAME `jones_gate.json`
+        snapshot the rule gate read moments earlier, when this request's
+        shape carries one) is preferred, falling back to this session's
+        Turn-start snapshot (`_turn_mode_snapshot`, written by `send()`
+        alongside `_refresh_gate_config` — see that dict's docstring in
+        `__init__`) and only then to a live DB read (this function's own
+        historical behavior, kept as the last resort for a request that
+        somehow outlives having ever gone through either). Reading the
+        live, possibly-since-changed `session["mode"]` unconditionally would
+        let a mode change mid-Run (`set_mode()` has no "Run in flight" guard)
+        retroactively LOOSEN a pending review-gate decision for an
+        already-running Run — the DB read is a red herring for what actually
+        matters here, since the rule gate that produced this request already
+        made its own decision against the mode captured at Turn start.
         """
         decision_id = new_ulid()
         tool_call = params.get("toolCall") or {}
@@ -1146,7 +1214,6 @@ class SessionService:
         step_id = ctx_turn.tool_call_steps.get(tool_call_id) if ctx_turn and tool_call_id else None
 
         session = await run_in_db_thread(queries.get_session, self.ctx.db, session_id)
-        mode = session["mode"] if session is not None else "task"
         project_id = session["project_id"] if session is not None else None
         cwd = None
         if session is not None:
@@ -1157,10 +1224,15 @@ class SessionService:
                 # raises) rather than narrowing to `RpcError`
                 cwd = None
 
-        tool_name, tool_args = _extract_tool_call(params)
+        tool_name, tool_args, mode_hint = _extract_tool_call(params)
+        mode = (
+            mode_hint
+            or self._turn_mode_snapshot.get(session_id)
+            or (session["mode"] if session is not None else "task")
+        )
         risk = review.classify(tool_name, tool_args, cwd=cwd)
 
-        if risk.level == "low" and mode == "auto":
+        if risk.level == "low" and mode in ("auto", "task"):
             await run_in_db_thread(
                 queries.insert_permission_decision,
                 self.ctx.db, decision_id=decision_id, step_id=step_id,
@@ -1199,8 +1271,40 @@ class SessionService:
         if session is not None:
             settings = await run_in_db_thread(self.ctx.config.settings, project_id)
             timeout_minutes = (settings or {}).get("approval_timeout_minutes")
+        configured_timeout_s = (
+            float(timeout_minutes) * 60.0 if timeout_minutes is not None else None
+        )
+        # Review finding #5 (2026-09-19): the `write_file`/`patch` edit-
+        # approval shape (`_extract_tool_call`'s `{"tool","arguments"}`
+        # branch) travels over `acp_adapter/edit_approval.py::
+        # make_acp_edit_approval_requester`, called by the installed
+        # `hermes-agent`'s `acp_adapter/server.py::_wire_turn_callbacks`
+        # with its 60.0s DEFAULT timeout, never overridden at that call
+        # site — verified against the installed checkout. That channel
+        # auto-DENIES the edit on ITS OWN after 60s, independent of
+        # anything Jones configures. If `settings.approval_timeout_minutes`
+        # is unset (PRD 9.4's "默认不超时") or looser than 60s, this
+        # function would otherwise keep the pending-approval UI up well
+        # past the point where the edit already didn't happen — a later
+        # `permission.decide(allow)` would write `decision=allow` for an
+        # edit Hermes already gave up on 60s+ earlier (the user sees "我批
+        # 了、系统说批了" while nothing was done — exactly what 9.3 forbids).
+        # The effective wait for THIS shape is therefore capped at 60s,
+        # whichever of the two timeouts is tighter always wins.
+        is_edit_approval_shape = (
+            isinstance((tool_call.get("rawInput") or {}), dict)
+            and "tool" in (tool_call.get("rawInput") or {})
+            and "arguments" in (tool_call.get("rawInput") or {})
+        )
+        effective_timeout_s = configured_timeout_s
+        if is_edit_approval_shape:
+            effective_timeout_s = (
+                _EDIT_APPROVAL_HERMES_TIMEOUT_SECONDS
+                if effective_timeout_s is None
+                else min(effective_timeout_s, _EDIT_APPROVAL_HERMES_TIMEOUT_SECONDS)
+            )
         try:
-            if timeout_minutes is None:
+            if effective_timeout_s is None:
                 return await fut
             # NOT `asyncio.wait_for(fut, ...)`: on timeout, `wait_for` CANCELS
             # the awaitable it was given — cancelling `fut` itself would make
@@ -1215,7 +1319,7 @@ class SessionService:
             # only reports which set `fut` landed in; it never touches `fut`
             # itself, so a genuine timeout leaves it exactly as pending as it
             # was, safe to inspect/resolve below.
-            done, _pending = await asyncio.wait({fut}, timeout=float(timeout_minutes) * 60.0)
+            done, _pending = await asyncio.wait({fut}, timeout=effective_timeout_s)
             if fut not in done:
                 # PRD 9.4: "超时可配置，但只能配「拒绝」" — never auto-allow.
                 # `fut` may already carry a real user/`_resolve_pending_
@@ -1236,11 +1340,22 @@ class SessionService:
                     # denied tool call — best-effort: if this Turn already
                     # finished by the time we get here (a last-second
                     # `permission.decide` raced us), there is nothing left
-                    # to terminate.
-                    if ctx_turn is not None and self._active_turns.get(session_id) is ctx_turn:
-                        await self._terminate_run(
-                            ctx_turn, kind="error", reason="approval timed out (审批超时)"
+                    # to terminate. The reason names which timeout actually
+                    # bound this wait (review finding #5) rather than
+                    # always blaming `settings.approval_timeout_minutes`.
+                    reason = "approval timed out (审批超时)"
+                    if is_edit_approval_shape and (
+                        configured_timeout_s is None
+                        or configured_timeout_s > _EDIT_APPROVAL_HERMES_TIMEOUT_SECONDS
+                    ):
+                        reason = (
+                            "the edit-approval channel auto-denies after 60s on its own "
+                            "(Hermes-side timeout, independent of Jones's "
+                            "approval_timeout_minutes); acting on that outcome now "
+                            "(审批超时)"
                         )
+                    if ctx_turn is not None and self._active_turns.get(session_id) is ctx_turn:
+                        await self._terminate_run(ctx_turn, kind="error", reason=reason)
             return await fut
         finally:
             self._pending_permissions.pop(decision_id, None)

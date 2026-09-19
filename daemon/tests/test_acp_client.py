@@ -60,6 +60,33 @@ async def test_initialize_and_new_session_roundtrip():
         await _stop(client, process)
 
 
+async def test_new_session_rejects_a_non_default_acp_session_mode():
+    # Issue #11 round-1 review finding #6 (docs/design/02-w3-interfaces.md
+    # §1.2): a worker whose ACP session mode isn't "default" would let
+    # Hermes's own `edit_approval.py` auto-approve write_file/patch without
+    # ever asking the daemon — `new_session()` must refuse to use it.
+    client, process, _events = await _start_client(mode="session_new_non_default_mode")
+    try:
+        await client.initialize()
+        with pytest.raises(AcpProtocolError, match="accept_edits"):
+            await client.new_session("/tmp")
+    finally:
+        await _stop(client, process)
+
+
+async def test_new_session_accepts_a_response_with_no_modes_field():
+    # "normal" mode's `session/new` response carries no `modes` key at all
+    # (same as a real Hermes build predating ACP mode support) — absence is
+    # not a violation, only an explicit non-"default" value is.
+    client, process, _events = await _start_client()
+    try:
+        await client.initialize()
+        session = await client.new_session("/tmp")
+        assert session["sessionId"] == "fake-session-1"
+    finally:
+        await _stop(client, process)
+
+
 async def test_prompt_streams_message_delta_events():
     client, process, events = await _start_client()
     try:

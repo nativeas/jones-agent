@@ -27,6 +27,43 @@ reason it couldn't be parsed here, which routes it to the user gate in every
 mode. Silently hard-blocking anything we merely fail to understand would be
 its own kind of dishonesty (DEV.md 工程原则 #4 covers failing loud, not
 failing by guessing).
+
+## Shell-wrapper unwrapping (review finding #2, 2026-09-19)
+
+`classify_command`/`command_touches_protected_path` originally only looked at
+each shell segment's OWN argv — `bash -c 'rm -rf /Users/alice'` classified as
+a call to `bash` with two harmless-looking args, never looking inside the
+`-c` payload it actually executes. Combined with a `permissions.json` allow
+rule for `terminal` (a legitimate, intentional config — "allow this whole
+tool" — 02-w3-interfaces.md §1.1's exact-tool-name match shape), that meant
+the one gate PRD 5.7 says "any config" can never loosen had a hole a single
+`sh -c`/`bash -c` wrapper drove straight through it.
+
+`_expand_wrapped_argv` recursively unwraps a bounded set of known wrappers
+before the existing per-argv checks run, so the checks below see the REAL
+command being executed, not just the wrapper invoking it:
+  - `sh`/`bash`/`zsh`/`dash`/`ksh -c "<script>"` — the script argument is
+    itself a full shell command string, re-split into its own segments
+    (`_split_shell_segments`, same function the top-level command already
+    goes through) and each of those recursively unwrapped too (nested
+    wrapping, e.g. `bash -c "env FOO=1 sh -c 'rm -rf /'"`, up to
+    `_MAX_UNWRAP_DEPTH`).
+  - `env`/`nohup`/`timeout <cmd> ...` — these exec a real command with the
+    rest of their own argv, after skipping their own flags/args
+    (`_strip_leading_wrapper_argv`); the remainder is unwrapped the same way
+    (still just one argv, no re-splitting needed — no shell is involved).
+  - `xargs [options] <cmd> [initial-args]` — best-effort: the command
+    xargs would invoke, after xargs's own flags. `xargs`'s real invocation
+    also appends args read from stdin at runtime, which this static analysis
+    can never see — `_rm_verdict` already fails closed on that (an `rm -rf`
+    with no VISIBLE target argument is treated as "unproven safe", see its
+    own docstring), which is exactly the right degradation here too.
+
+A wrapper form this function doesn't recognize, or a `-c` payload that fails
+to parse, is simply not unwrapped — same "don't hard-deny what we can't
+positively identify" rule as everywhere else in this module; it still falls
+through to the review gate for whatever the wrapper's own argv looks like
+verbatim.
 """
 
 from __future__ import annotations
@@ -40,6 +77,16 @@ _SHELL_OPERATORS = frozenset({"&&", "||", ";", "|"})
 _RECURSIVE_FORCE_RM_FLAGS = frozenset({"-r", "-rf", "-fr", "-R", "-Rf", "-fR"})
 _TRASH_PROGRAMS = frozenset({"trash", "rmtrash"})
 _DEFAULT_BRANCHES = frozenset({"main", "master"})
+
+# Review finding #2: known shell-wrapper programs whose argv this module
+# recurses into instead of stopping at (see module docstring's "Shell-wrapper
+# unwrapping" section).
+_SHELL_INTERPRETERS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_ENV_LIKE_WRAPPERS = frozenset({"env", "nohup", "timeout"})
+_XARGS_VALUE_FLAGS = frozenset(
+    {"-I", "-L", "-n", "-P", "-s", "-d", "--delimiter", "--max-args", "--max-procs", "--replace"}
+)
+_MAX_UNWRAP_DEPTH = 4
 
 
 @dataclass(frozen=True)
@@ -76,7 +123,14 @@ def _resolve_best_effort(raw: str, *, cwd: str | None) -> Path | None:
         if not p.is_absolute() and cwd:
             p = Path(cwd).expanduser() / p
         return p.resolve(strict=False)
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
+        # `ValueError` (review finding #11, 2026-09-19): `Path.resolve()`
+        # raises it (not `OSError`) for a path containing an embedded NUL
+        # byte (`lstat: embedded null character in path`) — reproduced
+        # against this exact function before this fix. Fails closed the
+        # same way an `OSError` already did (see `is_protected_path`'s
+        # caller: an unresolvable path is treated as protected, an
+        # unresolvable `rm` target is treated as not-provably-temp).
         return None
 
 
@@ -114,6 +168,102 @@ def _split_shell_segments(command: str) -> list[list[str]] | None:
     if current:
         segments.append(current)
     return segments
+
+
+def _strip_leading_wrapper_argv(prog: str, argv: list[str]) -> list[str] | None:
+    """`env`/`nohup`/`timeout`: return the argv of the command they'd
+    actually exec, after skipping their own flags/args. `None` when nothing
+    identifiable follows (e.g. `env` with no command at all)."""
+    rest = argv[1:]
+    if prog == "env":
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok.startswith("-"):
+                i += 1
+                continue
+            if "=" in tok:  # a VAR=VALUE assignment, `env`'s own syntax
+                i += 1
+                continue
+            break
+        rest = rest[i:]
+    elif prog == "timeout":
+        i = 0
+        consumed_duration = False
+        while i < len(rest):
+            tok = rest[i]
+            if tok.startswith("-"):
+                i += 1
+                continue
+            if not consumed_duration:
+                i += 1
+                consumed_duration = True
+                continue
+            break
+        rest = rest[i:]
+    # `nohup <cmd> ...` takes no flags of its own before the command.
+    return rest or None
+
+
+def _strip_xargs_wrapper(argv: list[str]) -> list[str] | None:
+    """Best-effort: the argv of the command `xargs` would invoke, after its
+    own options. `xargs` also appends args it reads from stdin at runtime —
+    invisible to this static analysis — so the returned argv may be missing
+    trailing arguments the real invocation would have; callers (`_rm_verdict`
+    in particular) already fail closed on a target-less `rm -rf`, which is
+    the correct degradation for that gap, not a hole in it."""
+    rest = argv[1:]
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--":
+            i += 1
+            break
+        if not tok.startswith("-"):
+            break
+        if tok in _XARGS_VALUE_FLAGS:
+            i += 2
+        else:
+            i += 1
+    rest = rest[i:]
+    return rest or None
+
+
+def _expand_wrapped_argv(argv: list[str], depth: int) -> list[list[str]]:
+    """Return `[argv]` plus, for a recognized wrapper, every argv it would
+    actually go on to run (recursively, up to `depth`) — see the module
+    docstring's "Shell-wrapper unwrapping" section. Always includes the
+    original `argv` itself (a wrapper's own name/flags never denied by
+    anything below, but harmless to also check)."""
+    out = [argv]
+    if depth <= 0 or not argv:
+        return out
+    prog = Path(argv[0]).name
+    if prog in _SHELL_INTERPRETERS:
+        try:
+            c_index = argv.index("-c")
+        except ValueError:
+            return out
+        if c_index + 1 >= len(argv):
+            return out
+        inner_segments = _split_shell_segments(argv[c_index + 1])
+        if inner_segments is None:
+            return out
+        for seg in inner_segments:
+            if seg:
+                out.extend(_expand_wrapped_argv(seg, depth - 1))
+        return out
+    if prog in _ENV_LIKE_WRAPPERS:
+        rest = _strip_leading_wrapper_argv(prog, argv)
+        if rest:
+            out.extend(_expand_wrapped_argv(rest, depth - 1))
+        return out
+    if prog == "xargs":
+        rest = _strip_xargs_wrapper(argv)
+        if rest:
+            out.extend(_expand_wrapped_argv(rest, depth - 1))
+        return out
+    return out
 
 
 def _rm_verdict(argv: list[str], *, cwd: str | None) -> str | None:
@@ -172,24 +322,32 @@ def classify_command(command: str, *, cwd: str | None = None) -> Verdict:
     segments = _split_shell_segments(command)
     if segments is None:
         return Verdict(False)  # unparseable -> not hard-denied here, see module docstring
-    for argv in segments:
-        if not argv:
+    for top_argv in segments:
+        if not top_argv:
             continue
-        prog = Path(argv[0]).name
-        reason = _rm_verdict(argv, cwd=cwd)
-        if reason:
-            return Verdict(True, reason)
-        if prog in _TRASH_PROGRAMS:
-            return Verdict(True, "moving files to Trash / emptying it is never allowed (PRD 5.7)")
-        if prog == "shred":
-            return Verdict(True, "shred is never allowed (PRD 5.7)")
-        if prog.startswith("mkfs"):
-            return Verdict(True, "mkfs* is never allowed (PRD 5.7)")
-        if prog == "diskutil" and len(argv) > 1 and argv[1].lower().startswith("erase"):
-            return Verdict(True, "diskutil erase* is never allowed (PRD 5.7)")
-        reason = _git_push_force_verdict(argv)
-        if reason:
-            return Verdict(True, reason)
+        for argv in _expand_wrapped_argv(top_argv, _MAX_UNWRAP_DEPTH):
+            prog = Path(argv[0]).name
+            reason = _rm_verdict(argv, cwd=cwd)
+            if reason:
+                return Verdict(True, reason)
+            if prog in _TRASH_PROGRAMS:
+                return Verdict(
+                    True, "moving files to Trash / emptying it is never allowed (PRD 5.7)"
+                )
+            if prog == "shred":
+                return Verdict(True, "shred is never allowed (PRD 5.7)")
+            if prog.startswith("mkfs"):
+                return Verdict(True, "mkfs* is never allowed (PRD 5.7)")
+            if prog == "diskutil" and len(argv) > 1 and argv[1].lower().startswith("erase"):
+                return Verdict(True, "diskutil erase* is never allowed (PRD 5.7)")
+            if prog == "find" and any(a == "-delete" for a in argv[1:]):
+                return Verdict(
+                    True, "find -delete performs an irreversible delete and is never allowed "
+                    "(PRD 5.7)"
+                )
+            reason = _git_push_force_verdict(argv)
+            if reason:
+                return Verdict(True, reason)
     return Verdict(False)
 
 
@@ -211,19 +369,21 @@ def command_touches_protected_path(
     segments = _split_shell_segments(command)
     if segments is None:
         return False
-    for argv in segments:
-        for tok in argv:
-            candidate = tok.lstrip("-")
-            for prefix in (">>", ">"):
-                if candidate.startswith(prefix):
-                    candidate = candidate[len(prefix) :]
-                    break
-            if not candidate:
-                continue
-            if is_protected_path(
-                candidate, user_root=user_root, project_permissions_path=project_permissions_path
-            ):
-                return True
+    for top_argv in segments:
+        for argv in _expand_wrapped_argv(top_argv, _MAX_UNWRAP_DEPTH):
+            for tok in argv:
+                candidate = tok.lstrip("-")
+                for prefix in (">>", ">"):
+                    if candidate.startswith(prefix):
+                        candidate = candidate[len(prefix) :]
+                        break
+                if not candidate:
+                    continue
+                if is_protected_path(
+                    candidate, user_root=user_root,
+                    project_permissions_path=project_permissions_path,
+                ):
+                    return True
     return False
 
 

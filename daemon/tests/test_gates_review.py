@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from jones_daemon.permissions.review import classify
 
 
@@ -93,3 +95,64 @@ def test_unknown_tool_defaults_to_medium_never_low():
 def test_none_args_does_not_crash():
     risk = classify("terminal", None)
     assert risk.level in ("medium", "high")
+
+
+# Review findings #7/#9 (2026-09-19): the default Project's `cwd` is the
+# user's real home directory (`sessions/service.py::_cwd_for_project`'s
+# documented placeholder) — "inside the workspace" must never collapse to
+# `low` when that's what "the workspace" actually is, and a sensitive
+# user-home location must never be `low` regardless of the workspace.
+
+
+def test_write_with_cwd_equal_to_home_is_never_low():
+    home = str(Path.home())
+    risk = classify("write_file", {"path": f"{home}/some/deep/path.txt"}, cwd=home)
+    assert risk.level != "low"
+
+
+def test_write_with_cwd_wider_than_home_is_never_low():
+    parent_of_home = str(Path.home().parent)
+    risk = classify(
+        "write_file", {"path": str(Path.home() / "notes.txt")}, cwd=parent_of_home
+    )
+    assert risk.level != "low"
+
+
+def test_write_to_ssh_is_high_even_with_cwd_equal_to_home():
+    home = str(Path.home())
+    risk = classify("write_file", {"path": f"{home}/.ssh/authorized_keys"}, cwd=home)
+    assert risk.level == "high"
+
+
+def test_write_to_shell_rc_is_high_even_with_cwd_equal_to_home():
+    home = str(Path.home())
+    risk = classify("write_file", {"path": f"{home}/.zshrc"}, cwd=home)
+    assert risk.level == "high"
+
+
+def test_write_to_launch_agents_is_high_even_with_cwd_equal_to_home():
+    home = str(Path.home())
+    risk = classify(
+        "write_file", {"path": f"{home}/Library/LaunchAgents/evil.plist"}, cwd=home
+    )
+    assert risk.level == "high"
+
+
+def test_write_to_sensitive_path_is_high_even_with_a_real_project_workspace():
+    # Defense in depth (review finding #9's second suggested fix): the
+    # sensitive-path denylist applies independent of the workspace boundary
+    # check, so it still catches a future real Project whose workspace
+    # happens to nest a sensitive path.
+    home = str(Path.home())
+    risk = classify("write_file", {"path": f"{home}/.ssh/id_rsa"}, cwd=f"{home}/some/project")
+    assert risk.level == "high"
+
+
+def test_write_inside_a_real_narrow_workspace_under_home_is_still_low():
+    # A genuine project directory (not home itself, not an ancestor of it)
+    # is unaffected by the #7/#9 fix — this is what "inside the workspace"
+    # is actually supposed to mean.
+    home = str(Path.home())
+    cwd = f"{home}/code/myproject"
+    risk = classify("write_file", {"path": f"{cwd}/src/main.py"}, cwd=cwd)
+    assert risk.level == "low"

@@ -23,7 +23,13 @@ from typing import Any
 from jones_daemon.context import DaemonContext, NullProviderResolver
 from jones_daemon.kernel.plugin.jones_gate import _review_payload
 from jones_daemon.sessions import queries
-from jones_daemon.sessions.service import DEFAULT_AGENT_ID, DEFAULT_PROJECT_ID, SessionService
+from jones_daemon.sessions import service as service_module
+from jones_daemon.sessions.service import (
+    DEFAULT_AGENT_ID,
+    DEFAULT_PROJECT_ID,
+    SessionService,
+    _extract_tool_call,
+)
 from jones_daemon.store import apply_pending, connect, run_in_db_thread
 
 _FAKE_AGENT = str(Path(__file__).parent / "fake_acp_agent.py")
@@ -151,17 +157,50 @@ async def test_auto_mode_high_risk_still_goes_through_the_user_gate(tmp_path, mo
         await service.shutdown()
 
 
-async def test_task_mode_low_risk_still_goes_through_the_user_gate_G06(tmp_path, monkeypatch):
-    # PRD 9.1: task mode gates every write action individually, regardless
-    # of risk — only auto mode's low-risk path skips the user gate.
+async def test_task_mode_low_risk_auto_allows_with_no_pending_broadcast_G06(tmp_path, monkeypatch):
+    # PRD 9.1's task-mode row: "允许；只读工具直接放行，改变外部世界的动作逐条走
+    # 三道闸" — a read-only (low-risk) tool must NOT interrupt the user in task
+    # mode either, only auto's low-risk path was wired that way originally
+    # (review finding #4, 2026-09-19: the pre-fix version of this test
+    # asserted the OPPOSITE of PRD 9.1 and is why the bug shipped — see git
+    # history for the version this replaces).
     service = await _make_service(tmp_path, monkeypatch)
     try:
         session_id = await _new_session(service, mode="task")
         prompt = _custom_permission_prompt("read_file", {"path": "/tmp/x"}, mode="task")
         await service.send(session_id, prompt)
+        await _wait_until(
+            lambda: service.ctx.server.events("permission.decided")
+            or service.ctx.server.events("run.terminated")
+        )
+        assert service.ctx.server.events("permission.requested") == []
+        decided = service.ctx.server.events("permission.decided")
+        assert decided, "expected an instant permission.decided"
+        row = decided[0][1]
+        assert row["decision"] == "allow"
+        assert row["decided_by"] == "rule"
+        assert row["gate"] == "review"
+    finally:
+        await service.shutdown()
+
+
+async def test_task_mode_write_action_still_goes_through_the_user_gate_G06(tmp_path, monkeypatch):
+    # The other half of PRD 9.1's task-mode row: a WRITE action (something
+    # that changes the outside world, not read-only) still gates individually
+    # in task mode regardless of how low-risk it might otherwise look —
+    # `write_file`/`patch` are never `low` by `permissions/review.py::
+    # classify()`'s own rules (see `_classify_write`), so this exercises the
+    # "everything but read-only tools" half task mode is actually about.
+    service = await _make_service(tmp_path, monkeypatch)
+    try:
+        session_id = await _new_session(service, mode="task")
+        prompt = _custom_permission_prompt(
+            "terminal", {"command": "echo hi"}, mode="task"
+        )
+        await service.send(session_id, prompt)
         await _wait_until(lambda: service.ctx.server.events("permission.requested"))
         requested = service.ctx.server.events("permission.requested")[0][1]
-        assert requested["risk"] == "low"
+        assert requested["risk"] in ("medium", "high")
         pending = await service.permission_pending(session_id)
         await service.permission_decide(pending[0]["request_id"], "allow")
         await _wait_until(lambda: service.ctx.server.events("permission.decided"))
@@ -233,6 +272,112 @@ async def test_approval_timeout_never_auto_approves(tmp_path, monkeypatch):
         await _wait_until(lambda: service.ctx.server.events("permission.decided"), timeout=5.0)
         decision_row = service.ctx.server.events("permission.decided")[0][1]
         assert decision_row["decision"] == "deny"
+    finally:
+        await service.shutdown()
+
+
+# Review finding #13 (2026-09-19): `_extract_tool_call` threads a mode hint
+# (decoded from the rule gate's own `jones_gate.json` snapshot) alongside
+# the tool name/args, so `_on_request_permission` can gate on the mode the
+# RULE gate actually saw instead of unconditionally re-reading the (possibly
+# since mid-Run-changed) live session mode.
+
+
+def test_extract_tool_call_returns_the_encoded_mode_hint_for_the_generic_shape():
+    encoded = _review_payload.encode("terminal", {"command": "ls"}, mode="auto")
+    params = {
+        "toolCall": {
+            "rawInput": {"command": "terminal (plugin approval rule)", "description": encoded}
+        }
+    }
+    tool_name, args, mode_hint = _extract_tool_call(params)
+    assert (tool_name, args, mode_hint) == ("terminal", {"command": "ls"}, "auto")
+
+
+def test_extract_tool_call_has_no_mode_hint_for_the_edit_approval_shape():
+    params = {
+        "toolCall": {"rawInput": {"tool": "write_file", "arguments": {"path": "/tmp/x"}}}
+    }
+    _tool_name, _args, mode_hint = _extract_tool_call(params)
+    assert mode_hint is None
+
+
+async def test_send_snapshots_the_turn_start_mode_for_the_review_gate(tmp_path, monkeypatch):
+    service = await _make_service(tmp_path, monkeypatch)
+    try:
+        session_id = await _new_session(service, mode="auto")
+        assert session_id not in service._turn_mode_snapshot
+        prompt = _custom_permission_prompt("read_file", {"path": "/tmp/x"}, mode="auto")
+        await service.send(session_id, prompt)
+        # Written synchronously inside `send()`'s immediate-start branch,
+        # before the Turn's task is even scheduled — no need to wait for
+        # anything to observe it.
+        assert service._turn_mode_snapshot[session_id] == "auto"
+    finally:
+        await service.shutdown()
+
+
+async def test_edit_approval_shape_times_out_at_hermes_own_ceiling(tmp_path, monkeypatch):
+    # Review finding #5 (2026-09-19): the edit-approval ACP path
+    # (`{"tool","arguments"}` rawInput) travels over a channel that Hermes
+    # itself hard-times-out after 60s, independent of anything Jones
+    # configures — even with NO `settings.approval_timeout_minutes` set
+    # (PRD 9.4's "默认不超时"), the daemon's own wait for THIS shape must
+    # still give up around that same ceiling, not hang indefinitely while
+    # the underlying edit has already been auto-denied. Monkeypatches the
+    # ceiling constant down to a test-speed value rather than actually
+    # waiting 60s.
+    monkeypatch.setattr(service_module, "_EDIT_APPROVAL_HERMES_TIMEOUT_SECONDS", 0.01)
+    service = await _make_service(tmp_path, monkeypatch, config=FakeConfigResolver())
+    try:
+        session_id = await _new_session(service, mode="task")
+        payload = {
+            "toolCall": {
+                "toolCallId": "edit-1", "title": "Approve edit: /etc/passwd",
+                "rawInput": {
+                    "tool": "write_file",
+                    "arguments": {"path": "/etc/passwd", "content": "x"},
+                },
+            },
+        }
+        await service.send(session_id, f"CUSTOM_PERMISSION_JSON:{json.dumps(payload)}")
+        await _wait_until(lambda: service.ctx.server.events("run.terminated"), timeout=5.0)
+        terminated = service.ctx.server.events("run.terminated")[0][1]
+        assert terminated["kind"] == "error"
+        assert "edit-approval channel" in terminated["reason"] or "60s" in terminated["reason"]
+        decided = service.ctx.server.events("permission.decided")
+        assert decided and decided[0][1]["decision"] == "deny"
+        assert decided[0][1]["decided_by"] == "timeout"
+    finally:
+        await service.shutdown()
+
+
+async def test_edit_approval_shape_uses_the_tighter_of_the_two_timeouts(tmp_path, monkeypatch):
+    # A `settings.approval_timeout_minutes` SHORTER than Hermes's own 60s
+    # ceiling still wins — the two bounds are combined with `min()`, neither
+    # one is simply ignored in favor of the other.
+    monkeypatch.setattr(service_module, "_EDIT_APPROVAL_HERMES_TIMEOUT_SECONDS", 60.0)
+    service = await _make_service(
+        tmp_path, monkeypatch, config=FakeConfigResolver(approval_timeout_minutes=0.0001)
+    )
+    try:
+        session_id = await _new_session(service, mode="task")
+        payload = {
+            "toolCall": {
+                "toolCallId": "edit-1", "title": "Approve edit: /etc/passwd",
+                "rawInput": {
+                    "tool": "write_file",
+                    "arguments": {"path": "/etc/passwd", "content": "x"},
+                },
+            },
+        }
+        await service.send(session_id, f"CUSTOM_PERMISSION_JSON:{json.dumps(payload)}")
+        await _wait_until(lambda: service.ctx.server.events("run.terminated"), timeout=5.0)
+        terminated = service.ctx.server.events("run.terminated")[0][1]
+        # The shorter, Jones-configured timeout is what actually fired here
+        # (0.0001min ≈ 6ms), not the 60s Hermes ceiling -> generic reason.
+        assert "审批超时" in terminated["reason"]
+        assert "edit-approval channel" not in terminated["reason"]
     finally:
         await service.shutdown()
 

@@ -128,6 +128,31 @@ def _hard_deny_verdict(
 def _on_pre_tool_call(
     tool_name: str = "", args: dict | None = None, tool_call_id: str = "", **kwargs: Any
 ) -> dict | None:
+    """Public hook entry point — a thin fail-closed wrapper around `_decide`.
+
+    Round-1 review finding #11 (2026-09-19): Hermes's own `PluginManager.
+    invoke_hook` treats a raised exception from a `pre_tool_call` callback as
+    "no directive produced" and lets the tool proceed (`hermes_cli/
+    plugins_dispatch.py`'s `except Exception: logger.warning(...)`, verified
+    against the installed checkout) — i.e. fail-OPEN, the exact opposite of
+    contract §3 ("任何闸出错 → 拒绝"). `_decide` below has real inputs it can
+    raise on (a malformed `jones_gate.json` shape, a path containing an
+    embedded NUL byte — both reproduced against this exact code before this
+    fix), so the entry point itself must never let an exception escape.
+    """
+    try:
+        return _decide(tool_name, args, tool_call_id)
+    except BaseException as exc:  # noqa: BLE001 - deliberately broad, see
+        # the docstring above: ANY exception here must fail closed, not just
+        # the ones we've thought to anticipate.
+        return _block(
+            f"rule gate raised {type(exc).__name__} while evaluating this call; "
+            "failing closed rather than letting Hermes treat it as no verdict "
+            "(contract §3, review finding #11)"
+        )
+
+
+def _decide(tool_name: str, args: dict | None, tool_call_id: str) -> dict | None:
     args = args if isinstance(args, dict) else {}
 
     if tool_name == PROBE_TOOL_NAME:
@@ -160,6 +185,23 @@ def _on_pre_tool_call(
     if mode == "chat":
         return _block("chat mode forbids all tool calls, no exceptions (PRD 9.1, N12)")
 
+    # N13 / review finding #1 & #10 (2026-09-19): the Agent tool whitelist is
+    # a "narrow only, never widen" constraint on top of everything else —
+    # it must be checked BEFORE the allow-passthrough branch below, not
+    # after. A `permissions.json` `allow` rule (user- or project-level, or
+    # one this very plugin's `remember` feature wrote) says nothing about
+    # which Agent this session belongs to; letting it short-circuit straight
+    # to `return None` before the whitelist is even consulted let ANY allow
+    # rule hand a tool-restricted child session (including the "zero tools
+    # allowed" sentinel — see `permissions/gate_config.py::
+    # _tool_allowlist_for_json`) a tool its own whitelist forbids. Checking
+    # it here, ahead of both the allow-bypass AND the edit-approval-deferral
+    # branches, is what makes it apply uniformly to every path through this
+    # function that could otherwise let a tool run.
+    allowlist = config.get("tool_allowlist") or []
+    if allowlist and tool_name not in allowlist:
+        return _block(f"tool {tool_name!r} is not in this session's Agent tool whitelist")
+
     if rule_verdict == "allow" and not config.get("rules_degraded"):
         # A degraded permissions.json (existed but failed to parse
         # somewhere — see `_config.py`'s schema comment) can't be trusted
@@ -170,10 +212,6 @@ def _on_pre_tool_call(
         # `deny` branch above) is the fail-closed choice — never widen,
         # only ever narrow what escalates.
         return None  # 直接放行，零 IPC
-
-    allowlist = config.get("tool_allowlist") or []
-    if allowlist and tool_name not in allowlist:
-        return _block(f"tool {tool_name!r} is not in this session's Agent tool whitelist")
 
     if tool_name in _EDIT_APPROVAL_TOOLS:
         # See module docstring's "write_file/patch special case" — defer to

@@ -6,7 +6,7 @@
 
 | 分支 | Issue | 独占 | 允许的共享改动 |
 |---|---|---|---|
-| F `w3/11-permission-gates` | #11 | `daemon/src/jones_daemon/permissions/`（新）、`kernel/plugin/jones_gate/`、`sessions/modes.py`（新）、对应 tests | `sessions/service.py`：只改 `_on_request_permission`、`permission_decide`、`send`（模式检查一处调用）、`_resolve_pending_permissions`；`kernel/acp_client.py`：只改 `_answer_request_permission` 及其调用；`workers/manager.py`：只改 `_worker_env`/`_prepare_hermes_home`（写入规则闸配置给插件） |
+| F `w3/11-permission-gates` | #11 | `daemon/src/jones_daemon/permissions/`（新）、`kernel/plugin/jones_gate/`、`sessions/modes.py`（新）、对应 tests | `sessions/service.py`：只改 `_on_request_permission`、`permission_decide`、`send`（模式检查一处调用）、`_resolve_pending_permissions`；`kernel/acp_client.py`：只改 `_answer_request_permission` 及其调用、`new_session`（round-1 评审 #6 追加：ACP 会话模式启动自检，见 §1.2）；`workers/manager.py`：只改 `_worker_env`/`_prepare_hermes_home`（写入规则闸配置给插件） |
 | G `w3/12-run-replay` | #12 + 集成收口 | `daemon/src/jones_daemon/replay/`（新）、`apps/desktop/src/renderer/**` 中的回放 UI、`daemon/tests/test_replay*.py` | `sessions/service.py`：只改 `_handle_tool_call_start/_update`、`_finalize_*`、`_terminate_run`、`run_get/run_steps`、`_cwd_for_project`；`rpc/methods.py`：`daemon.status` 真实计数；`apps/desktop/src/main/index.ts`：`ALLOWED_RPC_METHODS` 扩到 RPC v0 全部方法；新增 `pnpm e2e` |
 
 两条分支都会碰 `sessions/service.py`，**按上表函数级划分**；不要在对方的函数里改一行。`__main__.py` 仍是加一行原则。
@@ -25,8 +25,12 @@ worker(Hermes) ── pre_tool_call(jones_gate 插件) ──┐
    ② 其余 → 返回 approve → Hermes request_tool_approval() → ACP session/request_permission → daemon
 daemon ── _on_request_permission ──┐
    ③ 审查闸（daemon 内）：对动作做风险分级 →                    │
-      - 低风险 且 auto 模式 → 自动 allow（记录 decided_by=rule）
-      - 高风险 或 task 模式 → 用户闸：写 permission_decisions(pending)，推 permission.requested，等待 permission.decide / 超时(只能 deny)
+      - 低风险 且（auto 或 task 模式） → 自动 allow（记录 decided_by=rule）——round-1 评审
+        #4（2026-09-19）修正：原文「低风险 且 auto 模式」/「高风险 或 task 模式」是 PRD 9.1
+        的简写，字面读起来会让 task 模式下的只读工具也逐条弹用户闸，与 PRD 9.1 原文「task 模式：
+        允许；只读工具直接放行，改变外部世界的动作逐条走三道闸」相悖；chat 模式在规则闸①就被
+        block 一切工具（N12），根本不会走到这一步，所以这里不必再提 chat
+      - 非低风险（medium/high） → 用户闸：写 permission_decisions(pending)，推 permission.requested，等待 permission.decide / 超时(只能 deny)
 ```
 
 - **规则闸配置下发**：`_prepare_hermes_home` 把该会话生效的规则（`ctx.config.permissions(project_id)` 合并结果 + 会话模式 + Agent 工具白名单）写成 `<HERMES_HOME>/jones_gate.json`；模式切换 / 规则变更时 daemon 重写该文件并（若 worker 活着）通过 ACP 发一个自定义 `session/update`？——**不要**：ACP 没有这种反向配置通道。裁定：插件每次 `pre_tool_call` 读一次 `jones_gate.json`（几 KB，mtime 缓存），零协议扩展；模式切换即时生效（PRD 9.1）。
@@ -105,6 +109,25 @@ daemon ── _on_request_permission ──┐
   本分支的测试套件已经改写成不触发它（见 `test_gates_sessions_integration.py` 里
   `test_remember_session_persists_an_allow_rule_for_this_session_only` 的说明），CI 因此仍是绿的，
   但这个 bug 本身没有被这条分支修掉。
+- **ACP 会话模式启动自检**（round-1 评审 #6，2026-09-19；扩大了 §0 对 `kernel/acp_client.py` 的允许
+  改动范围，加入 `new_session`，DEV.md「改接口先改文档」）：核对已安装 `hermes-agent` 源码
+  （`acp_adapter/server.py::_MODES`/`_edit_approval_policy_for_state`）发现，ACP 会话模式一旦不是
+  `"default"`（`accept_edits`/`dont_ask`），`edit_approval.py::should_auto_approve_edit` 会在工作区内
+  （或全部非敏感）路径下直接放行 `write_file`/`patch`，**根本不发** `session/request_permission`——
+  本插件对这两个工具只返回 `block`/`None`（见 `__init__.py` 的 "write_file/patch special case"），
+  daemon 侧因此永远收不到请求，本 PR 的用户闸/审查闸对这两个工具会静默失效，且没有任何探针能发现
+  （现有探针只证明插件加载了，证明不了 edit 通道的策略）。
+  今天这是**潜在**而非已触发的风险：Jones 代码库里没有任何地方调用 `session/set_mode`，ACP 会话
+  模式因此只会停留在 Hermes 自己的默认值 `"default"`；但没有任何东西"钉死"它，也没有任何自检验证过
+  这一点——00-foundation.md §8.1 对同类"第五条绕过路径"的处理标准是"显式关掉 + 启动自检证明"。
+  `new_session()` 因此在收到 `session/new` 响应后做一次只读自检：若响应携带 `modes.currentModeId`
+  且它不是 `"default"`，拒绝使用这个 worker（`AcpProtocolError`，被 `workers/manager.py::
+  _spawn_and_check` 的既有 `except` 分支转成 `WorkerStartupError`，即 09-19 前就有的 fail-closed 路径，
+  不是新错误类型）。`modes` 字段缺失（测试用的 `fake_acp_agent.py`、或一个不支持 ACP 模式的旧版
+  Hermes）不视为违规，只有显式的非 `"default"` 值才算——不新增 `session/set_mode` 调用去"钉死"它
+  （那需要的 RPC 往返/新状态超出了这条分支已经很大的改动面，且今天没有任何代码路径会把模式改成别的
+  值，钉死一个不会被改的东西不是这条修复要解决的问题）；如果未来确有代码开始调用 `session/set_mode`，
+  这个自检会在那一刻立即变成真正的拒绝，而不是继续静默通过。
 
 ## 2. G：Run 回放（FR06）+ 集成收口
 
