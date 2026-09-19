@@ -1,0 +1,62 @@
+name: Acceptance
+
+# W6 验收门禁 (Issue #24, docs/design/05-w6-interfaces.md §2): G01-G21/N01-N18
+# 中可自动化的部分，作为一个独立、明确命名的 PR 检查跑一遍。这些同一批测试
+# 文件（`daemon/tests/acceptance/`、`apps/desktop/tests/acceptance/`）也会被
+# `ci.yml` 的常规 `pytest -q` / `pnpm test` 收集到（`testpaths = ["tests"]` /
+# vitest `include` 都是递归的）——刻意接受这点重复：`ci.yml` 证明"整个仓库的
+# 测试都绿"，这个工作流证明"发布门禁本身绿"，两件事分开看更容易在发布前一眼
+# 确认，值这点重跑的时间。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  daemon-acceptance:
+    name: daemon G/N acceptance gates
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: daemon
+    # 同 ci.yml：`worker` 依赖组指向本机路径，--frozen 跳过对它的重新解析。
+    env:
+      UV_FROZEN: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.10"
+      - name: Install Python 3.12
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync
+      - name: pytest (acceptance only)
+        run: uv run pytest -q tests/acceptance/
+
+  desktop-acceptance:
+    name: desktop G/N acceptance gates
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "10"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: vitest (acceptance only)
+        # apps/desktop/tests/acceptance/*.test.ts each shell out to a scoped
+        # `pnpm exec vitest run <file>` themselves (see tests/acceptance/
+        # _reuse.ts) to re-run the component/store test it cites — needs pnpm
+        # on PATH, which pnpm/action-setup above already provides.
+        run: pnpm exec vitest run tests/acceptance/
