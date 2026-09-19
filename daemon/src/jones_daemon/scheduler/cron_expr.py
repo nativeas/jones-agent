@@ -12,9 +12,20 @@ a Sunday alias, both normalized to `0`). When both day-of-month and day-of-week 
 restricted (neither is a bare `*`), a date matches if *either* one does — standard
 cron semantics, not an AND.
 
-Deliberately minute-resolution and UTC-only: `runs`/`crons.next_run_at` are stored
-as UTC ISO-8601 text (00-foundation.md §4.1), and PRD 12.3's Cron acceptance is
-"分钟级精度", not sub-minute.
+Deliberately minute-resolution; PRD 12.3's Cron acceptance is "分钟级精度", not
+sub-minute.
+
+Timezone: `next_after` itself takes no position on timezone — it matches fields
+against whatever `datetime` (aware or naive, any tzinfo) the caller passes in, and
+returns a result carrying that same tzinfo. `crons.next_run_at` is stored as UTC
+ISO-8601 text (00-foundation.md §4.1) regardless, but *storage format* and *which
+timezone a user's expression is interpreted in* are two different questions — an
+earlier revision of this docstring conflated them (round-1 review #4). The actual
+interpretation decision (fields mean the local system timezone — "0 9 * * *" is
+this machine's 9am, the intuitive reading for a single-user desktop scheduler, not
+UTC 9am) lives in `scheduler/service.py::_next_after_local`, the one place that
+converts UTC<->local around calls into this module; see that function's docstring
+and 04-w5-interfaces.md §2 for the recorded decision.
 """
 
 from __future__ import annotations

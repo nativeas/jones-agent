@@ -115,8 +115,25 @@ def update_cron(
 
 
 def delete_cron(conn: sqlite3.Connection, cron_id: str) -> None:
-    conn.execute("DELETE FROM crons WHERE id = ?", (cron_id,))
-    conn.commit()
+    """Round-1 fix (review #8): `tasks.cron_id` is `REFERENCES crons(id)` with
+    `PRAGMA foreign_keys=ON` (store/db.py), and every dispatch (`create_cron_task`,
+    below) leaves a `tasks` row pointing at this cron — so a bare `DELETE FROM
+    crons` here fails with `sqlite3.IntegrityError` for any cron that has ever
+    fired once. `cron_id` is nullable (001_init.sql), so detach every referencing
+    `tasks` row first; the task itself (and its history) is untouched, it just
+    stops pointing at a cron definition that no longer exists — the same
+    independence `delete()`'s own comment already describes for the *session*
+    a deleted cron dispatched."""
+    try:
+        conn.execute(
+            "UPDATE tasks SET cron_id = NULL, updated_at = ? WHERE cron_id = ?",
+            (now_iso(), cron_id),
+        )
+        conn.execute("DELETE FROM crons WHERE id = ?", (cron_id,))
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
 
 
 def set_cron_next_run_at(conn: sqlite3.Connection, cron_id: str, next_run_at: str | None) -> None:
@@ -187,6 +204,52 @@ def create_cron_task(
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     assert row is not None  # noqa: S101 - just inserted above
     return _task_row(row)
+
+
+def mark_cron_task_status(conn: sqlite3.Connection, task_id: str, *, status: str) -> None:
+    """Round-1 fix (review #5): `create_cron_task` wrote `status='running'` and
+    nothing ever updated it again — every cron-dispatched `tasks` row claimed to
+    be perpetually running, success or failure. Called from `service.py::
+    _record_outcome` once the dispatched Run actually finishes (or is given up
+    on)."""
+    conn.execute(
+        "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+        (status, now_iso(), task_id),
+    )
+    conn.commit()
+
+
+# -- pending permission requests on a dispatched child session -------------------
+
+
+def list_pending_user_permissions(
+    conn: sqlite3.Connection, session_id: str
+) -> list[dict[str, Any]]:
+    """Round-1 fix (review #3): PRD 9.4 "待审动作：推回主会话提醒" — a `gate="user"`
+    permission request against a cron-dispatched child session has nobody
+    subscribed to that session's `permission.requested` broadcast (the user is
+    looking at the main session, not a cron child nobody opened), so without this
+    the request just sits there with no visible reminder anywhere. Plain read
+    against the shared `permission_decisions`/`steps`/`runs` tables (schema-level
+    access, same as this module's other functions — not an import from
+    `sessions/queries.py`, per §1's ownership split).
+
+    Best-effort, not exhaustive: `permission_decisions.step_id` can be `NULL`
+    (`sessions/service.py::_on_request_permission` — no `ctx_turn`/`tool_call_id`
+    tracked for that request), and a `NULL` `step_id` can't be traced back to a
+    session through this join, so such a request won't be relayed. A real,
+    documented gap (see the PR report), not a silent one.
+    """
+    cur = conn.execute(
+        "SELECT pd.id AS decision_id, pd.risk, pd.created_at "
+        "FROM permission_decisions pd "
+        "JOIN steps s ON pd.step_id = s.id "
+        "JOIN runs r ON s.run_id = r.id "
+        "WHERE r.session_id = ? AND pd.gate = 'user' AND pd.decision = 'pending' "
+        "ORDER BY pd.created_at",
+        (session_id,),
+    )
+    return [{k: row[k] for k in row.keys()} for row in cur.fetchall()]
 
 
 # -- system messages posted back to the main session -----------------------------
