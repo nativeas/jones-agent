@@ -59,7 +59,16 @@ trap 'rm -f "$REQS_FILE"' EXIT
 # THE SAME `uv.lock` `uv sync --group worker` resolves from, so every pin here
 # already passed uv's own resolver as one consistent graph; there is no
 # separate "Hermes's lock" being merged in afterward; the export below.
-UV_FROZEN=1 uv export --no-hashes --no-default-groups --group worker \
+#
+# round-1 review fix (评审 #6): no longer `--no-hashes`. `uv export` writes
+# per-artifact hashes straight from `uv.lock`, and `uv pip install -r` verifies
+# them — dropping that (the original `--no-hashes`) meant the third-party
+# dependency closure shipped in every release .dmg (cryptography included) was
+# installed from the network with zero integrity verification. Hashes are now
+# kept, which is also why the local wheel install below moved to its own `uv
+# pip install` call: pip's hash-checking mode requires EVERY requirement in one
+# invocation to carry a hash, and a freshly-built local wheel has none.
+UV_FROZEN=1 uv export --no-default-groups --group worker \
   --format requirements-txt > "$REQS_FILE.raw"
 # Strip the two editable/local-path entries: `-e .` (jones_daemon itself —
 # built as a real wheel below instead) and `-e <hermes-agent path>` (source
@@ -85,11 +94,20 @@ WHEEL="$(ls dist/jones_daemon-*.whl)"
 # x86_64 Rust target installed. This is a real gap, not a benign warning; the
 # command below is left to fail loudly (not caught/retried) so that failure
 # is never silently swallowed into a broken bundle.
+# Third-party deps first, hash-checked against uv.lock (-r "$REQS_FILE" now
+# carries hashes — see the export step above); the local wheel is a separate
+# call below since it has no hash to check against and pip's hash-checking
+# mode requires all-or-nothing within one invocation.
 uv pip install \
   --target "$SITE_PACKAGES" \
   --python-platform "$UV_PLATFORM" \
   --python 3.12 \
-  -r "$REQS_FILE" \
+  -r "$REQS_FILE"
+
+uv pip install \
+  --target "$SITE_PACKAGES" \
+  --python-platform "$UV_PLATFORM" \
+  --python 3.12 \
   "$WHEEL"
 
 INSTALLED_COUNT=$(find "$SITE_PACKAGES" -maxdepth 1 -name '*.dist-info' | wc -l | tr -d ' ')

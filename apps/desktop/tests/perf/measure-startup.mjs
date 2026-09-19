@@ -122,6 +122,11 @@ function machineInfo() {
   }
 }
 
+// round-1 review fix (评审 #2/#5): this used to `metrics.push(...newMetrics)`
+// unconditionally, so two `pnpm run perf` runs on the same day produced 6
+// desktop_* entries instead of 3 (duplicates, not an update) — now upserts by
+// metric `name`, matching the merge-not-overwrite fix on the pytest side
+// (daemon/tests/perf/conftest.py's own round-1 fix).
 function mergePerfReport(newMetrics) {
   fs.mkdirSync(REPORT_DIR, { recursive: true })
   const dateStr = new Date().toISOString().slice(0, 10)
@@ -132,7 +137,7 @@ function mergePerfReport(newMetrics) {
   } else {
     report = {
       date: dateStr,
-      generated_by: 'daemon/tests/perf (pytest) + apps/desktop/tests/perf (electron)',
+      generated_by: 'apps/desktop/tests/perf (electron)',
       machine: machineInfo(),
       idle_window_s: null,
       metrics: [],
@@ -142,7 +147,9 @@ function mergePerfReport(newMetrics) {
   if (!report.generated_by.includes('apps/desktop/tests/perf')) {
     report.generated_by += ' + apps/desktop/tests/perf (electron)'
   }
-  report.metrics.push(...newMetrics)
+  const byName = new Map((report.metrics ?? []).map((m) => [m.name, m]))
+  for (const m of newMetrics) byName.set(m.name, m)
+  report.metrics = Array.from(byName.values())
   report.all_passed = report.metrics.every((m) => m.passed)
   fs.writeFileSync(outPath, JSON.stringify(report, null, 2) + '\n', 'utf-8')
   console.log(`[perf] wrote ${outPath}`)

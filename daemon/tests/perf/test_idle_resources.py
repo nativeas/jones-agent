@@ -29,9 +29,18 @@ _THRESHOLD_RSS_MB = 150.0
 # "≈ 0": daemon 空闲不轮询 (00-foundation.md's own worded requirement, DEV.md 工程
 # 原则 #3). A few ms of CPU time across the window is measurement/scheduler noise
 # (process wakeup for the `ps` probe itself, GC, etc.), not a busy-loop — the
-# threshold below is deliberately far under "1 core saturated for the window"
-# while still well above what a single `ps` sample's own noise floor can produce.
-_THRESHOLD_CPU_S = 0.15
+# rate below is deliberately far under "1 core saturated for the window" while
+# still well above what a single `ps` sample's own noise floor can produce.
+#
+# round-1 review fix (评审 #7): this used to be a flat CPU-seconds threshold
+# (0.15s) applied unchanged regardless of `JONES_PERF_IDLE_WINDOW_S` — fine at
+# the default 2s window, but a *different, 5x stricter* gate at the PRD-literal
+# 10s window (0.15s allowed out of 10s idle, vs. 0.15s out of 2s), and that 10s
+# gate had never actually been run (the committed perf-<date>.json's own
+# idle_window_s is 2, per the report). A rate (CPU-seconds allowed per idle-
+# second) keeps both windows checking the same thing; the rate below preserves
+# today's default-window behavior exactly (0.075 * 2.0 == 0.15).
+_THRESHOLD_CPU_RATE_S_PER_S = 0.075
 
 
 @pytest.fixture(scope="module")
@@ -129,6 +138,7 @@ def test_idle_rss(idle_daemon, perf_record):
 
 def test_idle_cpu_no_wakeups(idle_daemon, perf_record):
     window_s = float(os.environ.get("JONES_PERF_IDLE_WINDOW_S", "2.0"))
+    threshold_s = _THRESHOLD_CPU_RATE_S_PER_S * window_s
     before = _ps_cpu_seconds(idle_daemon.pid)
     time.sleep(window_s)
     after = _ps_cpu_seconds(idle_daemon.pid)
@@ -138,11 +148,12 @@ def test_idle_cpu_no_wakeups(idle_daemon, perf_record):
         "idle_cpu_delta_s",
         delta_s,
         "s",
-        _THRESHOLD_CPU_S,
+        threshold_s,
         "PRD 11.2 空闲 CPU ≈ 0（无任务时不轮询）",
-        detail={"window_s": window_s},
+        detail={"window_s": window_s, "threshold_rate_s_per_s": _THRESHOLD_CPU_RATE_S_PER_S},
     )
     assert passed, (
         f"idle CPU consumed {delta_s:.3f}s of CPU time over a {window_s}s idle window "
-        f"(threshold {_THRESHOLD_CPU_S}s) — daemon may be polling while idle"
+        f"(threshold {threshold_s:.3f}s, rate {_THRESHOLD_CPU_RATE_S_PER_S}s/s) — daemon "
+        "may be polling while idle"
     )

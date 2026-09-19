@@ -19,9 +19,39 @@
 const { execFileSync } = require('node:child_process')
 const path = require('node:path')
 
+// round-1 review fix (评审 #3): this hook used to run sign-adhoc.sh
+// unconditionally, with no check of `mac.identity`. docs/release.md §3 step 2
+// tells a releaser to swap `mac.identity: null` for a real "Developer ID
+// Application" identity so electron-builder signs the .app/Frameworks/Helpers
+// itself — but that alone does nothing about this hook, which would still run
+// sign-adhoc.sh's ad-hoc-only parameters (`--sign -`, `--timestamp=none`)
+// against Contents/Resources/daemon (extraResources — electron-builder's own
+// signing never reaches it, confirmed in sign-adhoc.sh's own comments/spike
+// 02) and, depending on hook ordering, possibly re-sign the WHOLE .app ad-hoc
+// on top of electron-builder's real signature. Either way `notarytool submit`
+// would only fail later, at the worst point to discover it. Real-identity
+// signing of Resources/daemon (sign-adhoc.sh's own documented "正式发布所需
+// 步骤" §3: drop --timestamp=none, use the real identity, no --deep) isn't
+// implemented here — it's never been run against a real certificate — so this
+// fails fast instead of silently shipping an ad-hoc-signed payload.
 exports.default = async function afterPack(context) {
+  const identity = context.packager.config?.mac?.identity
   const appName = `${context.packager.appInfo.productFilename}.app`
   const appPath = path.join(context.appOutDir, appName)
+
+  if (identity) {
+    throw new Error(
+      `[afterPack] mac.identity is set ("${identity}") but afterPack.cjs only ` +
+        'knows how to ad-hoc sign (packaging/sign/sign-adhoc.sh, --sign - ' +
+        '--timestamp=none — never correct with a real identity). Signing ' +
+        'Contents/Resources/daemon with a real Developer ID is documented but ' +
+        'NOT implemented (see sign-adhoc.sh\'s "正式发布所需步骤" §3 and ' +
+        'docs/release.md §3) — implement and verify it against a real ' +
+        'certificate before packaging with mac.identity set, or revert to null ' +
+        'for ad-hoc packaging.'
+    )
+  }
+
   const signScript = path.join(__dirname, '..', 'sign', 'sign-adhoc.sh')
 
   console.log(`[afterPack] ad-hoc signing ${appPath}`)

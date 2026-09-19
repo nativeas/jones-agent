@@ -20,6 +20,19 @@ dedicated invocation opt into the full 10s window when producing the authoritati
 `perf-<date>.json` artifact (see the report for the command used to generate the
 committed one) — the JSON always records which window size actually ran, so the
 artifact is never silently mislabeled.
+
+**round-1 review fix (评审 #2/#5)**: `pytest_sessionfinish` below used to
+`write_text()` the WHOLE file unconditionally — fine the first time a given day's
+`perf-<date>.json` is written, but a plain `pytest tests/perf` (this directory
+alone, no desktop run) after `apps/desktop/tests/perf/measure-startup.mjs` had
+already written its 3 `desktop_*` metrics into the same file silently deleted
+them, because this file's payload only ever contained what *this* run measured.
+`measure-startup.mjs`'s own `mergePerfReport()` reads-then-appends instead, so the
+two writers disagreed about whether the file is "this run's answer" or "every
+run's answers, accumulated" — this is now a merge on both sides, upserted by
+metric `name`, matching semantics: an existing metric on disk survives a run that
+didn't re-measure it, and a metric this run DID measure replaces its own prior
+entry (not append a duplicate — see measure-startup.mjs's own round-1 fix).
 """
 
 from __future__ import annotations
@@ -141,15 +154,56 @@ def _mac_memory_gb() -> float | None:
         return None
 
 
+def _load_existing_report(out_path: Path) -> dict[str, Any] | None:
+    if not out_path.exists():
+        return None
+    try:
+        data = json.loads(out_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:  # noqa: ARG001
     if not _collected:
         return
     _REPORT_DIR.mkdir(parents=True, exist_ok=True)
     date_str = time.strftime("%Y-%m-%d", time.gmtime())
     out_path = _REPORT_DIR / f"perf-{date_str}.json"
+
+    new_metrics = {
+        m.name: {
+            "name": m.name,
+            "value": m.value,
+            "unit": m.unit,
+            "threshold": m.threshold,
+            "threshold_source": m.threshold_source,
+            "passed": m.passed,
+            "detail": m.detail,
+        }
+        for m in _collected
+    }
+
+    # Merge (upsert by metric name), not overwrite — see module docstring's
+    # round-1 review fix: a metric already on disk from another writer (e.g.
+    # apps/desktop/tests/perf) that this run didn't re-measure survives; a
+    # metric this run DID measure replaces (not duplicates) its prior entry.
+    existing = _load_existing_report(out_path)
+    existing_metrics = existing.get("metrics") if existing else None
+    generated_by = existing.get("generated_by", "") if existing else ""
+    if isinstance(existing_metrics, list):
+        merged = {
+            m["name"]: m for m in existing_metrics if isinstance(m, dict) and "name" in m
+        }
+    else:
+        merged = {}
+    merged.update(new_metrics)
+    if "daemon/tests/perf (pytest)" not in generated_by:
+        generated_by = (generated_by + " + daemon/tests/perf (pytest)").strip(" +")
+
     payload = {
         "date": date_str,
-        "generated_by": "daemon/tests/perf (pytest)",
+        "generated_by": generated_by,
         "machine": {
             "platform": platform.platform(),
             "arch": platform.machine(),
@@ -159,18 +213,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:  # n
             "prd_reference_machines": ["Apple M1 / 16GB", "Intel i5 12代 / 16GB"],
         },
         "idle_window_s": float(os.environ.get("JONES_PERF_IDLE_WINDOW_S", "2.0")),
-        "metrics": [
-            {
-                "name": m.name,
-                "value": m.value,
-                "unit": m.unit,
-                "threshold": m.threshold,
-                "threshold_source": m.threshold_source,
-                "passed": m.passed,
-                "detail": m.detail,
-            }
-            for m in _collected
-        ],
-        "all_passed": all(m.passed for m in _collected),
+        "metrics": list(merged.values()),
+        "all_passed": all(m["passed"] for m in merged.values()),
     }
     out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

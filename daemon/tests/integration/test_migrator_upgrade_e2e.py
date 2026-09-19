@@ -4,11 +4,23 @@ JONES_HOME (creating real data — bootstrap default Project/Agent, the main
 Session), then open that same JONES_HOME with the CURRENT build and assert
 everything survived, complete.
 
-"上一版" is the `v0.9-pre` tag (local only, never pushed — see report), created at
-this branch's own merge-base with `main` per 05-w6-interfaces.md §3.3: "用上一发布
-版本（当前 main 的某个 tag 作为「上一版」，若无则 `git tag v0.9-pre` 于 W5 收尾提
-交）". No prior release tag existed on `main` when this branch was cut (checked:
-`git tag --list`, empty), so this is the fallback case.
+"上一版" is the `v0.9-pre` tag, created at this branch's own merge-base with `main`
+per 05-w6-interfaces.md §3.3: "用上一发布版本（当前 main 的某个 tag 作为「上一
+版」，若无则 `git tag v0.9-pre` 于 W5 收尾提交）". No prior release tag existed on
+`main` when this branch was cut (checked: `git tag --list`, empty), so this is the
+fallback case.
+
+**round-1 review fix (评审 #1/#4)**: this tag is local-only — `git ls-remote --tags
+origin` returns zero tags, and there is no repo convention or CI step that pushes
+one. A file collected by plain `uv run pytest -q`/`make check-daemon` that hard-fails
+(the original `_run(["git", "rev-parse", _OLD_TAG])`, an `AssertionError` on a
+missing ref, not a skip) whenever that tag is absent breaks CI on every PR
+(`actions/checkout@v4` doesn't fetch tags by default even if one were pushed) and
+`make check-daemon` on every fresh clone. This is now gated like the repo's other
+real-subprocess/real-checkout e2e tests (`JONES_E2E=1`, see
+`daemon/tests/integration/test_cap_browser_e2e.py`) and the fixture skips (not
+raises) when the tag genuinely isn't there — belt-and-suspenders, since the primary
+guard is that `JONES_E2E` is unset in CI and on a plain clone.
 
 The "old" build runs from a real, separate `git worktree` of that tag with its own
 `uv sync` — not a `PYTHONPATH` trick pointed at this checkout's venv — so it
@@ -22,10 +34,11 @@ test would need (a repo with an actual shipped previous release) and
 for the version-delta *rejection* path, which is exercised directly against the
 migrator with synthetic migration files instead.
 
-Slow (a real `git worktree add` + `uv sync` in a fresh venv): opt out locally with
-`-k "not upgrade_e2e"`, but this is NOT skip-gated the way `JONES_E2E=1` tests are —
-it needs no API key or real Hermes checkout, just git + uv, both of which
-`make check-daemon` already assumes.
+Slow (a real `git worktree add` + `uv sync` in a fresh venv) and now `JONES_E2E`-
+gated like the repo's other real-subprocess e2e tests — it needs no API key or real
+Hermes checkout, just git + uv, but neither should run by default on every
+`pytest -q`/`make check-daemon` given the tag's local-only nature above. Run with
+`JONES_E2E=1 uv run pytest tests/integration/test_migrator_upgrade_e2e.py -v`.
 """
 
 from __future__ import annotations
@@ -43,7 +56,13 @@ from pathlib import Path
 import pytest
 
 _OLD_TAG = "v0.9-pre"
-_REPO_ROOT = Path(__file__).resolve().parents[2]  # .../daemon/tests/.. -> repo root
+_REPO_ROOT = Path(__file__).resolve().parents[3]  # .../daemon/tests/integration/.. -> repo root
+
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("JONES_E2E"),
+    reason="upgrade e2e needs a local-only v0.9-pre tag (never pushed, see module "
+    "docstring): set JONES_E2E=1 to run (see docs/DEV.md)",
+)
 
 
 def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
@@ -61,7 +80,16 @@ def old_build_daemon_dir():
     """A real `git worktree` checked out at `v0.9-pre`, with its own `uv sync`'d
     venv — module-scoped so the (one-time) `uv sync` cost is paid once per test
     run, not once per test."""
-    _run(["git", "-C", str(_REPO_ROOT), "rev-parse", _OLD_TAG])  # fail loudly if missing
+    tag_check = subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), "rev-parse", _OLD_TAG],
+        capture_output=True,
+        text=True,
+    )
+    if tag_check.returncode != 0:
+        pytest.skip(
+            f"{_OLD_TAG} tag not found locally (it is never pushed, see module "
+            "docstring) — nothing to build the 'old' daemon from"
+        )
     worktree_dir = Path(tempfile.mkdtemp(prefix="jones-v09-worktree-"))
     shutil.rmtree(worktree_dir)  # `git worktree add` requires the target not exist
     _run(["git", "-C", str(_REPO_ROOT), "worktree", "add", "--detach", str(worktree_dir), _OLD_TAG])

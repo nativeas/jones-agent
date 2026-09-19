@@ -122,7 +122,11 @@ x86_64 python-build-standalone 产物，只是不能在本机执行验证（没�
      去掉 `--timestamp=none`（改用默认安全时间戳，notarytool 要求）、
      `--sign -` 换成真实 Developer ID、去掉 entitlements 里的
      `disable-library-validation`（改为把这些 `.dylib` 也用同一 Team ID
-     重签）。
+     重签）。**`afterPack.cjs` round-1 评审后已改为在检测到非空 `mac.identity`
+     时直接 fail fast（不会静默继续跑 ad-hoc 签名）**——这一步必须先在
+     `afterPack.cjs` 里实现并用真实证书验证过（本仓库从未做过），否则第 2 步
+     一换证书，打包就会在这里硬停，而不是悄悄产出一个仍然 ad-hoc 签名的
+     `Resources/daemon`。
   4. `xcrun notarytool store-credentials` 存 App 专用密码（不落明文）→
      `xcrun notarytool submit *.dmg --keychain-profile <profile> --wait`。
   5. `xcrun stapler staple *.dmg`。
