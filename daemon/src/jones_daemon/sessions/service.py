@@ -476,7 +476,7 @@ class SessionService:
         """
         project_id = session["project_id"]
         try:
-            cwd = self._cwd_for_project(project_id)
+            cwd = await self._cwd_for_project(project_id)
         except Exception:  # noqa: BLE001 - `_cwd_for_project` is not this
             # branch's function to touch/narrow the failure modes of (its
             # only documented one is `RpcError` for a non-default project —
@@ -739,7 +739,7 @@ class SessionService:
         if session is None:
             return
         try:
-            project_path = self._cwd_for_project(session["project_id"])
+            project_path = await self._cwd_for_project(session["project_id"])
         except RpcError:
             logger.warning(
                 "permission.decide remember='project' requested but this session's project "
@@ -1218,7 +1218,7 @@ class SessionService:
         cwd = None
         if session is not None:
             try:
-                cwd = self._cwd_for_project(project_id)
+                cwd = await self._cwd_for_project(project_id)
             except Exception:  # noqa: BLE001 - see `_refresh_gate_config`'s
                 # matching `except Exception` for why this degrades (never
                 # raises) rather than narrowing to `RpcError`

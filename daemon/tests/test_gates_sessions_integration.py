@@ -20,8 +20,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from jones_daemon.context import DaemonContext, NullProviderResolver
+from jones_daemon.context import DaemonContext
+from jones_daemon.context import ProviderResolver as ProviderResolverProtocol
 from jones_daemon.kernel.plugin.jones_gate import _review_payload
+from jones_daemon.projects.bootstrap import bootstrap_projects_and_agents
 from jones_daemon.sessions import queries
 from jones_daemon.sessions import service as service_module
 from jones_daemon.sessions.service import (
@@ -44,6 +46,23 @@ class FakeServer:
 
     def events(self, method: str) -> list[tuple[str, Any]]:
         return [(sid, p) for sid, m, p in self.broadcasts if m == method]
+
+
+class _StubProviderResolver(ProviderResolverProtocol):
+    """A `ProviderResolver` that always succeeds — stands in for B/#7's real
+    `DaemonProviderResolver` (which needs an actual configured vendor Key) so
+    `_run_turn`'s provider pre-flight check (02-w3-interfaces.md §2) doesn't
+    short-circuit every Turn in this file with a `provider_error` before it
+    ever reaches the gates under test. Same shape as
+    `test_sessions_service.py::_StubProviderResolver` (duplicated, not
+    imported, following this test suite's existing per-file fake convention
+    — see `FakeServer` above)."""
+
+    def resolve(self, model_pref: dict[str, Any] | None) -> Any:
+        return {"provider": "anthropic", "model": "claude-test", "env": {}, "hermes_config": {}}
+
+    def list_models(self, provider: str | None) -> list[dict[str, Any]]:
+        return []
 
 
 class FakeConfigResolver:
@@ -71,6 +90,15 @@ async def _make_service(tmp_path, monkeypatch, *, config=None) -> SessionService
     def _open() -> Any:
         conn = connect(tmp_path / "jones.db")
         apply_pending(conn)
+        # Real daemon startup runs this before the RPC server accepts
+        # connections (see __main__.py) — it fixes `proj_default.path` from
+        # the migration's environment-independent placeholder to a real,
+        # per-machine directory (projects/service.py::ensure_default_
+        # project). `_cwd_for_project` (02-w3-interfaces.md §2 集成收口 #1,
+        # G/#12) now reads that real path via `ProjectService.get()` instead
+        # of a hardcoded default, so this test harness needs the same
+        # bootstrap step `test_sessions_service.py::_make_service` uses.
+        bootstrap_projects_and_agents(conn)
         return conn
 
     conn = await run_in_db_thread(_open)
@@ -80,7 +108,7 @@ async def _make_service(tmp_path, monkeypatch, *, config=None) -> SessionService
         db=conn,
         paths=paths,
         server=FakeServer(),
-        providers=NullProviderResolver(),
+        providers=_StubProviderResolver(),
         config=config if config is not None else FakeConfigResolver(),
     )
     service = SessionService(ctx, worker_cmd=[sys.executable, _FAKE_AGENT])
@@ -420,15 +448,19 @@ async def test_remember_session_persists_an_allow_rule_for_this_session_only(tmp
 
 
 async def test_remember_project_writes_to_the_projects_permissions_json(tmp_path, monkeypatch):
-    # `_cwd_for_project` only resolves DEFAULT_PROJECT_ID today (to the real
-    # machine's home dir — see that method's own docstring); monkeypatching
-    # it to a tmp_path is the same technique
+    # `_cwd_for_project` resolves via `ProjectService.get()` (G/#12); this
+    # test wants a controlled, disposable directory for its `permissions.json`
+    # write rather than whatever the bootstrapped default project's real path
+    # is — same monkeypatch technique
     # test_sessions_service.py::test_unexpected_exception_in_run_turn_still_terminates_the_run
-    # already uses to isolate a project-path-dependent test from that gap,
-    # so this test's `permissions.json` write never touches a real machine.
+    # uses, just async now that `_cwd_for_project` itself is.
     project_path = tmp_path / "project"
     project_path.mkdir()
-    monkeypatch.setattr(SessionService, "_cwd_for_project", lambda self, pid: str(project_path))
+
+    async def _fake_cwd_for_project(self: SessionService, pid: str) -> str:
+        return str(project_path)
+
+    monkeypatch.setattr(SessionService, "_cwd_for_project", _fake_cwd_for_project)
     service = await _make_service(tmp_path, monkeypatch)
     try:
         session_id = await _new_session(service, mode="task")
