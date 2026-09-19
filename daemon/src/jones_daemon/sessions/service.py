@@ -1437,24 +1437,55 @@ class SessionService:
         # the persisted row and broadcasts it now, guaranteeing at least one
         # broadcast for this Run no matter which of the two racing callers'
         # writes landed first or which one got cancelled in between.
+        #
+        # Round-N2 review fix (#3, "新问题"): `runs.status` has THREE non-
+        # 'running' values, not two — `mark_run_completed` (a normal, successful
+        # end of Turn) also flips it to 'completed', and a successfully
+        # completed Run is never added to `_terminated_broadcast_run_ids` (it
+        # never broadcasts `run.terminated` at all). The rebroadcast branch
+        # above therefore has to be scoped to 'terminated' specifically — a
+        # bare `status != 'running'` check would treat every ordinary
+        # completion that reaches this guard (e.g. `_on_worker_crash`'s N07
+        # watchdog racing a Turn that finished successfully a moment earlier)
+        # as "written but never broadcast" and rebuild a `run.terminated` payload
+        # from a row whose `terminated_kind`/`terminated_reason` are NULL —
+        # `classify.classify(kind_hint=None, reason="")` falls through to
+        # `ErrorKind.INTERNAL`, faking an "internal error" termination card
+        # onto a Run that actually finished fine.
         existing = await run_in_db_thread(queries.get_run, self.ctx.db, ctx_turn.run_id)
         if existing is not None and existing["status"] != "running":
-            if ctx_turn.run_id in self._terminated_broadcast_run_ids:
-                logger.debug(
-                    "_terminate_run called for a Run that's already terminated AND "
-                    "broadcast; skipping the duplicate DB write/broadcast",
+            if existing["status"] == "terminated" and existing["terminated_kind"]:
+                if ctx_turn.run_id in self._terminated_broadcast_run_ids:
+                    logger.debug(
+                        "_terminate_run called for a Run that's already terminated AND "
+                        "broadcast; skipping the duplicate DB write/broadcast",
+                        extra={
+                            "detail": {"run_id": ctx_turn.run_id, "status": existing["status"]}
+                        },
+                    )
+                    return
+                logger.warning(
+                    "_terminate_run called for a Run whose DB write already landed but "
+                    "was never broadcast (the writer's own coroutine likely got "
+                    "cancelled between its DB write and its broadcast — R-N1); "
+                    "rebroadcasting from the persisted row instead of dropping "
+                    "run.terminated",
                     extra={"detail": {"run_id": ctx_turn.run_id, "status": existing["status"]}},
                 )
+                await self._rebroadcast_terminated_run(existing)
                 return
-            logger.warning(
-                "_terminate_run called for a Run whose DB write already landed but "
-                "was never broadcast (the writer's own coroutine likely got "
-                "cancelled between its DB write and its broadcast — R-N1); "
-                "rebroadcasting from the persisted row instead of dropping "
-                "run.terminated",
+            # Not a rebroadcast candidate — either the Run completed normally
+            # (`status == 'completed'`) or it's 'terminated' but somehow
+            # missing `terminated_kind` (shouldn't happen; `mark_run_terminated`
+            # always writes it, but this is not the row to guess a fake kind
+            # for). Same no-op as the pre-R-N1 guard: the DB write already
+            # happened once, writing over it again would be the actual bug.
+            logger.debug(
+                "_terminate_run called for a Run that's no longer running and isn't a "
+                "terminated-but-unbroadcast rebroadcast candidate; skipping without a "
+                "duplicate write",
                 extra={"detail": {"run_id": ctx_turn.run_id, "status": existing["status"]}},
             )
-            await self._rebroadcast_terminated_run(existing)
             return
 
         # Issue #22 (04-w5-interfaces.md §4): "run.terminated 的 card 字段统一用
@@ -1546,11 +1577,27 @@ class SessionService:
         `ErrorKind` just for a race this narrow: the outer `kind`/`actions`/
         `retryable` a user actually acts on are unaffected (`BUDGET` and
         `PROVIDER_QUOTA` share the same `("abandon",)` action set).
+
+        Defensive: the caller (`_terminate_run`'s idempotency guard) already
+        only reaches this for `existing["status"] == "terminated"` rows with a
+        non-empty `terminated_kind` (round-N2 review fix #3 — a `'completed'`
+        row has neither, and faking a kind for it would broadcast a bogus
+        `run.terminated` onto a Run that actually finished fine). This function
+        asserts that precondition itself rather than trusting every future
+        caller to keep re-checking it.
         """
         run_id = existing["id"]
         reason = existing["terminated_reason"] or ""
         step_seq = existing["terminated_step_seq"]
         outer_kind = existing["terminated_kind"]
+        if not outer_kind:
+            logger.error(
+                "_rebroadcast_terminated_run called for a run with no "
+                "terminated_kind — refusing to fake one; this indicates a bug "
+                "in the caller's status check, not a real termination to report",
+                extra={"detail": {"run_id": run_id, "status": existing["status"]}},
+            )
+            return
         if classify.is_user_stop(outer_kind):
             card = classify.build_user_card(reason)
         else:

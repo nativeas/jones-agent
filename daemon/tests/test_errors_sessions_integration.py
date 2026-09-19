@@ -543,6 +543,74 @@ async def test_terminate_run_rebroadcasts_after_a_racing_write_gets_cancelled(
         await service.shutdown()
 
 
+async def test_terminate_run_does_not_fake_a_termination_for_a_run_that_completed(
+    tmp_path, monkeypatch
+):
+    """Round-N2 review fix (#3, "新问题"): R-N1's rebroadcast guard above must
+    NOT trigger for `runs.status == 'completed'` — only `mark_run_completed`
+    writes that value (a normal, successful end of Turn), and it's never added
+    to `_terminated_broadcast_run_ids` (a successful completion never
+    broadcasts `run.terminated` at all). Before this fix, a bare `status !=
+    'running'` check treated 'completed' exactly like an unbroadcast
+    'terminated' row and rebuilt a card from `terminated_kind`/
+    `terminated_reason`, both NULL on a completed row — `classify.classify
+    (kind_hint=None, reason="")` falls through to `ErrorKind.INTERNAL`,
+    faking a "internal error" `run.terminated` (with `kind=None` in the
+    payload, violating the `user|error|budget` contract) onto a Run that
+    actually finished fine.
+
+    The real call site this reproduces is `_handle_permission_request`'s
+    approval-timeout branch (best-effort `_terminate_run` call guarded only by
+    `self._active_turns.get(session_id) is ctx_turn`, never by run status) —
+    `_active_turns` isn't popped until `_advance_queue` runs, which is after
+    `_finalize_turn_success` already committed `mark_run_completed`, so that
+    window is real. This test drives `_terminate_run` directly rather than
+    threading a real approval race through `_handle_permission_request`,
+    since the guard being tested lives entirely in `_terminate_run` itself and
+    doesn't care which caller reached it."""
+    service = await _make_service(tmp_path, monkeypatch)
+    try:
+        session_id = await _new_session(service, title="s1")
+        run_id = "run_done01"
+        turn_id = "turn_done01"
+        await run_in_db_thread(
+            service_module.queries.create_turn_and_user_message,
+            service.ctx.db,
+            turn_id=turn_id,
+            message_id="msg_done01",
+            session_id=session_id,
+            text="hello",
+            queued=False,
+        )
+        await run_in_db_thread(
+            service_module.queries.create_run,
+            service.ctx.db,
+            run_id=run_id,
+            turn_id=turn_id,
+            session_id=session_id,
+        )
+        # Stand-in for `_finalize_turn_success` already having committed the
+        # Run as successfully completed before this (late) call arrives.
+        await run_in_db_thread(
+            service_module.queries.mark_run_completed, service.ctx.db, run_id, turn_id
+        )
+        ctx_turn = service_module._TurnContext(
+            turn_id=turn_id, run_id=run_id, session_id=session_id
+        )
+
+        await service._terminate_run(ctx_turn, kind="error", reason="approval timed out")
+
+        # No fake `run.terminated` for a Run that actually completed.
+        assert _terminated(service) == []
+        # And the DB row itself must stay untouched — 'completed', not
+        # overwritten with 'terminated'/NULL-kind garbage.
+        row = await run_in_db_thread(service_module.queries.get_run, service.ctx.db, run_id)
+        assert row["status"] == "completed"
+        assert row["terminated_kind"] is None
+    finally:
+        await service.shutdown()
+
+
 async def test_worker_crash_watchdog_backs_off_when_the_prompt_call_already_reported_it(
     tmp_path, monkeypatch
 ):
