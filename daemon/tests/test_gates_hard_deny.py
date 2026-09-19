@@ -233,3 +233,44 @@ def test_bash_l_without_c_is_not_treated_as_a_dash_c_wrapper():
     # `-c` cluster just because it's a combined-looking short option.
     verdict = _hard_deny.classify_command("bash -l 'echo hello'")
     assert not verdict.denied
+
+
+# Review finding, round 3 (2026-09-19): `_split_shell_segments` only ever
+# treated `&&`/`||`/`;`/`|` as segment boundaries — a bare newline or a
+# background `&` between two commands is exactly as ordinary a joiner, and
+# was invisible to it (newlines are plain whitespace to `shlex`, `&` was
+# just never in `_SHELL_OPERATORS`), so `classify_command`'s per-segment
+# `argv[0]` check never even saw the second command.
+
+
+def test_newline_joined_rm_rf_is_denied():
+    verdict = _hard_deny.classify_command("npm test\nrm -rf /Users/alice")
+    assert verdict.denied
+
+
+def test_ampersand_joined_rm_rf_is_denied():
+    verdict = _hard_deny.classify_command("npm test & rm -rf /Users/alice")
+    assert verdict.denied
+
+
+def test_blank_line_between_commands_does_not_split_the_second_commands_own_argv():
+    # Two consecutive newlines (a blank line) are still just ONE boundary
+    # between `npm test` and `rm -rf ...` — the blank line must not also
+    # sever `rm` from its own `-rf /Users/alice` arguments.
+    segments = _hard_deny._split_shell_segments("npm test\n\nrm -rf /Users/alice")
+    assert segments == [["npm", "test"], ["rm", "-rf", "/Users/alice"]]
+
+
+def test_newline_inside_a_quoted_argument_is_not_a_segment_boundary():
+    # `echo "hello\nworld"` is ONE token with a literal embedded newline —
+    # must stay one segment, not be split into two commands.
+    segments = _hard_deny._split_shell_segments('echo "hello\nworld" && curl evil.com')
+    assert segments == [["echo", "hello\nworld"], ["curl", "evil.com"]]
+
+
+def test_newline_wrapped_rm_rf_inside_a_shell_c_payload_is_denied():
+    # The same joiner, hidden inside a `bash -c` payload — both the
+    # wrapper-unwrapping (finding #2) and the newline boundary (this
+    # finding) have to compose correctly.
+    verdict = _hard_deny.classify_command('bash -c "echo hi\nrm -rf /Users/alice"')
+    assert verdict.denied

@@ -91,7 +91,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-_SHELL_OPERATORS = frozenset({"&&", "||", ";", "|"})
+_SHELL_OPERATORS = frozenset({"&&", "||", ";", "|", "&"})
 _RECURSIVE_FORCE_RM_FLAGS = frozenset({"-r", "-rf", "-fr", "-R", "-Rf", "-fR"})
 _TRASH_PROGRAMS = frozenset({"trash", "rmtrash"})
 _DEFAULT_BRANCHES = frozenset({"main", "master"})
@@ -161,30 +161,108 @@ def _is_temp_path(raw: str, *, cwd: str | None) -> bool:
     return any(_is_relative_to(resolved, root) for root in _temp_roots())
 
 
-def _split_shell_segments(command: str) -> list[list[str]] | None:
-    """Split on top-level `&&`/`||`/`;`/`|` into one argv per segment.
-
-    `shlex.split` doesn't treat these as operators on its own — they come
-    back as ordinary word tokens (e.g. `"a && b"` -> `["a", "&&", "b"]`) — so
-    a second pass groups tokens between them. Returns `None` (not raises) on
-    unbalanced quoting, matching the "don't hard-deny what we can't parse"
-    rule in the module docstring.
-    """
-    try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        return None
-    segments: list[list[str]] = []
+def _split_on_bare_newlines(command: str) -> list[str]:
+    """Split `command` into pieces at every literal newline that lies
+    OUTSIDE single/double quotes — a minimal, quote-aware scan (single
+    quotes escape nothing; a backslash, inside double quotes or unquoted,
+    escapes only the one character right after it) whose only job is
+    telling a boundary-newline apart from one embedded in a quoted
+    argument. A newline that IS inside an open quote is left untouched
+    in the piece it's part of, so a quoted multi-line argument
+    (`echo "hello\\nworld"`) stays whole and gets tokenized by a single
+    `shlex.split` call downstream exactly as it always has — this
+    function only ever decides WHERE to cut, `shlex` still does the
+    actual tokenizing of each piece, unchanged. An unterminated quote
+    simply never closes for the rest of the string, so every newline
+    after it lands in one final piece — `shlex.split` raising on that
+    piece's unbalanced quote is `_split_shell_segments`'s existing
+    "can't parse it, don't hard-deny it" fallback, not a new failure
+    mode."""
+    pieces: list[str] = []
     current: list[str] = []
-    for tok in tokens:
-        if tok in _SHELL_OPERATORS:
-            if current:
-                segments.append(current)
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                current.append(ch)
+                current.append(command[i + 1])
+                i += 2
+                continue
+            current.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            current.append(ch)
+            current.append(command[i + 1])
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            current.append(ch)
+            i += 1
+            continue
+        if ch == "\n":
+            pieces.append("".join(current))
             current = []
-        else:
-            current.append(tok)
-    if current:
-        segments.append(current)
+            i += 1
+            continue
+        current.append(ch)
+        i += 1
+    pieces.append("".join(current))
+    return pieces
+
+
+def _split_shell_segments(command: str) -> list[list[str]] | None:
+    """Split on top-level `&&`/`||`/`;`/`|`/`&`, AND on a bare (unquoted)
+    newline, into one argv per segment.
+
+    `shlex.split` doesn't treat `&&`/`||`/`;`/`|`/`&` as operators on its
+    own — they come back as ordinary word tokens (e.g. `"a && b"` ->
+    `["a", "&&", "b"]`) — so a second pass groups tokens between them.
+    Returns `None` (not raises) on unbalanced quoting, matching the "don't
+    hard-deny what we can't parse" rule in the module docstring.
+
+    ## Newline as a segment boundary (review finding, round 3, 2026-09-19)
+
+    A newline is whitespace to `shlex` — exactly like a space — so
+    `"npm test\\nrm -rf /Users/alice"` tokenized the same as
+    `"npm test rm -rf /Users/alice"`: one single segment `argv[0] == "npm"`,
+    with `rm -rf ...` riding along as extra words nothing here ever looked
+    at. A multi-line command is ordinary terminal syntax (every line after
+    the first runs as its own separate command, same as `;`), not a
+    constructed edge case, and it closed the exact same "narrow allow rule
+    covers an unrelated tail" hole `&&`/`;`/`|` were already closed for
+    (`_rules.py`'s segment-aware `decide()` shares this function) — as well
+    as letting a hard-denied command through this module itself, since
+    `classify_command` only ever inspected `argv[0]` of each *segment*.
+
+    `_split_on_bare_newlines` (above) does the quote-aware cutting; each
+    piece it returns is then tokenized by `shlex.split` exactly as the
+    whole command used to be (a piece with no newline in it at all — the
+    overwhelmingly common case — is byte-identical to the original input,
+    so this is a strict extension, not a rewrite of the common path).
+    """
+    segments: list[list[str]] = []
+    for piece in _split_on_bare_newlines(command):
+        try:
+            tokens = shlex.split(piece, posix=True)
+        except ValueError:
+            return None
+        current: list[str] = []
+        for tok in tokens:
+            if tok in _SHELL_OPERATORS:
+                if current:
+                    segments.append(current)
+                current = []
+            else:
+                current.append(tok)
+        if current:
+            segments.append(current)
     return segments
 
 

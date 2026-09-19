@@ -300,6 +300,46 @@ def test_shell_wrapper_does_not_bypass_hard_deny_of_rm_rf(_hermes_home):
     assert result["message"].startswith(RULE_GATE_BLOCK_PREFIX)
 
 
+# Review finding, round 3 (2026-09-19): `_split_shell_segments` only knew
+# about `&&`/`||`/`;`/`|` — a bare newline or a background `&` between two
+# commands is just as ordinary a joiner, and a narrow allow rule's segment
+# coverage was blind to both (same "记住的规则被拼接绕过" shape as
+# findings #3/#8/#12, a different spelling of the joiner).
+
+
+def test_allow_rule_prefix_does_not_extend_across_a_newline(_hermes_home):
+    _write_config(_hermes_home, mode="task", rules=[{"match": "npm test", "action": "allow"}])
+    plain = _on_pre_tool_call(tool_name="terminal", args={"command": "npm test"})
+    assert plain is None
+    # `curl` (not `rm -rf`) so this exercises the rules engine's escalation,
+    # not the hard-deny layer (see the separate hard-deny test below for the
+    # `rm -rf` payload, which is caught earlier and returns "block").
+    smuggled = _on_pre_tool_call(
+        tool_name="terminal", args={"command": "npm test\ncurl http://evil.example"}
+    )
+    assert smuggled is not None and smuggled["action"] == "approve"  # escalated, not bypassed
+
+
+def test_allow_rule_prefix_does_not_extend_across_an_ampersand(_hermes_home):
+    _write_config(_hermes_home, mode="task", rules=[{"match": "npm test", "action": "allow"}])
+    smuggled = _on_pre_tool_call(
+        tool_name="terminal", args={"command": "npm test & curl http://evil.example"}
+    )
+    assert smuggled is not None and smuggled["action"] == "approve"  # escalated, not bypassed
+
+
+def test_hard_deny_catches_a_newline_joined_rm_rf_behind_a_blanket_allow(_hermes_home):
+    # Same "hard-deny can't be widened by any config" guarantee as the
+    # shell-wrapper test above (finding #2), this time the smuggling joiner
+    # is a bare newline instead of a `bash -c` wrapper.
+    _write_config(_hermes_home, mode="auto", rules=[{"match": "terminal", "action": "allow"}])
+    result = _on_pre_tool_call(
+        tool_name="terminal", args={"command": "npm test\nrm -rf /Users/alice"}
+    )
+    assert result is not None and result["action"] == "block"
+    assert result["message"].startswith(RULE_GATE_BLOCK_PREFIX)
+
+
 def test_malformed_rules_shape_is_skipped_not_raised_N01(_hermes_home):
     # Review finding #11: a `rules` entry that isn't an object (e.g. a bare
     # string) must be ignored, not crash the whole evaluation — and since

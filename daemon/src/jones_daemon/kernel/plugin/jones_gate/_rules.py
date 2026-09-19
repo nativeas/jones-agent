@@ -88,6 +88,31 @@ stays honest — inventing a fifth, informal boundary there would blur what
     segment(s), to a bounded depth (`_MAX_SUBSTITUTION_DEPTH`) matching
     `_hard_deny.py`'s own recursion cap. Best-effort, not a shell parser —
     see `_extract_substitution_texts`'s own docstring for how it degrades.
+
+## `&` and bare newlines as joiners (review finding, round 3, 2026-09-19)
+
+Round 1/2 above both frame the fix as "make every joiner a segment
+boundary" but `_split_shell_segments` itself only ever recognized
+`&&`/`||`/`;`/`|` — a background-job `&` and a plain newline between two
+commands (`"npm test\nrm -rf /Users/alice"`, `"npm test & curl evil.com"`)
+are exactly as ordinary a shell joiner as `;`, and were invisible to the
+splitter the same way `$(...)`/`>` were before round 2: a narrow allow rule
+for `npm test` still matched the leading tokens of the single segment
+`shlex` handed back and returned `allow` for the whole thing, tail
+included — same hole, different spelling of the joiner, and (unlike the
+round-2 gap, which was allow-only) this one also let a hard-denied command
+straight through `_hard_deny.classify_command` itself, since that function
+only ever inspected `argv[0]` of each *segment*.
+
+`_hard_deny._split_shell_segments` (still the single shared implementation
+both this module and `_hard_deny.py` call) now also treats `&` as a
+segment-boundary operator and a bare newline between two tokens (not one
+embedded inside a quoted token — see that function's own docstring for how
+it tells the two apart) as a segment boundary. Nothing in this module
+changed: `decide()`'s allow-every-segment / deny-any-segment loop already
+iterates whatever segments `_split_shell_segments` returns, so it picks up
+the extra boundaries for free, the same way it picked up `&&`/`;`/`|` in
+round 1.
 """
 
 from __future__ import annotations
