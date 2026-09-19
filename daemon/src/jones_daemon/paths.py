@@ -76,6 +76,20 @@ def projects_dir() -> Path:
     return _ensure(user_root() / "projects")
 
 
+def project_attachments_dir(project_id: str, *, create: bool = True) -> Path:
+    """`<user_root>/projects/<project-id>/` — PRD 10.2's per-Project attachments
+    directory (user uploads, agent-generated files/media). Named accessor for what
+    `projects/service.py`/`store/maintenance.py` previously spelled out ad hoc as
+    `paths.projects_dir() / project_id` — same path, just given a name so the two
+    real deletion (Issue #23) has one obvious place to point at rather than
+    re-deriving the join. `create=False` mirrors `project_root`'s read-only
+    contract: a caller only checking "does this Project have any attachments"
+    (e.g. before deleting it) must not resurrect the directory by asking."""
+    if not create:
+        return projects_dir() / project_id
+    return _ensure(projects_dir() / project_id)
+
+
 def memory_global_dir() -> Path:
     _ensure_root()
     return _ensure(user_root() / "memory" / "global")

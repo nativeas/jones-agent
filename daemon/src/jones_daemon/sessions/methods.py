@@ -22,6 +22,7 @@ from jones_daemon.context import DaemonContext
 from jones_daemon.rpc.errors import INVALID_PARAMS, RpcError
 from jones_daemon.rpc.server import Connection, RpcServer
 from jones_daemon.sessions.service import SessionService
+from jones_daemon.store import maintenance, run_in_db_thread
 
 
 def _require_str(params: dict[str, Any], key: str) -> str:
@@ -131,6 +132,40 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
             )
         return await service.run_payload(_require_str(params, "ref"), offset=offset, limit=limit)
 
+    async def session_delete(params: dict[str, Any], conn: Connection) -> Any:
+        # Issue #23 (04-w5-interfaces.md §5, G20 真删) — calls straight into
+        # `store/maintenance.py` rather than through `SessionService`: this
+        # branch's contract only grants it `sessions/methods.py`, not
+        # `sessions/service.py` (04-w5-interfaces.md §1's per-branch ownership
+        # table), so the cascade-delete + refusal rules live entirely in
+        # `maintenance.delete_session` and this handler is a thin
+        # params -> call translation, same shape as every other handler here.
+        session_id = _require_str(params, "id")
+        user_root = ctx.paths.user_root()
+        await run_in_db_thread(maintenance.delete_session, ctx.db, user_root, session_id)
+        return {"deleted": True}
+
+    async def session_export(params: dict[str, Any], conn: Connection) -> Any:
+        session_id = _require_str(params, "id")
+        delete_after = params.get("delete_after", False)
+        if not isinstance(delete_after, bool):
+            raise RpcError(
+                INVALID_PARAMS, "'delete_after' must be a boolean", {"params": params}
+            )
+        path = await run_in_db_thread(
+            maintenance.export_session,
+            ctx.db,
+            ctx.paths.user_root(),
+            session_id,
+            delete_after=delete_after,
+        )
+        return {"path": str(path)}
+
+    async def run_delete(params: dict[str, Any], conn: Connection) -> Any:
+        run_id = _require_str(params, "run_id")
+        await run_in_db_thread(maintenance.delete_run, ctx.db, ctx.paths.user_root(), run_id)
+        return {"deleted": True}
+
     async def permission_pending(params: dict[str, Any], conn: Connection) -> Any:
         return await service.permission_pending(params.get("session_id"))
 
@@ -153,11 +188,14 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
     server.register("session.queue_reorder", session_queue_reorder)
     server.register("session.subscribe", session_subscribe)
     server.register("session.unsubscribe", session_unsubscribe)
+    server.register("session.delete", session_delete)
+    server.register("session.export", session_export)
     server.register("turn.messages", turn_messages)
     server.register("run.list", run_list)
     server.register("run.get", run_get)
     server.register("run.steps", run_steps)
     server.register("run.payload", run_payload)
+    server.register("run.delete", run_delete)
     server.register("permission.pending", permission_pending)
     server.register("permission.decide", permission_decide)
     return service

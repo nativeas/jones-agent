@@ -92,6 +92,17 @@ def _backup_before_migrating(conn: sqlite3.Connection, target_version: int) -> P
     backup_path = db_file.with_name(f"{db_file.name}.bak-{target_version}-{time.time_ns()}")
     shutil.copy2(db_file, backup_path)
     logger.info("db backed up before migration", extra={"detail": {"backup": str(backup_path)}})
+
+    # PRD §10.3/04-w5-interfaces.md §5: "迁移备份 jones.db.bak-* 保留最近 5 份" —
+    # prune right after a successful backup, not on some separate schedule, so the
+    # backup count never grows unbounded across repeated upgrades. Imported here
+    # (not at module scope) to avoid a store/migrator.py <-> store/maintenance.py
+    # import cycle risk: maintenance.py does not import this module, but keeping
+    # the dependency one-directional and lazily-resolved costs nothing and avoids
+    # ever having to reason about it either way.
+    from jones_daemon.store.maintenance import rotate_backups
+
+    rotate_backups(db_file)
     return backup_path
 
 

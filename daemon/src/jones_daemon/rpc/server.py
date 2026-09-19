@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import json
 import os
+from collections import deque
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,13 @@ MAX_LINE_BYTES = 16 * 1024 * 1024
 #   realistic simultaneous request count for a single-user daemon.
 MAX_INFLIGHT_PER_CONNECTION = 16
 MAX_INFLIGHT_GLOBAL = 64
+
+# Issue #23 (04-w5-interfaces.md §5): the startup Key-redaction self-check scans
+# "最近 100 条 RPC 响应样本" alongside log files — this is that buffer's size. A
+# plain bounded ring, not a persisted log: it only ever needs to answer "did a
+# response body in the recent past contain a configured key", never survive a
+# restart.
+RECENT_RESPONSES_MAXLEN = 100
 
 
 def _peek_request_id(line: bytes) -> Any:
@@ -117,9 +125,21 @@ class RpcServer:
         # set: connections add themselves in `_handle_client` and remove
         # themselves in its `finally`, both on the event loop thread.
         self._connections: set[Connection] = set()
+        # Additive, Issue #23 (04-w5-interfaces.md §5): the last
+        # RECENT_RESPONSES_MAXLEN response bodies (success or error) this server
+        # sent, fed to the startup Key-redaction self-check
+        # (`store/maintenance.py::startup_key_redaction_self_check`). A `deque`
+        # with `maxlen` set drops the oldest entry itself on overflow — no
+        # separate trim step, and no unbounded growth for a long-lived daemon.
+        self._recent_responses: deque[str] = deque(maxlen=RECENT_RESPONSES_MAXLEN)
 
     def register(self, method: str, handler: Handler) -> None:
         self._methods[method] = handler
+
+    def recent_response_samples(self) -> list[str]:
+        """Snapshot of the last `RECENT_RESPONSES_MAXLEN` response bodies sent —
+        see `_recent_responses`'s docstring."""
+        return list(self._recent_responses)
 
     async def broadcast(self, session_id: str, method: str, params: Any) -> None:
         """Push a notification to every connection currently subscribed to
@@ -148,17 +168,18 @@ class RpcServer:
 
     async def broadcast_all(self, method: str, params: Any) -> None:
         """Push a notification to EVERY currently-connected client, regardless
-        of `session.subscribe` state (controller ruling R-H3, Issue #17/#19).
+        of `session.subscribe` state (controller ruling R-H3, Issue #17/#19;
+        design §4.2: `daemon.error`, "永不静默" — a leaked-key hit from the
+        startup redaction self-check, Issue #23, is exactly this shape too).
 
         `broadcast()` above only reaches connections subscribed to one
         specific `session_id` — right for a per-session event like `message.
-        delta`, wrong for a daemon-wide `daemon.error` a client should see
-        even if it hasn't subscribed to (or has a different session focused
-        than) the one that triggered it (e.g. `mcp_server_down`/
-        `capability_drift`, 00-foundation.md §4.3's "永不静默" for exactly this
-        reason). Same additive-only, best-effort-per-connection shape as
-        `broadcast()` (01-w2-interfaces.md §2 "加法不改法" — this file is the
-        one every W2+ branch may extend, never rewrite)."""
+        delta`, wrong for a daemon-wide notification a client should see even
+        if it hasn't subscribed to (or has a different session focused than)
+        the one that triggered it (e.g. `mcp_server_down`/`capability_drift`).
+        Same additive-only, best-effort-per-connection shape as `broadcast()`
+        (01-w2-interfaces.md §2 "加法不改法" — this file is the one every
+        W2+ branch may extend, never rewrite)."""
         targets = list(self._connections)
         for conn in targets:
             try:
@@ -310,7 +331,9 @@ class RpcServer:
             return
 
         if req_id is not None:
-            await conn._send({"jsonrpc": "2.0", "id": req_id, "result": result})
+            response = {"jsonrpc": "2.0", "id": req_id, "result": result}
+            self._recent_responses.append(json.dumps(response, ensure_ascii=False))
+            await conn._send(response)
 
     async def _respond_error(
         self,
@@ -323,4 +346,6 @@ class RpcServer:
         error: dict[str, Any] = {"code": code, "message": message}
         if detail is not None:
             error["data"] = detail
-        await conn._send({"jsonrpc": "2.0", "id": req_id, "error": error})
+        response = {"jsonrpc": "2.0", "id": req_id, "error": error}
+        self._recent_responses.append(json.dumps(response, ensure_ascii=False))
+        await conn._send(response)

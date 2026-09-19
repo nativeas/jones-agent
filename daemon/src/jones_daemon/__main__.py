@@ -36,7 +36,8 @@ from jones_daemon.secrets.vault import build_default_vault
 from jones_daemon.service import maybe_handle_cli
 from jones_daemon.sessions import methods as sessions_methods
 from jones_daemon.skills.methods import register as register_skills
-from jones_daemon.store import apply_pending, connect, run_in_db_thread
+from jones_daemon.store import apply_pending, connect, maintenance, run_in_db_thread
+from jones_daemon.store.methods import register as register_store
 
 logger = get_logger("main")
 
@@ -132,6 +133,7 @@ async def _run() -> None:
         register_agents(server, ctx)
         register_skills(server, ctx)
         register_capabilities(server, ctx)  # Issue #17/#19 daemon 侧: `capability.list`
+        register_store(server, ctx)  # Issue #23: daemon.clear_cache
         session_service = sessions_methods.register(server, ctx)
         register_daemon_status(server, session_service)  # 02-w3-interfaces.md §2 集成收口 #2
         await session_service.startup()
@@ -147,6 +149,34 @@ async def _run() -> None:
             extra={"detail": {"sock": str(paths.sock_file()), "pid": os.getpid()}},
         )
 
+        # Issue #23 (04-w5-interfaces.md §5): logs/ 滚动 7 天 — a low-frequency
+        # background sweep, same shape/lifecycle as replay/retention.py's payload
+        # sweep (owned by G/#12, not touched here).
+        log_rotation_task = asyncio.create_task(maintenance.run_log_rotation_loop(paths.logs_dir()))
+
+        async def _on_redaction_hit(code: str, message: str, detail: dict) -> None:
+            payload = {"code": code, "message": message, "detail": detail}
+            await server.broadcast_all("daemon.error", payload)
+
+        async def _run_startup_redaction_check() -> None:
+            # 启动期 Key 脱敏自检 (04-w5-interfaces.md §5, G03/N02): a failure to
+            # *run* the check (e.g. the vault file exists but its data key is
+            # unavailable) is logged, not fatal to daemon startup — a malfunctioning
+            # self-check must not itself become an outage; a real *hit* (a key
+            # actually found unredacted) is what must never be silent, via
+            # `_on_redaction_hit` -> `daemon.error` above.
+            try:
+                await maintenance.startup_key_redaction_self_check(
+                    vault=vault,
+                    logs_dir=paths.logs_dir(),
+                    recent_response_samples=server.recent_response_samples(),
+                    on_hit=_on_redaction_hit,
+                )
+            except Exception:  # noqa: BLE001 - see comment above: log, don't crash startup
+                logger.error("startup key-redaction self-check failed to run", exc_info=True)
+
+        redaction_check_task = asyncio.create_task(_run_startup_redaction_check())
+
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -157,8 +187,13 @@ async def _run() -> None:
         logger.info("shutting down", extra={"detail": {}})
 
         serve_task.cancel()
+        log_rotation_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await serve_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await log_rotation_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await redaction_check_task
         await server.stop()
         # Stop dispatching new cron triggers before tearing `session_service`
         # down — it dispatches through that service's public methods and must

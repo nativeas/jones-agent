@@ -70,6 +70,7 @@ Electron main ──(socket client)──> daemon
 |---|---|---|
 | `daemon.ping` | — | `{version, pid, uptime_s}` |
 | `daemon.status` | — | `{sessions_active, workers, memory_mb}` |
+| `daemon.clear_cache` | — | `{cleared: int}` — 一键清空 `cache/`（PRD 10.3，issue #23） |
 | `project.list` / `project.create` / `project.delete` | `{path}` | `Project` |
 | `agent.list` / `agent.get` / `agent.upsert` / `agent.delete` | `Agent` | `Agent` |
 | `session.list` | `{project_id?}` | `Session[]` |
@@ -79,8 +80,11 @@ Electron main ──(socket client)──> daemon
 | `session.send` | `{id, text, attachments?}` | `{turn_id, queued: bool}` — 运行中则入队（PRD 9.2） |
 | `session.queue` / `session.queue_remove` / `session.queue_reorder` | `{id, ...}` | `QueueItem[]` |
 | `session.stop` | `{id}` | `{stopped: bool}` — 用户终止（PRD 9.3） |
+| `session.delete` | `{id}` | `{deleted: bool}` — 真删（G20，issue #23）：级联 turns/messages/runs/steps/permission_decisions/queue_items，拒绝主会话与仍有子会话/运行中 Run 的会话 |
+| `session.export` | `{id, delete_after?: bool}` | `{path: string}` — 导出该 Session 为 JSON（PRD 10.3「导出」），`delete_after` 导出成功后调用 `session.delete`（issue #23） |
 | `turn.messages` | `{session_id, before?, limit}` | `Message[]` |
 | `run.get` / `run.steps` | `{run_id}` | `Run` / `Step[]`（回放数据源） |
+| `run.delete` | `{run_id}` | `{deleted: bool}` — 真删单个 Run（G20，issue #23）：级联 steps/permission_decisions，拒绝运行中的 Run |
 | `permission.pending` | `{session_id?}` | `PermissionRequest[]` |
 | `permission.decide` | `{request_id, decision: "allow"\|"deny", remember?: "session"\|"project"}` | `PermissionDecision` |
 | `provider.list` / `provider.set_key` / `provider.delete_key` | `{provider, key?}` | `{provider, has_key, key_hint}`（hint 只给末 4 位，PRD FR04） |
@@ -143,6 +147,8 @@ title=cron 名)` 与失败/完成/停用推回主会话的系统消息都需要�
 ## 6. 路径（PRD 10.2）
 
 `paths.py` 提供 `user_root()`（默认 `~/.jones`，可用 `JONES_HOME` 覆盖，测试用）、`project_root(project_path)` → `<project>/.jones`，以及各子目录访问器；所有目录首次访问时创建。
+
+**追加（issue #23，2026-09-19）**：新增访问器 `project_attachments_dir(project_id, *, create=True)` → `<user_root>/projects/<project-id>/`——PRD 10.2 用户级树里 `projects/<project-id>/` 那一条（`projects/service.py`/`store/maintenance.py` 此前把这个 join 手写在各自调用点，现在有名字了）。`daemon/tests/test_storage_paths_audit.py` 把 `paths.py` 的每个公开访问器与本节+PRD 10.2 的目录树逐条对照（用户级、项目级各一张表 + 一个"没有多余访问器"的兜底断言），新增/删掉任何访问器都会让它先失败，不需要再手动维护一份影子清单。
 
 ## 7. 待 spike 决定的开放点
 
