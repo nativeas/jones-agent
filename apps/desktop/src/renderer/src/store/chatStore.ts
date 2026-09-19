@@ -38,10 +38,14 @@ interface ChatState {
   bindSession(transport: RpcTransport, sessionId: string): Promise<void>
   unbindSession(): void
   send(text: string): Promise<{ queued: boolean } | null>
-  /** PRD 9.3 错误终止卡片的"重试"：重发最近一条用户消息。 */
-  retryLastMessage(): Promise<{ queued: boolean } | null>
-  /** PRD 9.3 错误终止卡片的"放弃"：只是关闭这张卡片，run 早已终止，没有服务端动作可做。 */
-  dismissTermination(runId: string): void
+  /** Issue #22 (04-w5-interfaces.md §4) 错误卡片"重试" — `session.retry
+   * {action:"retry"}`，daemon 用原 Turn 的用户消息发起一个新 Turn。 */
+  retryTermination(turnId: string): Promise<void>
+  /** 错误卡片"换模型" — `session.retry {action:"retry", model_override}`。 */
+  switchModelTermination(turnId: string, override: { provider: string; model: string }): Promise<void>
+  /** 错误卡片"放弃" — `session.retry {action:"abandon"}`：daemon 清掉该 Session
+   * 排队中的后续指令并标记 Run/Turn（04-w5-interfaces.md §4），不只是本地隐藏。 */
+  abandonTermination(turnId: string): Promise<void>
   stop(): Promise<void>
   removeQueueItem(itemId: string): Promise<void>
   reorderQueue(orderedIds: string[]): Promise<void>
@@ -50,6 +54,20 @@ interface ChatState {
     decision: 'allow' | 'deny',
     remember?: 'session' | 'project'
   ): Promise<void>
+}
+
+/** The original user message text for `turnId`, read back from the client's
+ * own timeline — `session.retry`'s "用户消息复用" (Issue #22) reuses whatever
+ * text the daemon already has for that Turn, and the renderer already has the
+ * same text locally (it's how the failed Turn got there in the first place),
+ * so this avoids a round trip just to echo it back optimistically. */
+function findUserMessageText(timeline: TimelineEntry[], turnId: string): string | null {
+  for (const entry of timeline) {
+    if (entry.kind === 'message' && entry.message.turn_id === turnId && entry.message.role === 'user') {
+      return entry.message.content.text
+    }
+  }
+  return null
 }
 
 function upsertTimeline(timeline: TimelineEntry[], entry: TimelineEntry): TimelineEntry[] {
@@ -319,21 +337,71 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     return res.result
   },
 
-  async retryLastMessage() {
-    const { timeline } = get()
-    for (let i = timeline.length - 1; i >= 0; i -= 1) {
-      const entry = timeline[i]
-      if (entry?.kind === 'message' && entry.message.role === 'user') {
-        return get().send(entry.message.content.text)
-      }
+  async retryTermination(turnId) {
+    const { transport, activeSessionId, timeline } = get()
+    if (!transport || !activeSessionId) return
+    const originalText = findUserMessageText(timeline, turnId)
+    const res = await transport.call<{ turn_id: string; queued: boolean }>('session.retry', {
+      id: activeSessionId,
+      turn_id: turnId,
+      action: 'retry'
+    })
+    if (!res.ok || !res.result) {
+      set({ error: res.message ?? '重试失败' })
+      return
     }
-    return null
+    // Same optimistic local echo as send() (see its own comment) — the daemon
+    // has no "message created" notification for the user's own turn even when
+    // that turn was started by session.retry rather than session.send.
+    if (!res.result.queued && originalText) {
+      const message: Message = {
+        id: `local_${res.result.turn_id}`,
+        session_id: activeSessionId,
+        turn_id: res.result.turn_id,
+        role: 'user',
+        content: { kind: 'text', text: originalText },
+        seq: get().timeline.length
+      }
+      set((state) => ({ timeline: upsertTimeline(state.timeline, { kind: 'message', message }) }))
+    }
   },
 
-  dismissTermination(runId) {
-    set((state) => ({
-      timeline: state.timeline.filter((e) => !(e.kind === 'termination' && e.card.run_id === runId))
-    }))
+  async switchModelTermination(turnId, override) {
+    const { transport, activeSessionId, timeline } = get()
+    if (!transport || !activeSessionId) return
+    const originalText = findUserMessageText(timeline, turnId)
+    const res = await transport.call<{ turn_id: string; queued: boolean }>('session.retry', {
+      id: activeSessionId,
+      turn_id: turnId,
+      action: 'retry',
+      model_override: override
+    })
+    if (!res.ok || !res.result) {
+      set({ error: res.message ?? '换模型重试失败' })
+      return
+    }
+    if (!res.result.queued && originalText) {
+      const message: Message = {
+        id: `local_${res.result.turn_id}`,
+        session_id: activeSessionId,
+        turn_id: res.result.turn_id,
+        role: 'user',
+        content: { kind: 'text', text: originalText },
+        seq: get().timeline.length
+      }
+      set((state) => ({ timeline: upsertTimeline(state.timeline, { kind: 'message', message }) }))
+    }
+  },
+
+  async abandonTermination(turnId) {
+    const { transport, activeSessionId } = get()
+    if (!transport || !activeSessionId) return
+    const res = await transport.call('session.retry', {
+      id: activeSessionId,
+      turn_id: turnId,
+      action: 'abandon'
+    })
+    if (!res.ok) set({ error: res.message ?? '放弃失败' })
   },
 
   async stop() {

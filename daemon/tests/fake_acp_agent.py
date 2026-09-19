@@ -76,6 +76,15 @@ Behavior is selected via the `FAKE_ACP_MODE` env var (default "normal"):
   true}`) — the daemon-side test asserts that pid no longer exists
   (`os.kill(pid, 0)` -> `ProcessLookupError`), which is what a fake agent
   with no real subprocess (this file's other modes) could never prove.
+- "TOOL_EXCEPTION" prompt marker (Issue #22, G08's "工具抛异常（ACP tool_call
+  返回 error）" fault injection — pure addition, same pattern as "USE_TOOL"/
+  "NEEDS_PERMISSION" above, no existing behavior changed): emits a
+  `demo_tool` `tool_call`/`tool_call_update(status="failed")` pair, then
+  responds to the `session/prompt` call itself with a JSON-RPC **error**
+  object instead of a normal `{"stopReason": ...}` result — the shape real
+  Hermes uses when a tool's exception is unrecoverable enough to end the
+  Turn (`kernel/acp_client.py`'s `AcpError`), as opposed to "USE_TOOL"'s
+  always-succeeds `demo_tool`, which the agent just continues past.
 """
 
 from __future__ import annotations
@@ -311,6 +320,27 @@ def _handle_normal_prompt(session_id: str, text: str) -> None:
         _handle_spawn_subprocess_terminal(session_id)
 
 
+_TOOL_EXCEPTION_MARKER = "TOOL_EXCEPTION"
+
+
+def _handle_tool_exception_prompt(session_id: str, req_id) -> None:
+    tool_call_id = "boom-1"
+    _send_update(
+        session_id,
+        {"sessionUpdate": "tool_call", "toolCallId": tool_call_id, "title": "demo_tool",
+         "status": "pending", "rawInput": {"arg": 1}},
+    )
+    _send_update(
+        session_id,
+        {"sessionUpdate": "tool_call_update", "toolCallId": tool_call_id, "title": "demo_tool",
+         "status": "failed", "rawOutput": {"error": "boom: tool raised an exception"}},
+    )
+    # A JSON-RPC error response (not a normal `{"stopReason": ...}` result) —
+    # `kernel/acp_client.py`'s `prompt()` turns this into `AcpError`, ending the
+    # Turn the same way a real unrecoverable tool exception would.
+    _respond(req_id, error={"code": -32000, "message": "tool execution failed: boom"})
+
+
 _pending_responses: dict[int, dict] = {}
 _response_events: dict[int, threading.Event] = {}
 _response_lock = threading.Lock()
@@ -334,6 +364,9 @@ def _handle_prompt_request(req_id, params: dict) -> None:
         _handle_probe_prompt(session_id)
     elif MODE == "crash_on_prompt":
         os._exit(7)
+    elif _TOOL_EXCEPTION_MARKER in text:
+        _handle_tool_exception_prompt(session_id, req_id)
+        return
     else:
         _handle_normal_prompt(session_id, text)
     stop_reason = "cancelled" if session_id in _cancelled_sessions else "end_turn"

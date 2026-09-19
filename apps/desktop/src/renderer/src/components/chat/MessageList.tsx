@@ -1,4 +1,5 @@
 import type { TimelineEntry } from '../../store/chatStore'
+import type { Model, Provider } from '../../domain/types'
 import { VirtualList } from '../common/VirtualList'
 import { StepCard } from './StepCard'
 import { TerminationCard } from './TerminationCard'
@@ -12,11 +13,13 @@ const ROLE_LABEL: Record<string, string> = {
 
 interface MessageListProps {
   timeline: TimelineEntry[]
-  onRetry?: () => void
-  onSwitchModel?: () => void
-  /** Dismiss one termination card — takes the card's run_id since the
-   * timeline can hold more than one past termination. */
-  onAbandon?: (runId: string) => void
+  /** Providers with a configured Key, for the "换模型" inline picker
+   * (Issue #22, 04-w5-interfaces.md §4). */
+  providers: Provider[]
+  models: Model[]
+  onRetry?: (turnId: string) => void
+  onSwitchModel?: (turnId: string, override: { provider: string; model: string }) => void
+  onAbandon?: (turnId: string) => void
 }
 
 function renderEntry(entry: TimelineEntry, props: MessageListProps): JSX.Element {
@@ -35,13 +38,15 @@ function renderEntry(entry: TimelineEntry, props: MessageListProps): JSX.Element
   if (entry.kind === 'step') {
     return <StepCard step={entry.step} />
   }
-  const runId = entry.card.run_id
+  const { turn_id: turnId } = entry.card
   return (
     <TerminationCard
       card={entry.card}
-      onRetry={props.onRetry}
-      onSwitchModel={props.onSwitchModel}
-      onAbandon={props.onAbandon ? () => props.onAbandon!(runId) : undefined}
+      providers={props.providers}
+      models={props.models}
+      onRetry={props.onRetry ? () => props.onRetry!(turnId) : undefined}
+      onSwitchModel={props.onSwitchModel ? (override) => props.onSwitchModel!(turnId, override) : undefined}
+      onAbandon={props.onAbandon ? () => props.onAbandon!(turnId) : undefined}
     />
   )
 }

@@ -130,6 +130,7 @@ spike #2（§2 已定案的 python-build-standalone 方案）在真实 daemon（
 | `session.stop` | `{id}` | `{stopped: bool}` — 用户终止（PRD 9.3） |
 | `session.delete` | `{id}` | `{deleted: bool}` — 真删（G20，issue #23）：级联 turns/messages/runs/steps/permission_decisions/queue_items，拒绝主会话与仍有子会话/运行中 Run 的会话 |
 | `session.export` | `{id, delete_after?: bool}` | `{path: string}` — 导出该 Session 为 JSON（PRD 10.3「导出」），`delete_after` 导出成功后调用 `session.delete`（issue #23） |
+| `session.retry` | `{id, turn_id, action: "retry"\|"abandon", model_override?}` | `{turn_id, action, ...}` — 错误卡片三动作（Issue #22，见 04-w5-interfaces §4）：`action="retry"`（可带 `model_override` 即「换模型」）复用原 Turn 的用户消息发起新 Turn；`action="abandon"` 清空该 Session 排队中的后续指令并把涉及的 Turn 标记 `cancelled` |
 | `turn.messages` | `{session_id, before?, limit}` | `Message[]` |
 | `run.get` / `run.steps` | `{run_id}` | `Run` / `Step[]`（回放数据源） |
 | `run.delete` | `{run_id}` | `{deleted: bool}` — 真删单个 Run（G20，issue #23）：级联 steps/permission_decisions，拒绝运行中的 Run |
@@ -152,7 +153,7 @@ spike #2（§2 已定案的 python-build-standalone 方案）在真实 daemon（
 | `step.started` / `step.completed` | `Step`（含 tool 名、参数摘要、结果摘要、耗时） |
 | `permission.requested` | `PermissionRequest`（含 gate: "rule"\|"review"\|"user"，风险等级，动作描述） |
 | `permission.decided` | `PermissionDecision` |
-| `run.terminated` | `{run_id, kind: "user"\|"error"\|"budget", reason, card}` — PRD 9.3 |
+| `run.terminated` | `{run_id, turn_id, kind: "user"\|"error"\|"budget", reason, card}` — PRD 9.3；`turn_id` 由 Issue #22（04-w5-interfaces.md §4）补充，`session.retry` 靠它定位要重试/放弃的 Turn；`card` 统一为 `ErrorCard {kind, title, message, step_seq, raw_excerpt, actions, retryable}`（`kind="user"` 时 `card.kind` 也是 `"user"` 且 `actions` 为空，见 `daemon/src/jones_daemon/errors/classify.py`） |
 | `queue.changed` | `{session_id, items: QueueItem[]}` |
 | `daemon.error` | `{code, message, detail?}` — 永不静默（PRD 5.5） |
 

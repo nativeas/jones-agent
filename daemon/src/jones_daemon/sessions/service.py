@@ -51,6 +51,7 @@ from typing import Any
 
 from jones_daemon.config.jsonfile import read_json, write_json
 from jones_daemon.context import DaemonContext
+from jones_daemon.errors import classify
 from jones_daemon.kernel.acp_client import AcpError, AcpProtocolError
 from jones_daemon.kernel.ids import new_ulid
 from jones_daemon.kernel.plugin.jones_gate import (
@@ -92,6 +93,15 @@ DEFAULT_AGENT_ID = "agent_default"
 # `hermes-agent` checkout), never overridden by `acp_adapter/server.py`'s
 # call site — see `_on_request_permission`'s docstring for the full story.
 _EDIT_APPROVAL_HERMES_TIMEOUT_SECONDS = 60.0
+
+# Issue #22 / N07 (04-w5-interfaces.md §4): "运行中 Run 超过 5s 没有任何 ACP update
+# 且 worker 进程已退出 -> 立即 worker_crash 终止". `_on_worker_crash`'s watchdog
+# polls at `_WORKER_CRASH_POLL_INTERVAL_S` for up to `_WORKER_CRASH_GRACE_S`
+# before force-terminating — module-level (not a constructor param) so tests can
+# `monkeypatch.setattr(service, "_WORKER_CRASH_GRACE_S", ...)` for speed without
+# widening `SessionService.__init__`'s signature.
+_WORKER_CRASH_GRACE_S = 5.0
+_WORKER_CRASH_POLL_INTERVAL_S = 0.1
 
 
 def _extract_text(content: Any) -> str:
@@ -264,6 +274,53 @@ def _extract_diff_content(content: Any) -> dict[str, Any] | None:
     return None
 
 
+def _last_step_for_run(conn: Any, run_id: str) -> dict[str, Any] | None:
+    """The most recently started Step for a Run — used only by `_terminate_run`'s
+    classification (Issue #22): distinguishes "the model/API layer itself failed"
+    from "a specific tool call failed and that's what ended the Turn" within the
+    generic `"ACP prompt failed: ..."` reason bucket (see `errors/classify.py`'s
+    module docstring). Raw SQL rather than a new `sessions/queries.py` function —
+    04-w5-interfaces.md §1 doesn't grant this branch write access to that file,
+    and this is read-only, single-statement, and used from exactly one place;
+    `queries._d()` (module-private, same row->dict decoding every other query in
+    that file uses) is reused rather than duplicated."""
+    row = conn.execute(
+        "SELECT * FROM steps WHERE run_id = ? ORDER BY seq DESC LIMIT 1", (run_id,)
+    ).fetchone()
+    return queries._d(row)  # noqa: SLF001 - see docstring
+
+
+def _fetch_turn(conn: Any, turn_id: str) -> dict[str, Any] | None:
+    """Read-only turn lookup by id — `sessions/queries.py` has no such function
+    (only `latest_turn(session_id)`); needed by `retry()` (Issue #22) to load the
+    turn being retried/abandoned. Same "raw SQL, not a queries.py addition"
+    reasoning as `_last_step_for_run` above."""
+    row = conn.execute("SELECT * FROM turns WHERE id = ?", (turn_id,)).fetchone()
+    return queries._d(row)  # noqa: SLF001 - see docstring
+
+
+def _fetch_turn_user_text(conn: Any, turn: dict[str, Any]) -> str | None:
+    """The original user message text for `turn` (`retry()`'s "用户消息复用") —
+    `turns.user_message_id` -> `messages.content_json`. `None` for a turn with no
+    user message row (shouldn't happen for anything `create_turn_and_user_message`
+    produced, i.e. every real Turn — DEV.md 工程原则 #4: `retry()` raises rather
+    than guess if this ever comes back empty)."""
+    message_id = turn.get("user_message_id")
+    if not message_id:
+        return None
+    row = conn.execute(
+        "SELECT content_json FROM messages WHERE id = ?", (message_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        content = json.loads(row["content_json"])
+    except json.JSONDecodeError:
+        return None
+    text = content.get("text") if isinstance(content, dict) else None
+    return text if isinstance(text, str) else None
+
+
 @dataclass
 class _TurnContext:
     turn_id: str
@@ -350,6 +407,15 @@ class SessionService:
         # by racing a live DB read, the same "正在执行中的 Run 不受影响"
         # guarantee `_refresh_gate_config` already gives the rule gate.
         self._turn_mode_snapshot: dict[str, str] = {}
+        # Issue #22 (04-w5-interfaces.md §4): `retry()`'s optional `model_override`
+        # for the "换模型" card action — keyed by the NEW turn_id `retry()` gets
+        # back from `send()`, consumed (popped) by `_run_turn`'s provider-
+        # resolution line the one time that Turn actually starts running. Same
+        # restart-loses-it lifetime as `_session_remembered_rules` above (in-
+        # memory only; a retry queued behind other work and never reached before
+        # a restart just falls back to the Agent's normal model_pref, which is
+        # honest — PRD 5.8 never promises restart preserves in-flight intent).
+        self._turn_model_override: dict[str, dict[str, Any]] = {}
 
     def _lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -764,6 +830,103 @@ class SessionService:
                 )
             await self.worker_manager.stop_worker(session_id, reason="session_deleted")
             return await fn(*args, **kwargs)
+    async def retry(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        action: str = "retry",
+        model_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """RPC `session.retry` (Issue #22, 04-w5-interfaces.md §4) — the server
+        side of the error card's three actions:
+
+          - "重试" -> `action="retry"`, no `model_override`.
+          - "换模型" -> `action="retry"` WITH `model_override` set. Not a
+            separate action at this layer — "switch model, then retry" is
+            exactly "retry, but resolve the provider differently for this one
+            Turn", which is what `model_override` already means (see below);
+            giving it a second RPC action would just be two names for one
+            operation (this is called out as an interface decision, not left
+            silent, in the report's "契约变更" section).
+          - "放弃" -> `action="abandon"`: clears this session's pending queue
+            (04-w5-interfaces.md §4: "清掉队列中该 Turn 的后续") and marks both
+            the abandoned turn and every queue item's own turn `cancelled`
+            (reusing `queries.cancel_turn` — the same status `queue_remove`
+            already uses for a manually-dequeued item, not a new vocabulary
+            value invented for this).
+
+        "重新发起该 Turn（新 Turn，用户消息复用）": `action="retry"` does not
+        replay the OLD Turn — it calls `send()` (unmodified, see this branch's
+        exclusive-touch list) with the original user message text, which is
+        exactly `session.send`'s own existing immediate-run-or-enqueue
+        semantics (PRD 9.2 same-session serial execution applies here too: if
+        another Turn is already running on this session, the retry queues
+        behind it like any other `send()`, which is correct — there is no
+        special "jump the queue" case for a retry).
+        """
+        if action not in ("retry", "abandon"):
+            raise RpcError(INVALID_PARAMS, f"invalid action: {action!r}", {"action": action})
+        session = await run_in_db_thread(queries.get_session, self.ctx.db, session_id)
+        if session is None:
+            raise RpcError(NOT_FOUND, "session not found", {"id": session_id})
+        turn = await run_in_db_thread(_fetch_turn, self.ctx.db, turn_id)
+        if turn is None or turn["session_id"] != session_id:
+            raise RpcError(
+                NOT_FOUND, "turn not found", {"turn_id": turn_id, "session_id": session_id}
+            )
+        if turn["status"] != "terminated":
+            # Only a Turn whose Run actually ended in `run.terminated` (error or
+            # budget — success never shows a card with these actions, and a
+            # still-running Turn has nothing to retry/abandon yet) is a valid
+            # target. Round-tripping this twice (e.g. abandon, then abandon
+            # again) is refused rather than silently no-op'd — an honest signal
+            # to a UI bug that sent a stale run_id/turn_id twice, not a state
+            # worth pretending is fine (DEV.md 工程原则 #4).
+            raise RpcError(
+                INVALID_STATE,
+                f"turn {turn_id} is not in a retryable state (status={turn['status']!r})",
+                {"turn_id": turn_id, "status": turn["status"]},
+            )
+
+        if action == "abandon":
+            async with self._lock(session_id):
+                pending = await run_in_db_thread(queries.list_queue_items, self.ctx.db, session_id)
+                for item in pending:
+                    removed_turn_id = await run_in_db_thread(
+                        queries.remove_queue_item,
+                        self.ctx.db,
+                        session_id=session_id,
+                        item_id=item["id"],
+                    )
+                    if removed_turn_id is not None:
+                        await run_in_db_thread(queries.cancel_turn, self.ctx.db, removed_turn_id)
+                await run_in_db_thread(queries.cancel_turn, self.ctx.db, turn_id)
+            items = await run_in_db_thread(queries.list_queue_items, self.ctx.db, session_id)
+            await self.ctx.server.broadcast(
+                session_id, "queue.changed", {"session_id": session_id, "items": items}
+            )
+            return {"turn_id": turn_id, "action": "abandon", "cleared_queue_items": len(pending)}
+
+        if model_override is not None and (
+            not isinstance(model_override, dict) or not model_override.get("provider")
+        ):
+            raise RpcError(
+                INVALID_PARAMS,
+                "model_override must be an object with at least a 'provider'",
+                {"model_override": model_override},
+            )
+        text = await run_in_db_thread(_fetch_turn_user_text, self.ctx.db, turn)
+        if text is None:
+            raise RpcError(
+                INVALID_STATE,
+                "original user message not found for this turn",
+                {"turn_id": turn_id},
+            )
+        result = await self.send(session_id, text)
+        if model_override is not None:
+            self._turn_model_override[result["turn_id"]] = model_override
+        return {**result, "action": "retry", "retried_turn_id": turn_id}
 
     async def queue(self, session_id: str) -> list[dict[str, Any]]:
         return await run_in_db_thread(queries.list_queue_items, self.ctx.db, session_id)
@@ -1076,7 +1239,17 @@ class SessionService:
                 # dev checkouts) both surface as the same opaque "worker startup
                 # failed" card. Does not wire the resolved `ProviderBinding` into
                 # the worker itself — see this file's module docstring.
-                model_pref = await run_in_db_thread(
+                # Issue #22 scope note (04-w5-interfaces.md §4's "model_override
+                # 写入本 Turn 的 provider 解析", contract amendment recorded in
+                # this branch's report "契约变更" section — `_run_turn` itself
+                # is A/#10's function, not one of N/#22's three authorized touch
+                # points, but there is no other place this read can happen):
+                # `retry()`'s optional per-Turn override, if `send()` (called
+                # from `retry()`) populated one for this exact turn_id, takes
+                # priority over the Agent's own `model_pref`; popped (not just
+                # read) so it can never leak into a later, unrelated Turn on the
+                # same session reusing a stale dict entry.
+                model_pref = self._turn_model_override.pop(turn_id, None) or await run_in_db_thread(
                     queries.get_agent_model_pref, self.ctx.db, session["agent_id"]
                 )
                 try:
@@ -1212,20 +1385,73 @@ class SessionService:
         # seq of the last Step started on this Run (0 if none ever started) —
         # exactly "终止时的 step_seq", so replay can show which Step was in
         # flight (or that none had started yet) when the Run ended.
+        step_seq = ctx_turn.step_seq or None
+
+        # Idempotency guard (Issue #22): `_on_worker_crash`'s N07 watchdog can, in
+        # a narrow race, force-terminate a Run in the same window the in-flight
+        # `prompt()` call's own `except (AcpError, AcpProtocolError)` branch was
+        # about to do the same thing on its own (see `_on_worker_crash`'s
+        # docstring note) — rather than add cross-coroutine locking for a race
+        # this narrow, make the second call a documented no-op: a Run already
+        # out of `'running'` status has already been reported once, and writing
+        # over it again (or broadcasting `run.terminated` twice) would be the
+        # actual bug, not this check.
+        existing = await run_in_db_thread(queries.get_run, self.ctx.db, ctx_turn.run_id)
+        if existing is not None and existing["status"] != "running":
+            logger.debug(
+                "_terminate_run called for a Run that's already terminated; skipping "
+                "the duplicate DB write/broadcast",
+                extra={"detail": {"run_id": ctx_turn.run_id, "status": existing["status"]}},
+            )
+            return
+
+        # Issue #22 (04-w5-interfaces.md §4): "run.terminated 的 card 字段统一用
+        # ErrorCard". kind="user" (`_finalize_turn_success`'s own call site,
+        # untouched by this branch) never goes through `ErrorKind` — PRD 9.3
+        # doesn't call a user-initiated stop an "error", and none of the three
+        # card actions apply to it (see `classify.build_user_card`'s docstring).
+        if classify.is_user_stop(kind):
+            card = classify.build_user_card(reason)
+            effective_kind = "user"
+        else:
+            last_step = await run_in_db_thread(_last_step_for_run, self.ctx.db, ctx_turn.run_id)
+            error_kind = classify.classify(
+                kind_hint=kind,
+                reason=reason,
+                last_step_status=last_step["status"] if last_step else None,
+            )
+            card = classify.build_card(error_kind, reason=reason, step_seq=step_seq)
+            # PRD 9.3 classifies "远端 API Key 额度受限/被限流" as a 预算终止, not
+            # an 错误终止 — this can upgrade the outer `kind` from the caller's
+            # own "error" to "budget" purely from the reason text, since no
+            # existing call site has enough context to know that ahead of time.
+            effective_kind = classify.terminated_kind_for(kind, error_kind)
+
         await run_in_db_thread(
             queries.mark_run_terminated,
             self.ctx.db,
             ctx_turn.run_id,
             ctx_turn.turn_id,
-            kind=kind,
+            kind=effective_kind,
             reason=reason,
-            terminated_step_seq=ctx_turn.step_seq or None,
+            terminated_step_seq=step_seq,
         )
-        card = {"kind": kind, "message": reason}
         await self.ctx.server.broadcast(
             ctx_turn.session_id,
             "run.terminated",
-            {"run_id": ctx_turn.run_id, "kind": kind, "reason": reason, "card": card},
+            {
+                "run_id": ctx_turn.run_id,
+                # Added by this branch (04-w5-interfaces.md §4's `session.retry`
+                # needs a turn_id to retry, and `run.terminated`'s payload — 00-
+                # foundation.md §4.2, updated by this branch's report — never
+                # carried one) — the renderer's termination card is the only
+                # place a user can act on a specific failed Turn, so it needs
+                # this to call `session.retry` at all.
+                "turn_id": ctx_turn.turn_id,
+                "kind": effective_kind,
+                "reason": reason,
+                "card": card.to_dict(),
+            },
         )
 
     async def _advance_queue(self, session_id: str) -> None:
@@ -1867,18 +2093,60 @@ class SessionService:
         # will ever resolve (round-1 review fix).
         self._resolve_pending_permissions(session_id=session_id, reason="worker crashed")
         ctx_turn = self._active_turns.get(session_id)
-        if ctx_turn is not None:
-            # The in-flight `worker.client.prompt()` call in `_run_turn` will itself
-            # observe the closed stdio pipe (AcpClient's read loop fails every
-            # pending future once the process's stdout hits EOF) and terminate the
-            # Run through its own `except (AcpError, AcpProtocolError)` branch —
-            # handling it a second time here would double-write the same Run.
-            logger.info(
-                "worker crashed during an active turn; the in-flight prompt() call will report it",
+        if ctx_turn is None:
+            logger.warning(
+                "idle worker exited unexpectedly; a fresh one will spawn on the next session.send",
                 extra={"detail": {"session_id": session_id, "returncode": returncode}},
             )
             return
-        logger.warning(
-            "idle worker exited unexpectedly; a fresh one will spawn on the next session.send",
+        # In the common case, the in-flight `worker.client.prompt()` call in
+        # `_run_turn` observes the closed stdio pipe on its own (AcpClient's read
+        # loop fails every pending future the instant the process's stdout hits
+        # EOF — kernel/acp_client.py's `_read_loop` `finally` block) and
+        # terminates the Run through its own `except (AcpError,
+        # AcpProtocolError)` branch, well under a second after `_watch_exit`
+        # calls this function.
+        #
+        # N07 (Issue #22, 04-w5-interfaces.md §4): "运行中 Run 超过 5s 没有任何
+        # ACP update 且 worker 进程已退出 -> 立即 worker_crash 终止" — this is the
+        # belt-and-suspenders backstop for whenever that doesn't happen in time
+        # (the known asyncio-shutdown hang noted in 02-w3-interfaces.md §1.2's
+        # "已发现但不在本分支范围内修复的 bug", or any other race/hang in the read
+        # loop): poll for up to `_WORKER_CRASH_GRACE_S` and force the termination
+        # here if this *exact* `ctx_turn` is still the session's active turn by
+        # then — PRD N07 is explicit that the UI must never show "running"
+        # against a dead Run for more than 5s, so this can't just log and hope.
+        logger.info(
+            "worker crashed during an active turn; waiting up to "
+            f"{_WORKER_CRASH_GRACE_S}s for the in-flight prompt() call to report it "
+            "before force-terminating (N07)",
             extra={"detail": {"session_id": session_id, "returncode": returncode}},
+        )
+        deadline = time.monotonic() + _WORKER_CRASH_GRACE_S
+        while time.monotonic() < deadline:
+            if self._active_turns.get(session_id) is not ctx_turn:
+                return  # the in-flight prompt() call's own error path got there first
+            await asyncio.sleep(_WORKER_CRASH_POLL_INTERVAL_S)
+        if self._active_turns.get(session_id) is not ctx_turn:
+            return
+        logger.warning(
+            "worker crash not observed by the in-flight prompt() call within "
+            f"{_WORKER_CRASH_GRACE_S}s; force-terminating the Run (N07)",
+            extra={"detail": {"session_id": session_id, "returncode": returncode}},
+        )
+        task = self._turn_tasks.get(session_id)
+        if task is not None and not task.done():
+            # Cancelling (rather than awaiting) `_run_turn`'s own stuck task is
+            # what still lets its `finally: await self._advance_queue(...)` run
+            # and unstick the session's queue — `asyncio.CancelledError` isn't
+            # caught by that function's `except Exception`, so this can never
+            # race a second `_terminate_run` call from that same task (and
+            # `_terminate_run`'s own idempotency guard covers the remaining,
+            # much narrower race against the in-flight prompt() call's error
+            # path finishing at almost the same instant this deadline expires).
+            task.cancel()
+        await self._terminate_run(
+            ctx_turn,
+            kind="error",
+            reason=f"worker process exited unexpectedly (code {returncode})",
         )

@@ -51,6 +51,7 @@ export const RPC_V0_METHODS = [
   'session.queue_remove',
   'session.queue_reorder',
   'session.stop',
+  'session.retry',
   'session.subscribe',
   'session.unsubscribe',
   'session.delete',

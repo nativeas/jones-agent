@@ -14,7 +14,7 @@
 |---|---|---|---|
 | L `w5/20-cron` | #20 | `daemon/src/jones_daemon/scheduler/`（新）、`daemon/tests/test_scheduler*.py` | 只通过 `SessionService` 公开方法（`create`/`send`/`get`）派发，不改 sessions 内部；`__main__` 加一行 |
 | M `w5/21-bundled-skills` | #21 | `daemon/src/jones_daemon/skills/bundled/**`（新）、`daemon/tests/test_bundled_skills*.py`、`tests/integration/` 对应用例 | `skills/service.py`：只把 bundled 目录接进第三层（K 已留位）；toolsets 下发：在 H 的清单里**允许** `image_gen`/`video_gen`/`tts`（改 `capabilities/` 的 toolsets 常量一处，报告标明） |
-| N `w5/22-error-panel` | #22 | `daemon/src/jones_daemon/errors/`（新：分类器 + 卡片构造）、`apps/desktop/src/renderer/**` 中的错误/终止卡片与重试动作、`daemon/tests/test_errors*.py` | `sessions/service.py`：只改 `_terminate_run`、`_on_worker_crash`、新增 `retry`（公开方法）；`sessions/methods.py` 加 `session.retry`；`kernel/acp_client.py`：只加错误分类所需的异常类型信息，不改协议 |
+| N `w5/22-error-panel` | #22 | `daemon/src/jones_daemon/errors/`（新：分类器 + 卡片构造）、`apps/desktop/src/renderer/**` 中的错误/终止卡片与重试动作、`daemon/tests/test_errors*.py` | `sessions/service.py`：只改 `_terminate_run`、`_on_worker_crash`、新增 `retry`（公开方法）；**契约追加**（实现阶段发现，见该分支报告"契约变更"）：`_run_turn` 追加一行——解析 `model_pref` 前先查 `self._turn_model_override.pop(turn_id, None)`——这是"`model_override` 写入本 Turn 的 provider 解析"唯一可能的接线点，`_run_turn` 本身仍是 A/#10 的函数，此处只多开一行读取权限；`sessions/methods.py` 加 `session.retry`；`kernel/acp_client.py`：只加错误分类所需的异常类型信息，不改协议 |
 | O `w5/23-storage` | #23 | `daemon/src/jones_daemon/store/maintenance.py`（新：真删、备份轮转、迁移校验）、`daemon/src/jones_daemon/store/methods.py`（新：`daemon.clear_cache`）、`daemon/tests/test_storage*.py`、`docs/design/00-foundation.md` §4.1/§6 追加 | `sessions/methods.py` 加 `session.delete`/`session.export`/`run.delete`；`replay/store.py::purge_run` 调用（未改该文件本身，只是调用方）；`secrets/vault.py` 原子写 fsync + `VaultKeyMismatchError`；`paths.py` 只加访问器（`project_attachments_dir`）；`projects/service.py::delete`（改为调 `maintenance.delete_project`，落实 §5 原文的「project.delete（已有，改为调 maintenance）」——原表格此格未列出该文件，实现时按 §5 正文补上，见 O 分支报告「契约变更」）；`store/migrator.py::_backup_before_migrating`（迁移备份保留最近 5 份，同一理由补列）；`rpc/server.py`（仅新增 `broadcast_all`/响应采样环形缓冲，"加法不改法"，该文件本就允许任何 W2 分支这样扩展）；`__main__.py` 常规「加几行」（注册 `store/methods.py`、启动期 Key 脱敏自检、日志滚动后台循环） |
 
 ## 2. L：Cron（FR11）
@@ -53,6 +53,22 @@
 - RPC `session.retry {id, turn_id?, model_override?}`：重新发起该 Turn（新 Turn，用户消息复用），`model_override` 写入本 Turn 的 provider 解析；`abandon` = 清掉队列中该 Turn 的后续（`queue_items`）并标记 Run。
 - renderer：错误卡片三个动作接 RPC；网络/配额/认证/工具/崩溃/超时/预算 7 类卡片样式区分（颜色 + 图标），每张卡片有「查看原始错误」折叠。
 - 测试（G08 四种故障注入，全用假 ACP agent / provider stub，不联网）：断网（provider 解析抛 network）、Key 失效（provider_auth）、工具抛异常（ACP tool_call 返回 error）、kill worker（`worker_crash` ≤ 5s 被发现）。每种断言：出卡片、进程不崩、`run.terminated` 载荷形状正确、UI 无白屏（vitest 渲染卡片）。
+
+### 4.1 落地时的契约细化（2026-09-19，实现阶段发现，非设计推测）
+
+- **脱敏没有「B 的现有工具函数」可复用**：核对过 `secrets/vault.py`、`providers/methods.py` 后，`_key_hint`（末 4 位）是模块私有、只给"已经拿到手的一个 key 算 hint"，不是"在任意文本里找并遮蔽 key"的通用函数；`DaemonContext` 也没有 `vault` 字段，`_terminate_run` 拿不到"当前配置了哪些 key 的明文"去做精确匹配。`errors/classify.py::redact_secrets()` 因此是本分支新写的、基于**模式**（`sk-` 前缀、`key=`/`token=`/`Bearer ` 后跟长不透明串、`AKIA` 前缀、`XXX_API_KEY=value` 环境变量赋值）而非精确匹配的遮蔽——比"仅遮蔽已知配置的 key"更保守（连未配置厂商泄露的 key 文本也能盖住），代价是启发式，見该文件模块 docstring 与 `test_errors_classify.py` 的已知假阴性/假阳性说明。
+- **`run.terminated` 新增 `turn_id`**：00-foundation.md §4.2 原契约没有它，`session.retry` 定位"重试哪个 Turn"必须靠它，`_terminate_run`（本分支唯一改动点）顺带补上，已同步该文档。
+- **`ErrorKind` 的 9 类 → 渲染的 7 类视觉样式**：`provider_error`/`internal` 没有独立颜色图标，回退成通用样式——`classify.py::VISUALLY_DISTINCT_KINDS` 是这个映射的唯一事实源，`TerminationCard.tsx` 的 `KIND_STYLE` 与之对应。
+- **`kind="budget"` 的两种来源**：① 调用方显式传 `kind="budget"`（今天没有任何调用点这样做，见下"没做什么"）；② `_terminate_run` 从 `reason` 文本分类出 `ErrorKind.PROVIDER_QUOTA`（限流/额度用尽）时，即使调用方传的是 `kind="error"`，`classify.terminated_kind_for()` 也会把最终广播的 `run.terminated.kind` 升级成 `"budget"`——PRD 9.3 原文把"远端 API Key 额度受限/被限流"明确归在预算终止，不是错误终止。
+- **`session.retry` 的「换模型」不是独立 action**：`{action:"retry", model_override}` 就是"换模型再试一次"，没有单独的 `action="switch_model"`——两个名字指向同一个操作，见 `SessionService.retry()` 的 docstring。
+- **`retry()` 的 model_override 落地**：见 §1 表格 N 行新追加的 `_run_turn` 一行改动——`self._turn_model_override`（新增实例状态，`__init__` 里初始化，键为新 Turn 的 turn_id，`retry()` 写入、`_run_turn` 读出即弹出）。
+- **`abandon` 复用 `cancelled`，没有发明新状态**：`queries.cancel_turn`（`queue_remove` 已在用的同一个状态值）用来标记被放弃的 Turn 和排队中每条被清掉的 Turn，没有新引入 `turns.status='abandoned'` 这类只有本分支用的新词汇。
+- **`_terminate_run` 的幂等保护**：写库前先读一次 `runs.status`，非 `'running'` 直接跳过——`_on_worker_crash` 的 N07 兜底和"真的 prompt() 自己发现"两条路径理论上可能在极窄的窗口内都想终止同一个 Run，这个检查把"双写/双广播"变成文档化的 no-op，而不是加跨协程锁。
+
+### 4.2 没做什么（契约要求但本分支未接线）
+
+- **11.2 的 Step 数 / 时长上限触发预算终止**：需要在 `_run_turn`/`_handle_tool_call_start` 里主动数 Step、算耗时并在触顶时调用 `_terminate_run(kind="budget", ...)`——这两个函数是 A/#10 的专属函数，04-w5-interfaces.md §1 没有把它们开放给 N；本分支只让 `_terminate_run` 在**收到** `kind="budget"` 时能正确出卡，没有新增任何调用点去触发它。同理 token 预算（Goal 层面）依赖 FR17（P1，未实现）。
+- 见报告"没做什么及原因"获取完整清单（含已知的极窄双终止竞态、`_turn_model_override` 的有界内存泄漏等）。
 
 ## 5. O：存储收口（第 10 节）
 

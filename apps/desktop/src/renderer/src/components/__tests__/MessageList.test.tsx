@@ -33,7 +33,7 @@ describe('MessageList', () => {
       expect(() => {
         act(() => {
           root = createRoot(container)
-          root.render(<MessageList timeline={timeline} />)
+          root.render(<MessageList timeline={timeline} providers={[]} models={[]} />)
         })
       }).not.toThrow()
 

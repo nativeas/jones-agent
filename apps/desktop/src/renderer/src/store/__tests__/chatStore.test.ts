@@ -118,41 +118,63 @@ describe('chatStore', () => {
     expect(assistantMsg).toBeDefined()
   })
 
-  it('retryLastMessage() resends the most recent user message (PRD 9.3 错误终止卡片 "重试")', async () => {
+  it('retryTermination() resends the original message via session.retry (Issue #22 FR14 "重试")', async () => {
     const transport = new MockTransport({ schedule: (fn) => fn() })
     await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
     await useChatStore.getState().send('/error 网络中断')
     expect(useChatStore.getState().running).toBe(false)
 
-    const result = await useChatStore.getState().retryLastMessage()
+    const card = useChatStore.getState().timeline.find((e) => e.kind === 'termination')
+    const turnId = card?.kind === 'termination' ? card.card.turn_id : undefined
+    expect(turnId).toBeDefined()
 
-    expect(result).not.toBeNull()
-    const state = useChatStore.getState()
-    const userMessages = state.timeline.filter((e) => e.kind === 'message' && e.message.role === 'user')
+    await useChatStore.getState().retryTermination(turnId!)
+
+    expect(useChatStore.getState().error).toBeNull()
+    const userMessages = useChatStore
+      .getState()
+      .timeline.filter((e) => e.kind === 'message' && e.message.role === 'user')
     expect(userMessages).toHaveLength(2)
     if (userMessages[1]?.kind === 'message') expect(userMessages[1].message.content.text).toBe('/error 网络中断')
   })
 
-  it('retryLastMessage() is a no-op when the timeline has no user message yet', async () => {
+  it('retryTermination() surfaces an error when the daemon rejects a stale/unknown turn_id', async () => {
     const transport = new MockTransport({ schedule: (fn) => fn() })
     await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
 
-    const result = await useChatStore.getState().retryLastMessage()
+    await useChatStore.getState().retryTermination('turn_does_not_exist')
 
-    expect(result).toBeNull()
+    expect(useChatStore.getState().error).toBeTruthy()
   })
 
-  it('dismissTermination() removes only the named card (PRD 9.3 错误终止卡片 "放弃" — no server action, just hide it)', async () => {
-    const transport = new MockTransport({ schedule: (fn) => fn() })
+  it('abandonTermination() clears the pending queue via session.retry (Issue #22 FR14 "放弃")', async () => {
+    // A controllable scheduler (same pattern as the "rebinding" test below) —
+    // the first Turn's scripted termination must stay pending long enough for
+    // a second send() to actually land in the queue behind it.
+    const scheduled: Array<() => void> = []
+    const transport = new MockTransport({ schedule: (fn) => scheduled.push(fn) })
     await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
+
     await useChatStore.getState().send('/error 第一次出错')
-    const firstCard = useChatStore.getState().timeline.find((e) => e.kind === 'termination')
-    const firstRunId = firstCard?.kind === 'termination' ? firstCard.card.run_id : undefined
-    expect(firstRunId).toBeDefined()
+    expect(useChatStore.getState().running).toBe(true) // termination not fired yet
 
-    useChatStore.getState().dismissTermination(firstRunId!)
+    await useChatStore.getState().send('排在后面的第二条')
+    expect(useChatStore.getState().queue).toHaveLength(1)
 
-    expect(useChatStore.getState().timeline.some((e) => e.kind === 'termination')).toBe(false)
+    scheduled.shift()!() // fire the scripted termination now
+
+    const card = useChatStore.getState().timeline.find((e) => e.kind === 'termination')
+    const turnId = card?.kind === 'termination' ? card.card.turn_id : undefined
+    expect(turnId).toBeDefined()
+
+    await useChatStore.getState().abandonTermination(turnId!)
+
+    expect(useChatStore.getState().error).toBeNull()
+    expect(useChatStore.getState().queue).toHaveLength(0)
+    // The card itself stays in the timeline as history — 04-w5-interfaces.md
+    // §4 / PRD FR06: 错误卡片本身进入 Session 记录，可回放. Abandoning clears
+    // the queue and the server-side Turn status, it doesn't hide the card.
+    expect(useChatStore.getState().timeline.some((e) => e.kind === 'termination')).toBe(true)
   })
 
   it('removeQueueItem drops the item from the queue panel', async () => {

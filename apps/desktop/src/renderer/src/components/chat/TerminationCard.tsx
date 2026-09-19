@@ -1,61 +1,171 @@
-import type { TerminationCard as TerminationCardData } from '../../domain/types'
+import { useState } from 'react'
+import type { CardAction, ErrorKind, Model, Provider, TerminationCard as TerminationCardData } from '../../domain/types'
 
 interface TerminationCardProps {
   card: TerminationCardData
+  /** Only providers with a configured key — the "换模型" picker has nothing
+   * useful to offer for one without a Key anyway. */
+  providers: Provider[]
+  models: Model[]
   onRetry?: () => void
-  onSwitchModel?: () => void
+  onSwitchModel?: (override: { provider: string; model: string }) => void
   onAbandon?: () => void
 }
 
+/** Issue #22 (FR14, 04-w5-interfaces.md §4) — daemon classifies, this only
+ * renders: one style per `ErrorKind`, folded down to 7 distinct visual
+ * buckets (`errors/classify.py::VISUALLY_DISTINCT_KINDS`) — `provider_error`/
+ * `internal` share the generic fallback rather than getting their own
+ * color/icon, matching that module's own comment on why. */
+const KIND_STYLE: Record<ErrorKind, { label: string; className: string; icon: string }> = {
+  network: { label: '网络', className: 'termination-card--network', icon: '⚠' },
+  provider_quota: { label: '配额', className: 'termination-card--quota', icon: '⛔' },
+  provider_auth: { label: '认证', className: 'termination-card--auth', icon: '🔑' },
+  tool_exception: { label: '工具', className: 'termination-card--tool', icon: '🛠' },
+  worker_crash: { label: '崩溃', className: 'termination-card--crash', icon: '💥' },
+  approval_timeout: { label: '超时', className: 'termination-card--timeout', icon: '⏱' },
+  budget: { label: '预算', className: 'termination-card--budget-kind', icon: '📊' },
+  provider_error: { label: '出错', className: 'termination-card--generic', icon: '❗' },
+  internal: { label: '出错', className: 'termination-card--generic', icon: '❗' }
+}
+
+const ACTION_LABEL: Record<CardAction, string> = {
+  retry: '重试',
+  switch_model: '换模型',
+  abandon: '放弃'
+}
+
+function ModelPicker({
+  providers,
+  models,
+  onConfirm,
+  onCancel
+}: {
+  providers: Provider[]
+  models: Model[]
+  onConfirm: (override: { provider: string; model: string }) => void
+  onCancel: () => void
+}): JSX.Element {
+  const [provider, setProvider] = useState(providers[0]?.provider ?? '')
+  const modelsForProvider = models.filter((m) => m.provider === provider)
+  const [model, setModel] = useState(modelsForProvider[0]?.id ?? '')
+
+  if (providers.length === 0) {
+    return (
+      <div className="termination-card__model-picker">
+        <span>还没有配置好 Key 的模型厂商 — 先去设置页配置一个。</span>
+        <button onClick={onCancel}>取消</button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="termination-card__model-picker">
+      <select
+        value={provider}
+        onChange={(e) => {
+          const next = e.target.value
+          setProvider(next)
+          setModel(models.find((m) => m.provider === next)?.id ?? '')
+        }}
+      >
+        {providers.map((p) => (
+          <option key={p.provider} value={p.provider}>
+            {p.provider}
+          </option>
+        ))}
+      </select>
+      <select value={model} onChange={(e) => setModel(e.target.value)}>
+        {models
+          .filter((m) => m.provider === provider)
+          .map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.label || m.id}
+            </option>
+          ))}
+      </select>
+      <button disabled={!provider || !model} onClick={() => onConfirm({ provider, model })}>
+        确认重试
+      </button>
+      <button onClick={onCancel}>取消</button>
+    </div>
+  )
+}
+
 /**
- * The three termination renderings required by PRD 9.3 / 01-w2-interfaces.md §5
- * ("三种终止卡片"). Field names inside `card.card` are this branch's assumed
- * shape (A's Session/Worker module isn't built yet) — documented in the
- * handoff report; every field is read defensively so an eventual real shape
- * that's missing one just renders less detail instead of crashing.
+ * The three termination renderings PRD 9.3 / 04-w5-interfaces.md §4 require —
+ * `kind==="user"` (nothing to act on), and `kind==="error"|"budget"` sharing
+ * one `ErrorCard`-driven rendering (the outer `kind` only decides the top-line
+ * framing text; the 7-bucket style and the available actions come from
+ * `card.card` — see `KIND_STYLE`/`ACTION_LABEL` above). Every field is read
+ * defensively (`card.card` may be an older/partial shape from a daemon this
+ * exact renderer build hasn't seen) so a missing field renders less detail
+ * instead of a white screen (N16).
  */
-export function TerminationCard({ card, onRetry, onSwitchModel, onAbandon }: TerminationCardProps): JSX.Element {
-  if (card.kind === 'user') {
+export function TerminationCard({
+  card,
+  providers,
+  models,
+  onRetry,
+  onSwitchModel,
+  onAbandon
+}: TerminationCardProps): JSX.Element {
+  const [picking, setPicking] = useState(false)
+  const [expanded, setExpanded] = useState(false)
+  const inner = card.card
+
+  if (card.kind === 'user' || !inner || inner.actions?.length === 0) {
     return (
       <div className="termination-card termination-card--user">
-        <div className="termination-card__title">已停止</div>
-        <div className="termination-card__body">{card.reason || '用户手动停止，正在执行的动作已收尾。'}</div>
+        <div className="termination-card__title">{inner?.title ?? '已停止'}</div>
+        <div className="termination-card__body">
+          {inner?.message || card.reason || '用户手动停止，正在执行的动作已收尾。'}
+        </div>
       </div>
     )
   }
 
-  if (card.kind === 'budget') {
-    const budget = card.card.budget as { name?: string; used?: number; limit?: number; unit?: string } | undefined
-    return (
-      <div className="termination-card termination-card--budget">
-        <div className="termination-card__title">预算已用完</div>
-        <div className="termination-card__body">{card.reason}</div>
-        {budget && (
-          <div className="termination-card__detail">
-            {budget.name ?? '预算'}：{budget.used ?? '?'} / {budget.limit ?? '?'} {budget.unit ?? ''}
-          </div>
-        )}
-      </div>
-    )
-  }
+  const style = KIND_STYLE[inner.kind as ErrorKind] ?? KIND_STYLE.internal
+  const actions = inner.actions ?? []
+  const rawExcerpt = inner.raw_excerpt ?? ''
 
-  // error
-  const errorMessage = (card.card.error_message as string | undefined) ?? card.reason
-  const step = card.card.step as { tool?: string; seq?: number } | undefined
   return (
-    <div className="termination-card termination-card--error">
-      <div className="termination-card__title">出错了</div>
-      {step && (
-        <div className="termination-card__detail">
-          发生在第 {step.seq ?? '?'} 步（{step.tool ?? '未知工具'}）
+    <div className={`termination-card ${style.className}`}>
+      <div className="termination-card__title">
+        <span aria-hidden className="termination-card__icon">
+          {style.icon}
+        </span>
+        {inner.title || style.label}
+      </div>
+      {inner.step_seq != null && (
+        <div className="termination-card__detail">发生在第 {inner.step_seq} 步</div>
+      )}
+      <div className="termination-card__body">{inner.message || card.reason}</div>
+      {rawExcerpt && (
+        <details className="termination-card__raw" open={expanded} onToggle={(e) => setExpanded(e.currentTarget.open)}>
+          <summary>查看原始错误</summary>
+          <pre>{rawExcerpt}</pre>
+        </details>
+      )}
+      {picking ? (
+        <ModelPicker
+          providers={providers}
+          models={models}
+          onCancel={() => setPicking(false)}
+          onConfirm={(override) => {
+            setPicking(false)
+            onSwitchModel?.(override)
+          }}
+        />
+      ) : (
+        <div className="termination-card__actions">
+          {actions.includes('retry') && <button onClick={onRetry}>{ACTION_LABEL.retry}</button>}
+          {actions.includes('switch_model') && (
+            <button onClick={() => setPicking(true)}>{ACTION_LABEL.switch_model}</button>
+          )}
+          {actions.includes('abandon') && <button onClick={onAbandon}>{ACTION_LABEL.abandon}</button>}
         </div>
       )}
-      <div className="termination-card__body">{errorMessage}</div>
-      <div className="termination-card__actions">
-        <button onClick={onRetry}>重试</button>
-        <button onClick={onSwitchModel}>换模型</button>
-        <button onClick={onAbandon}>放弃</button>
-      </div>
     </div>
   )
 }

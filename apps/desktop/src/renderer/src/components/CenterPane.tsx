@@ -3,7 +3,7 @@ import type { RpcTransport } from '../rpc/transport'
 import type { SessionMode } from '../domain/types'
 import { useChatStore } from '../store/chatStore'
 import { useSessionsStore } from '../store/sessionsStore'
-import { useNavigationStore } from '../store/navigationStore'
+import { useSettingsStore } from '../store/settingsStore'
 import { MessageList } from './chat/MessageList'
 import { InputBar } from './chat/InputBar'
 import { QueuePanel } from './chat/QueuePanel'
@@ -29,12 +29,24 @@ export function CenterPane({ transport }: CenterPaneProps): JSX.Element {
   const queue = useChatStore((s) => s.queue)
   const send = useChatStore((s) => s.send)
   const stop = useChatStore((s) => s.stop)
-  const retryLastMessage = useChatStore((s) => s.retryLastMessage)
-  const dismissTermination = useChatStore((s) => s.dismissTermination)
+  const retryTermination = useChatStore((s) => s.retryTermination)
+  const switchModelTermination = useChatStore((s) => s.switchModelTermination)
+  const abandonTermination = useChatStore((s) => s.abandonTermination)
   const removeQueueItem = useChatStore((s) => s.removeQueueItem)
   const reorderQueue = useChatStore((s) => s.reorderQueue)
   const error = useChatStore((s) => s.error)
-  const goToAgentModelSettings = useNavigationStore((s) => s.goToAgentModelSettings)
+  // Issue #22 (04-w5-interfaces.md §4): the "换模型" card action needs a real
+  // provider/model list — only providers with a configured Key are offered
+  // (picking one without a Key would just fail `session.retry` the same way
+  // the original Turn did).
+  const settingsInit = useSettingsStore((s) => s.init)
+  const configuredProviders = useSettingsStore((s) => s.providers.filter((p) => p.has_key))
+  const models = useSettingsStore((s) => s.models)
+
+  useEffect(() => {
+    void settingsInit(transport)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transport])
 
   useEffect(() => {
     if (!selectedSessionId) return
@@ -71,9 +83,11 @@ export function CenterPane({ transport }: CenterPaneProps): JSX.Element {
       <div className="center-pane__body">
         <MessageList
           timeline={timeline}
-          onRetry={() => void retryLastMessage()}
-          onSwitchModel={goToAgentModelSettings}
-          onAbandon={dismissTermination}
+          providers={configuredProviders}
+          models={models}
+          onRetry={(turnId) => void retryTermination(turnId)}
+          onSwitchModel={(turnId, override) => void switchModelTermination(turnId, override)}
+          onAbandon={(turnId) => void abandonTermination(turnId)}
         />
       </div>
       <QueuePanel items={queue} onRemove={removeQueueItem} onReorder={reorderQueue} />

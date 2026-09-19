@@ -217,6 +217,8 @@ export class MockTransport implements RpcTransport {
         return this.handleSend(params.id, params.text)
       case 'session.stop':
         return this.handleStop(params.id)
+      case 'session.retry':
+        return this.handleRetry(params.id, params.turn_id, params.action ?? 'retry', params.model_override)
       case 'session.queue':
         return this.queue.get(params.id) ?? []
       case 'session.queue_remove': {
@@ -385,15 +387,70 @@ export class MockTransport implements RpcTransport {
     const session = this.requireSession(sessionId)
     if (session.status !== 'running') return { stopped: false }
     const runId = this.activeRunId(sessionId)
+    const turnId = this.activeTurns.get(sessionId) ?? nextId('turn')
     this.cancelledRuns.add(runId)
     this.activeRuns.delete(sessionId)
+    this.activeTurns.delete(sessionId)
     session.status = 'idle'
-    const card: TerminationCard = { run_id: runId, kind: 'user', reason: '用户手动停止', card: {} }
+    const card: TerminationCard = {
+      run_id: runId,
+      turn_id: turnId,
+      kind: 'user',
+      reason: '用户手动停止',
+      card: {
+        kind: 'user',
+        title: '已停止',
+        message: '用户手动停止，正在执行的动作已收尾。',
+        step_seq: null,
+        raw_excerpt: '',
+        actions: [],
+        retryable: false
+      }
+    }
     this.emit('run.terminated', card)
     return { stopped: true }
   }
 
+  /** Issue #22 (04-w5-interfaces.md §4) mock side of `session.retry` — good
+   * enough to exercise chatStore's real RPC call and TerminationCard's real
+   * action buttons in `pnpm dev:mock`/vitest, not a full daemon re-
+   * implementation (no provider resolution, `model_override` is only echoed
+   * back, never validated). */
+  private handleRetry(
+    sessionId: string,
+    turnId: string,
+    action: 'retry' | 'abandon',
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    modelOverride?: any
+  ): { turn_id: string; action: string; queued?: boolean; retried_turn_id?: string; cleared_queue_items?: number } {
+    const session = this.requireSession(sessionId)
+    const original = this.terminatedTurns.get(turnId)
+    if (!original || original.sessionId !== sessionId) throw new Error('turn not found')
+
+    if (action === 'abandon') {
+      const cleared = this.queue.get(sessionId) ?? []
+      this.queue.set(sessionId, [])
+      this.emit('queue.changed', { session_id: sessionId, items: [] })
+      return { turn_id: turnId, action: 'abandon', cleared_queue_items: cleared.length }
+    }
+
+    const text = modelOverride ? `${original.text} [model:${modelOverride.provider}/${modelOverride.model}]` : original.text
+    const result = this.handleSend(sessionId, original.text)
+    // The mock's scripted reply doesn't actually branch on model_override
+    // (no real provider resolution here) — `text` above exists only so a test
+    // could assert the override was received if it ever needs to; the actual
+    // resend uses the unmodified original message, matching "用户消息复用".
+    void text
+    void session
+    return { ...result, action: 'retry', retried_turn_id: turnId }
+  }
+
   private activeRuns = new Map<string, string>() // session_id -> run_id
+  private activeTurns = new Map<string, string>() // session_id -> turn_id
+  /** Every Turn that ended in a `run.terminated` card, so `session.retry` can
+   * look up "the original user message text" the way the real daemon reads it
+   * back from `turns.user_message_id` (Issue #22, `retry()`'s "用户消息复用"). */
+  private terminatedTurns = new Map<string, { sessionId: string; text: string }>()
   /** run_ids a stop()/error/budget termination already ended — any scripted
    * continuation still scheduled for one (a pending setTimeout chunk, or a
    * permission wait) must no-op instead of re-emitting events for a run that's
@@ -408,6 +465,7 @@ export class MockTransport implements RpcTransport {
     session.status = 'running'
     const runId = nextId('run')
     this.activeRuns.set(session.id, runId)
+    this.activeTurns.set(session.id, turnId)
     this.steps.set(runId, [])
 
     const userMessage: Message = {
@@ -425,15 +483,15 @@ export class MockTransport implements RpcTransport {
     const reason = rest.join(' ') || '(未提供原因)'
 
     if (command === '/error') {
-      this.schedule(() => this.finishWithTermination(session, runId, 'error', reason))
+      this.schedule(() => this.finishWithTermination(session, runId, turnId, text, 'error', reason))
       return
     }
     if (command === '/budget') {
-      this.schedule(() => this.finishWithTermination(session, runId, 'budget', reason))
+      this.schedule(() => this.finishWithTermination(session, runId, turnId, text, 'budget', reason))
       return
     }
     if (command === '/permission') {
-      this.schedule(() => this.requestPermissionThenContinue(session, runId, turnId, reason))
+      this.schedule(() => this.requestPermissionThenContinue(session, runId, turnId, text, reason))
       return
     }
 
@@ -446,17 +504,65 @@ export class MockTransport implements RpcTransport {
     this.messages.set(sessionId, list)
   }
 
-  private finishWithTermination(session: Session, runId: string, kind: 'error' | 'budget', reason: string): void {
+  /** `errors/classify.py`'s real 7-bucket kinds, mirrored just well enough
+   * here for `/error`/`/budget`'s scripted card to exercise the renderer's
+   * real branches (retry/switch_model/abandon buttons, raw-error collapse) in
+   * `pnpm dev:mock` — not a re-implementation of the daemon's actual text
+   * classification. */
+  private finishWithTermination(
+    session: Session,
+    runId: string,
+    turnId: string,
+    originalText: string,
+    kind: 'error' | 'budget',
+    reason: string
+  ): void {
     session.status = 'idle'
     this.activeRuns.delete(session.id)
+    this.activeTurns.delete(session.id)
+    this.terminatedTurns.set(turnId, { sessionId: session.id, text: originalText })
     const card: TerminationCard =
       kind === 'error'
-        ? { run_id: runId, kind, reason, card: { error_message: reason } }
-        : { run_id: runId, kind, reason, card: { budget: { name: 'session_tokens', used: 100000, limit: 100000, unit: 'tokens' } } }
+        ? {
+            run_id: runId,
+            turn_id: turnId,
+            kind,
+            reason,
+            card: {
+              kind: 'network',
+              title: '网络错误',
+              message: reason,
+              step_seq: 1,
+              raw_excerpt: reason,
+              actions: ['retry', 'switch_model', 'abandon'],
+              retryable: true
+            }
+          }
+        : {
+            run_id: runId,
+            turn_id: turnId,
+            kind,
+            reason,
+            card: {
+              kind: 'budget',
+              title: '已达预算上限',
+              message: reason,
+              step_seq: null,
+              raw_excerpt: reason,
+              actions: ['switch_model', 'abandon'],
+              retryable: false
+            }
+          }
     this.emit('run.terminated', card)
   }
 
-  private requestPermissionThenContinue(session: Session, runId: string, turnId: string, reason: string): void {
+  private requestPermissionThenContinue(
+    session: Session,
+    runId: string,
+    turnId: string,
+    originalText: string,
+    reason: string
+  ): void {
     const requestId = nextId('perm')
     const request: PermissionRequest = {
       request_id: requestId,
@@ -473,7 +579,7 @@ export class MockTransport implements RpcTransport {
       if (decision === 'allow') {
         this.runScriptedReply(session, runId, turnId)
       } else {
-        this.finishWithTermination(session, runId, 'error', '用户在审批面板拒绝了该动作')
+        this.finishWithTermination(session, runId, turnId, originalText, 'error', '用户在审批面板拒绝了该动作')
       }
     })
   }
