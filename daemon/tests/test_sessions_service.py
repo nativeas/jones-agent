@@ -685,11 +685,22 @@ async def test_restart_marks_stale_runs_terminated_and_never_auto_resends_the_qu
 
         # R-N9 (round-6): `session.queue` now returns
         # {items, suspended, reason}, not a bare list.
-        items = (await service.queue(session_id))["items"]
+        queue_response = await service.queue(session_id)
+        items = queue_response["items"]
         assert [i["state"] for i in items] == ["pending"]
         # No Turn was auto-started for the queued item — restart never resends
         # (PRD 9.2/G10/N04): the worker registry stays empty until a real send.
         assert service.worker_manager.get(session_id) is None
+
+        # R-N14 (controller ruling, round-7, 2026-09-20): a force-restarted
+        # Run with a pending queue must also rebuild "已暂停" + "继续", not
+        # just leave the queue items themselves pending — `interrupt_stale_
+        # runs` now writes `queue_suspended_reason` too, same as an ordinary
+        # error termination would have.
+        assert queue_response["suspended"] is True
+        assert queue_response["reason"] == "error"
+        session_row = await service.get(session_id)
+        assert session_row["queue_suspended_reason"] == "error"
     finally:
         await service.shutdown()
 

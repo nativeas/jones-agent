@@ -416,6 +416,28 @@ class _TurnContext:
     # write (and this synchronous assignment, which always happens strictly
     # before that write starts) has already landed.
     terminated_kind: str | None = None
+    # R-N11 (controller ruling, round-7, 2026-09-20): pinned BEFORE any active
+    # termination path (`stop()`/`_terminate_run_for_exceeded_budget`/
+    # `_on_worker_crash`) sends its ACP `session/cancel` notification (or, for
+    # a crashed worker, before it would if it could) — `_finalize_turn_
+    # success` reads this back when `prompt()` eventually returns NORMALLY
+    # with `stopReason:"cancelled"`, because that same notification makes the
+    # worker report a cleanly-cancelled Turn regardless of *why* it was
+    # cancelled. Round-6's R-N7 made budget termination walk the exact same
+    # cancel-then-terminate path `stop()` already used for a user-initiated
+    # stop — round-6 review found the resulting race: `_terminate_run_for_
+    # exceeded_budget` (a background watchdog task, not `_run_turn`'s own
+    # task) sends `cancel()`, and the read loop can resolve `_run_turn`'s
+    # in-flight `prompt()` future with `stopReason:"cancelled"` concurrently,
+    # before that same call's own subsequent `_terminate_run(kind="budget")`
+    # write lands — `_finalize_turn_success`'s old, unconditional "stopReason
+    # cancelled -> kind=user" could then win that race and silently overwrite
+    # a budget/error termination with a wrong `kind="user"` (and no budget
+    # details). `None` means no active termination has claimed this Turn yet
+    # — only then does `_finalize_turn_success` fall back to `"user"`;
+    # otherwise it defers entirely to the claiming path's own `_terminate_run`
+    # call rather than gambling on which one's DB write lands first.
+    termination_intent: str | None = None
 
 
 # R-N5 (controller ruling, 2026-09-20; PRD 11.2 "单个 Run 最大 Step 数 200"/
@@ -872,6 +894,12 @@ class SessionService:
             return {"stopped": False}
         worker = self.worker_manager.get(session_id)
         if worker is not None and worker.client is not None and worker.acp_session_id is not None:
+            # R-N11 (controller ruling, round-7, 2026-09-20): pin the
+            # termination intent BEFORE sending the cancel notification below
+            # — see `_TurnContext.termination_intent`'s own comment for why.
+            ctx_turn = self._active_turns.get(session_id)
+            if ctx_turn is not None:
+                ctx_turn.termination_intent = "user"
             try:
                 # A notification, not a hard kill: PRD 9.3 "用户终止" requires the
                 # in-flight tool call to finish cleanly. `cancel()` sets Hermes's
@@ -879,7 +907,17 @@ class SessionService:
                 # `stopReason="cancelled"` once the agent notices, which
                 # `_finalize_turn_success` turns into `run.terminated{kind:"user"}`.
                 await worker.client.cancel(worker.acp_session_id)
-            except (AcpProtocolError, AcpError) as exc:
+            except Exception as exc:  # noqa: BLE001 - R-N13 (controller ruling,
+                # round-7, 2026-09-20): a worker that crashed just before this
+                # notification can fail `AcpClient._send` with something other
+                # than `(AcpProtocolError, AcpError)` too — e.g. a raw
+                # `ConnectionResetError` writing to a pipe whose other end just
+                # died (`AcpClient._closed` is only ever set inside `close()`,
+                # which nothing calls automatically the instant the subprocess
+                # exits). None of them should block finishing this termination,
+                # same as the two named ACP exception types already didn't —
+                # only `CancelledError` (a `BaseException`, not caught here)
+                # must still propagate.
                 logger.warning(
                     "session/cancel notification failed (worker likely already gone)",
                     extra={"detail": {"session_id": session_id, "error": str(exc)}},
@@ -1621,7 +1659,31 @@ class SessionService:
     ) -> None:
         await self._finalize_streamed_messages(ctx_turn)
         if response.get("stopReason") == "cancelled":
-            await self._terminate_run(ctx_turn, kind="user", reason="stopped by user")
+            # R-N11 (controller ruling, round-7, 2026-09-20): a `stopReason:
+            # "cancelled"` return is ambiguous on its own — `stop()` (user),
+            # `_terminate_run_for_exceeded_budget` (budget) and a would-be
+            # crash notification (error) all send the SAME ACP `session/
+            # cancel` that produces it. `ctx_turn.termination_intent` — set
+            # by whichever of those paths actually initiated this, BEFORE it
+            # sent that notification (see that field's own comment) — is the
+            # only reliable signal for which one this is. `None` or `"user"`
+            # both mean this really is a user stop: `None` is an honest, un-
+            # prompted `stopReason:"cancelled"` (nothing else has claimed
+            # this Turn), and `"user"` is `stop()` having pinned the intent
+            # itself right before sending the SAME cancel notification that
+            # produced this — `stop()` never calls `_terminate_run` on its
+            # own, this is the only place that does it for a user stop.
+            # `"budget"`/`"error"` mean a more specific termination is
+            # already in flight (or already landed) with its own
+            # `_terminate_run` call — calling it again here with a blind
+            # `kind="user"` would either lose that race and get silently
+            # dropped by `_terminate_run`'s idempotency guard (harmless), or
+            # WIN it and overwrite a budget/error termination with the wrong
+            # kind and no budget details (the actual round-6 bug this
+            # closes) — so this defers to that path entirely instead of
+            # gambling on which one lands first.
+            if ctx_turn.termination_intent in (None, "user"):
+                await self._terminate_run(ctx_turn, kind="user", reason="stopped by user")
             return
         await run_in_db_thread(
             queries.mark_run_completed, self.ctx.db, ctx_turn.run_id, ctx_turn.turn_id
@@ -2151,9 +2213,20 @@ class SessionService:
         reads it from this Turn's own `finally` block), and only THEN the
         local task cancel. A `cancel()` failure (worker already dead, or
         unreachable) is logged and does NOT block the rest of this — same
-        `except (AcpProtocolError, AcpError)` shape `stop()` already uses;
-        there's nothing left to notify and the termination must still
-        proceed regardless.
+        broad `except Exception` shape `stop()` also uses (R-N13, controller
+        ruling round-7, 2026-09-20 — widened from the original `(AcpProtocol
+        Error, AcpError)` because a worker that crashed moments earlier can
+        fail `AcpClient._send` with a raw `ConnectionResetError` instead,
+        which isn't either of those two); there's nothing left to notify and
+        the termination must still proceed regardless.
+
+        R-N11 (controller ruling, round-7, 2026-09-20): pins `ctx_turn.
+        termination_intent = "budget"` BEFORE sending that cancel notification
+        — see `_TurnContext.termination_intent`'s own comment for the race
+        this closes (this function runs on a background watchdog task, not
+        `_run_turn`'s own — the read loop resolving `_run_turn`'s in-flight
+        `prompt()` future with `stopReason:"cancelled"` can race ahead of
+        this same call's own `_terminate_run` below).
 
         Cancelling `_run_turn`'s own task LAST (not first) is still what
         guarantees its `finally: await self._advance_queue(...)` runs and
@@ -2176,6 +2249,10 @@ class SessionService:
         Turn's own worker/session by id regardless of which task calls it, so
         the same ordering guarantee holds either way.
         """
+        # R-N11 (controller ruling, round-7, 2026-09-20): pin this BEFORE
+        # sending the cancel notification below — see this method's own
+        # docstring and `_TurnContext.termination_intent`'s own comment.
+        ctx_turn.termination_intent = "budget"
         worker = self.worker_manager.get(ctx_turn.session_id)
         if worker is not None and worker.client is not None and worker.acp_session_id is not None:
             try:
@@ -2183,7 +2260,11 @@ class SessionService:
                 # termination (PRD 9.3) — see this method's own docstring
                 # (R-N7) for why this must happen before `_terminate_run`.
                 await worker.client.cancel(worker.acp_session_id)
-            except (AcpProtocolError, AcpError) as exc:
+            except Exception as exc:  # noqa: BLE001 - R-N13: see this method's
+                # own docstring — a worker that just crashed can fail
+                # `AcpClient._send` with more than `(AcpProtocolError,
+                # AcpError)`; none of them should block finishing this
+                # termination, only `CancelledError` still propagates.
                 logger.warning(
                     "session/cancel notification failed while terminating for "
                     "exceeded budget (worker likely already gone)",
@@ -2210,11 +2291,21 @@ class SessionService:
         tool_call_start`) never fired for a Turn that calls no tools at all —
         pure text generation could run past `max_run_duration_s` forever with
         no checkpoint to catch it (R-N5's own report's documented scope gap;
-        round-6 review: this can't stay a documented gap)."""
+        round-6 review: this can't stay a documented gap).
+
+        R-N12 (controller ruling, round-7, 2026-09-20): a single bad iteration
+        (`_check_run_durations` raising) used to kill this whole background
+        loop forever — same shape fix as `replay/retention.py::run_sweep_
+        loop` already uses: catch and log any `Exception` per iteration so
+        the NEXT scan still runs; only `CancelledError` (shutdown) may
+        propagate out of the loop itself."""
         try:
             while True:
                 await asyncio.sleep(_BUDGET_WATCHDOG_INTERVAL_S)
-                await self._check_run_durations()
+                try:
+                    await self._check_run_durations()
+                except Exception:  # noqa: BLE001 - one bad scan must not kill the loop forever
+                    logger.error("budget watchdog iteration failed", exc_info=True)
         except asyncio.CancelledError:
             raise
 
@@ -2751,6 +2842,13 @@ class SessionService:
                 extra={"detail": {"session_id": session_id, "returncode": returncode}},
             )
             return
+        # R-N11 (controller ruling, round-7, 2026-09-20): pinned defensively,
+        # same as `stop()`/`_terminate_run_for_exceeded_budget` — this path
+        # never itself sends an ACP cancel (the worker is already dead), so
+        # `_finalize_turn_success`'s `stopReason:"cancelled"` race doesn't
+        # apply here in practice, but claiming the intent up front costs
+        # nothing and keeps all termination paths consistent.
+        ctx_turn.termination_intent = "error"
         # In the common case, the in-flight `worker.client.prompt()` call in
         # `_run_turn` observes the closed stdio pipe on its own (AcpClient's read
         # loop fails every pending future the instant the process's stdout hits

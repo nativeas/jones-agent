@@ -1605,3 +1605,137 @@ async def test_run_duration_budget_terminates_a_tool_call_free_turn_via_the_resi
         await _wait_until(lambda: session_id not in service._active_turns, timeout=5)
     finally:
         await service.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Round-7 controller ruling: R-N11/R-N12/R-N13/R-N14
+# ---------------------------------------------------------------------------
+
+
+async def test_budget_termination_intent_survives_a_racing_cancelled_stop_reason(
+    tmp_path, monkeypatch
+):
+    """R-N11 (controller ruling, round-7, 2026-09-20): R-N7 (round-6) made
+    budget termination send the SAME real ACP `session/cancel` notification
+    `stop()` sends for a user-initiated termination — the worker can (and, in
+    the real race this closes, sometimes does) respond to that notification
+    by returning `prompt()`'s response with `stopReason:"cancelled"` on its
+    own, same as it would for an actual `session.stop`. Before this fix,
+    `_finalize_turn_success` unconditionally treated any `stopReason:
+    "cancelled"` as `kind="user"` and called `_terminate_run` again — which
+    could win the race against the budget path's own `_terminate_run` call
+    and overwrite `runs.terminated_kind`/`sessions.queue_suspended_reason`
+    from "budget" to "user" (losing the budget details in the process).
+    `ctx_turn.termination_intent` — pinned to `"budget"` by
+    `_terminate_run_for_exceeded_budget` BEFORE it ever sends that
+    notification — is what `_finalize_turn_success` must defer to instead.
+
+    Reproduces the race directly (same "prove the mechanism, not real
+    asyncio scheduling nondeterminism" approach this file already uses for
+    the duration watchdog above) rather than fighting real event-loop
+    timing: runs the real budget termination to completion, then calls
+    `_finalize_turn_success` again on the SAME `ctx_turn` with a
+    `stopReason:"cancelled"` response — exactly what the racing `prompt()`
+    call would eventually, and legitimately, deliver — and asserts it does
+    NOT re-terminate the Run as "user"."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "MANY_TOOL_CALLS:201")
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        card = _terminated(service)[0]
+        assert card["kind"] == "budget"
+
+        # `_terminate_run_for_exceeded_budget` already set this to "budget"
+        # on the real `ctx_turn` before sending its cancel notification — a
+        # fresh `_TurnContext` here stands in for it with the exact same
+        # field, since the real one has already been popped off
+        # `_active_turns` by `_advance_queue` by now.
+        ctx_turn = service_module._TurnContext(
+            turn_id=card["turn_id"], run_id=card["run_id"], session_id=session_id,
+        )
+        ctx_turn.termination_intent = "budget"
+        await service._finalize_turn_success(ctx_turn, {"stopReason": "cancelled"})
+
+        # No second `run.terminated` broadcast — `_finalize_turn_success`
+        # deferred entirely instead of racing a second `_terminate_run` call.
+        assert len(_terminated(service)) == 1
+        run = await run_in_db_thread(
+            service_module.queries.get_run, service.ctx.db, card["run_id"]
+        )
+        assert run["terminated_kind"] == "budget"
+        session = await run_in_db_thread(
+            service_module.queries.get_session, service.ctx.db, session_id
+        )
+        assert session["queue_suspended_reason"] == "budget"
+    finally:
+        await service.shutdown()
+
+
+async def test_budget_watchdog_loop_survives_a_bad_iteration(tmp_path, monkeypatch):
+    """R-N12 (controller ruling, round-7, 2026-09-20): mirrors `replay/
+    retention.py::run_sweep_loop`'s own shape — a single bad iteration
+    (`_check_run_durations` raising) must not kill the whole background
+    loop, only `asyncio.CancelledError` (shutdown) may propagate out of it."""
+    monkeypatch.setattr(service_module, "_BUDGET_WATCHDOG_INTERVAL_S", 0.01)
+    service = await _make_service(tmp_path, monkeypatch)
+
+    calls: list[int] = []
+
+    async def _flaky_check() -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("boom: simulated bad watchdog scan")
+
+    monkeypatch.setattr(service, "_check_run_durations", _flaky_check)
+    task = asyncio.create_task(service._run_budget_watchdog_loop())
+    try:
+        # A second call only happens if the first one's exception didn't
+        # kill the loop.
+        await _wait_until(lambda: len(calls) >= 2, timeout=5)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+async def test_budget_termination_still_terminates_when_cancel_raises_connection_reset(
+    tmp_path, monkeypatch
+):
+    """R-N13 (controller ruling, round-7, 2026-09-20): a worker that crashed
+    moments before this termination fires can fail `AcpClient._send` with a
+    raw `ConnectionResetError` (writing to a pipe whose other end just died —
+    `AcpClient._closed` is only ever set inside `close()`, nothing calls that
+    automatically the instant the subprocess exits), not the `(AcpProtocol
+    Error, AcpError)` pair the old `except` clause named. This must not block
+    or skip the rest of `_terminate_run_for_exceeded_budget` — the Run still
+    needs to terminate and land in the DB correctly, same as the sibling
+    `..._when_the_acp_cancel_notification_fails` test already covers for the
+    two named ACP exception types."""
+    from jones_daemon.kernel.acp_client import AcpClient
+
+    async def _failing_cancel(self: AcpClient, session_id: str) -> None:
+        raise ConnectionResetError("boom: simulated worker-already-dead pipe reset")
+
+    monkeypatch.setattr(AcpClient, "cancel", _failing_cancel)
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "MANY_TOOL_CALLS:201")
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        card = _terminated(service)[0]
+        assert card["kind"] == "budget"
+        assert card["card"]["kind"] == ErrorKind.BUDGET.value
+
+        run = await run_in_db_thread(
+            service_module.queries.get_run, service.ctx.db, card["run_id"]
+        )
+        assert run["status"] == "terminated"
+        assert run["terminated_kind"] == "budget"
+        await _wait_until(lambda: session_id not in service._active_turns, timeout=5)
+    finally:
+        await service.shutdown()
