@@ -210,11 +210,17 @@ def test_maybe_handle_cli_dispatches_service_subcommands(monkeypatch, tmp_path):
     # end to end (still via the fake default_runner substitution below) without
     # touching the user's actual ~/Library/LaunchAgents.
     monkeypatch.setattr(service, "_default_launch_agents_dir", lambda: tmp_path / "LaunchAgents")
-    monkeypatch.setattr(service, "default_runner", FakeRunner({tuple(PRINT): _cp(3)}))
+    fake = FakeRunner({tuple(PRINT): _cp(3)})
+    monkeypatch.setattr(service, "default_runner", fake)
 
     code = service.maybe_handle_cli(["service", "status"])
 
     assert code == 0
+    # The substitution has to actually take effect: before `dispatch_cli` switched to
+    # late-binding its `runner`, this monkeypatch was a no-op and the call shelled out
+    # to the real `launchctl` (fine on macOS, `FileNotFoundError` on a Linux runner).
+    assert fake.calls, "default_runner substitution never took effect"
+    assert fake.calls[0][0] == "launchctl"
 
 
 def test_dispatch_cli_parses_program_flag(monkeypatch, tmp_path):

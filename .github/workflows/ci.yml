@@ -89,6 +89,16 @@ jobs:
           version: "0.10"
       - name: Install Python 3.12
         run: uv python install 3.12
+      # The e2e spawns a REAL daemon via `uv run python -m jones_daemon`. On a cold
+      # runner that first invocation also CREATES the venv and installs deps
+      # (~20s) — which used to eat the e2e's own 20s budget for the left pane and
+      # fail the job on timing, not on behaviour. Warm the daemon venv here so
+      # `pnpm e2e` measures the app, not dependency installation.
+      - name: Warm daemon venv (so e2e's daemon spawn is a warm start)
+        working-directory: daemon
+        env:
+          UV_FROZEN: "1"
+        run: uv sync
       - name: e2e (real daemon + real Electron, no provider Key configured)
         env:
           UV_FROZEN: "1"

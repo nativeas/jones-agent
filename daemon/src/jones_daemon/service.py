@@ -265,10 +265,19 @@ def _print_status_result(r: StatusResult) -> None:
         print(f"pid: {r.pid}")
 
 
-def dispatch_cli(argv: list[str], *, runner: Runner = default_runner) -> int:
+def dispatch_cli(argv: list[str], *, runner: Runner | None = None) -> int:
     """Handle `service install|uninstall|status [--program "<cmd>"]`. Returns the
     process exit code; never calls `sys.exit` itself so it stays a plain, testable
-    function (`maybe_handle_cli` below is what wires it into a real exit)."""
+    function (`maybe_handle_cli` below is what wires it into a real exit).
+
+    `runner` defaults to `default_runner` by LATE binding (`None` sentinel, resolved
+    below) rather than a default argument value: a default argument is evaluated once
+    at def time, so `monkeypatch.setattr(service, "default_runner", ...)` — which every
+    test here and `maybe_handle_cli`'s own callers rely on — would silently keep
+    shelling out to the real `launchctl`. That is exactly what made the CI daemon job
+    (ubuntu, no `launchctl` binary) fail while the same test passed on macOS."""
+    if runner is None:
+        runner = default_runner
     if not argv or argv[0] not in {"install", "uninstall", "status"}:
         print(
             'usage: python -m jones_daemon service install|uninstall|status [--program "<cmd>"]',
