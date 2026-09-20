@@ -234,7 +234,9 @@ async def test_queue_remove_and_reorder(tmp_path, monkeypatch):
         await service.send(session_id, "SLEEP_MS:400 first turn")
         await service.send(session_id, "queued A")
         await service.send(session_id, "queued B")
-        items = await service.queue(session_id)
+        # R-N9 (round-6): `session.queue` now returns
+        # {items, suspended, reason}, not a bare list.
+        items = (await service.queue(session_id))["items"]
         assert [i["text"] for i in items] == ["queued A", "queued B"]
 
         reordered = await service.queue_reorder(session_id, [items[1]["id"], items[0]["id"]])
@@ -583,7 +585,9 @@ async def test_send_racing_the_end_of_a_turn_never_strands_a_queued_message(
             lambda: len(service.ctx.server.events("message.completed")) >= 2,
             timeout=5,
         )
-        items = await service.queue(session_id)
+        # R-N9 (round-6): `session.queue` now returns
+        # {items, suspended, reason}, not a bare list.
+        items = (await service.queue(session_id))["items"]
         assert items == [], f"stranded in queue: {items!r} (queued={second['queued']!r})"
         user_texts = [
             m["content"]["text"]
@@ -679,7 +683,9 @@ async def test_restart_marks_stale_runs_terminated_and_never_auto_resends_the_qu
         assert run_row["status"] == "terminated"
         assert run_row["terminated_kind"] == "error"
 
-        items = await service.queue(session_id)
+        # R-N9 (round-6): `session.queue` now returns
+        # {items, suspended, reason}, not a bare list.
+        items = (await service.queue(session_id))["items"]
         assert [i["state"] for i in items] == ["pending"]
         # No Turn was auto-started for the queued item — restart never resends
         # (PRD 9.2/G10/N04): the worker registry stays empty until a real send.

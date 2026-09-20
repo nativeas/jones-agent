@@ -6,6 +6,7 @@ import type {
   PermissionRequest,
   QueueItem,
   Session,
+  SessionQueueResponse,
   Step,
   TerminationCard
 } from '../domain/types'
@@ -345,6 +346,14 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       id: sessionId
     })
     if (isActive() && sessionRes.ok && sessionRes.result) {
+      // R-N9 (controller ruling, round-6, 2026-09-20; PRD 9.3): reconstruct
+      // "已暂停" from the persisted value `session.get`'s own row now carries
+      // (`Session.queue_suspended_reason`'s own doc comment), instead of
+      // leaving whatever `bindSession()`'s own reset above just set —
+      // `null`, every time, previously. A live `queue.changed` broadcast
+      // that arrives after this (this pane just (re)subscribed above) still
+      // wins going forward, same as before this round.
+      set({ queueSuspendedReason: sessionRes.result.queue_suspended_reason ?? null })
       const runId = sessionRes.result.turn?.run_id ?? null
       if (runId) {
         const running = sessionRes.result.status === 'running'
@@ -363,7 +372,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
 
     const [messagesRes, queueRes, pendingRes] = await Promise.all([
       transport.call<Message[]>('turn.messages', { session_id: sessionId, limit: 200 }),
-      transport.call<QueueItem[]>('session.queue', { id: sessionId }),
+      transport.call<SessionQueueResponse>('session.queue', { id: sessionId }),
       transport.call<PermissionRequest[]>('permission.pending', { session_id: sessionId })
     ])
     if (!isActive()) return
@@ -377,7 +386,16 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         )
       }))
     }
-    if (queueRes.ok) set({ queue: queueRes.result ?? [] })
+    if (queueRes.ok) {
+      // R-N9: `session.queue`'s response now carries the same persisted
+      // `suspended`/`reason` `session.get` above already applied — setting
+      // it again here is a harmless re-confirmation from the SAME
+      // underlying DB column, not a second independent source of truth.
+      set({
+        queue: queueRes.result?.items ?? [],
+        queueSuspendedReason: queueRes.result?.reason ?? null
+      })
+    }
     if (pendingRes.ok) set({ pendingPermissions: pendingRes.result ?? [] })
   },
 

@@ -96,7 +96,11 @@ class FakeServer:
 
 
 async def _make_service(
-    tmp_path, monkeypatch, *, providers: ProviderResolverProtocol | None = None
+    tmp_path,
+    monkeypatch,
+    *,
+    providers: ProviderResolverProtocol | None = None,
+    clock: Any = None,
 ) -> SessionService:
     monkeypatch.setenv("JONES_HOME", str(tmp_path))
     monkeypatch.setenv("FAKE_ACP_MODE", "normal")
@@ -117,7 +121,13 @@ async def _make_service(
         providers=providers if providers is not None else _StubProviderResolver(),
         config=NullConfigResolver(),
     )
-    service = SessionService(ctx, worker_cmd=[sys.executable, _FAKE_AGENT])
+    kwargs: dict[str, Any] = {}
+    if clock is not None:
+        # R-N8 (controller ruling, round-6, 2026-09-20): lets a duration-cap
+        # test drive `_check_run_durations` deterministically — see
+        # `SessionService.__init__`'s own comment on `self._clock`.
+        kwargs["clock"] = clock
+    service = SessionService(ctx, worker_cmd=[sys.executable, _FAKE_AGENT], **kwargs)
     return service
 
 
@@ -138,12 +148,23 @@ async def _wait_until(predicate, *, timeout: float = 5.0, interval: float = 0.02
     raise AssertionError(f"condition not met within {timeout}s")
 
 
+
+
 def _terminated(service: SessionService) -> list[dict[str, Any]]:
     return [p for _sid, m, p in service.ctx.server.broadcasts if m == "run.terminated"]
 
 
 def _queue_changed_events(service: SessionService) -> list[dict[str, Any]]:
     return [p for _sid, m, p in service.ctx.server.broadcasts if m == "queue.changed"]
+
+
+async def _queue_items(service: SessionService, session_id: str) -> list[dict[str, Any]]:
+    """R-N9 (controller ruling, round-6, 2026-09-20): `SessionService.queue()`
+    now returns `{items, suspended, reason}` (see that method's own
+    docstring), not a bare list — most of this file's existing assertions
+    only ever cared about the items, so this is the one place that unwraps
+    it rather than touching every call site's own assertion shape."""
+    return (await service.queue(session_id))["items"]
 
 
 async def _wait_for_queue_suspended(service: SessionService, *, suspended: bool) -> None:
@@ -358,15 +379,12 @@ async def test_worker_crash_watchdog_force_terminates_when_the_prompt_call_never
         service._turn_tasks[session_id] = stuck_task
 
         await service._on_worker_crash(session_id, 137)
-        # `task.cancel()` (called right after the `current_run` status read,
-        # R-N1 — see `_on_worker_crash`'s comment) only *schedules* delivery of
-        # `CancelledError`, it doesn't synchronously run it. `_on_worker_crash`
-        # does several more `await`s afterward (`_finalize_streamed_messages`,
-        # `_terminate_run`'s DB read/write/broadcast) which should have already
-        # given the event loop plenty of chances to mark the task cancelled by
-        # the time this coroutine resumes here — this extra yield is just cheap
-        # test-side insurance against relying on that, not a production
-        # ordering dependency.
+        # `task.cancel()` (called last, R-N10 — after `_finalize_streamed_
+        # messages`/`_terminate_run`, see `_on_worker_crash`'s own comment)
+        # only *schedules* delivery of `CancelledError`, it doesn't
+        # synchronously run it — this extra yield gives the event loop one
+        # more chance to actually mark the task cancelled before the
+        # assertion below reads it.
         await asyncio.sleep(0)
 
         assert len(_terminated(service)) == 1
@@ -380,24 +398,30 @@ async def test_worker_crash_watchdog_force_terminates_when_the_prompt_call_never
         await service.shutdown()
 
 
-async def test_worker_crash_watchdog_cancels_the_stuck_task_before_its_own_terminate(
+async def test_worker_crash_watchdog_terminates_before_cancelling_the_stuck_task(
     tmp_path, monkeypatch
 ):
-    """Round-N2 review fix (#1, controller ruling R-N1) supersedes round-2's
-    (#7) "broadcast before cancel" ordering, which this test used to lock in
-    (`order == ["terminate", "cancel"]`). Round-2's reordering moved the
-    `self._turn_tasks.get(session_id)` lookup several `await`s after the
-    `current_run` status read — long enough for the in-flight `prompt()`
-    call's own `finally: await self._advance_queue(...)` to pop+start the NEXT
-    queued Turn in between, so that late lookup could grab the NEW task
-    instead of the stuck one (this round's review #1). The fix reverts to
-    capturing/cancelling the task immediately after the status read — this
-    test now locks in THAT order instead (`cancel` before `terminate`) — and
-    relies on `_terminate_run`'s own write/broadcast idempotency split (R-N1,
-    see `test_terminate_run_rebroadcasts_after_a_racing_write_gets_cancelled`
-    below) to still guarantee a broadcast no matter how the race against the
-    cancelled task's own write resolves, instead of trying to win that race
-    through call ordering."""
+    """R-N10 (controller ruling, round-6, 2026-09-20) supersedes round-N2's
+    (R-N1) "cancel before terminate" ordering, which this test used to lock in
+    (`order == ["cancel", "terminate"]`, and before that, round-2's own
+    "terminate before cancel" the round-N2 fix had reverted). R-N1's write/
+    broadcast idempotency split (`_terminate_run`, see `test_terminate_run_
+    rebroadcasts_after_a_racing_write_gets_cancelled` below) already made
+    winning the "which coroutine's DB write lands first" race through call
+    ordering unnecessary — a second, losing write just no-ops or rebroadcasts
+    — so round-N2's own reason for putting `cancel` first no longer applies.
+    What cancel-first left open instead (`_advance_queue`'s own comment, R-N4):
+    a just-cancelled `_run_turn` task could reach `_advance_queue` and read
+    `ctx_turn.terminated_kind` as still `None` before this watchdog got back
+    around to `_terminate_run` (which sets it synchronously) — silently
+    auto-advancing a worker_crash termination instead of suspending the queue
+    for it (PRD 9.3). R-N10 reorders to terminate-then-cancel (mirroring R-N7's
+    `_terminate_run_for_exceeded_budget`), which this test now locks in
+    instead: `terminated_kind` is guaranteed set before this function ever
+    reaches `task.cancel()`. The TASK CAPTURE (`self._turn_tasks.get(session_
+    id)`, still immediately after the `current_run` status read, no `await` in
+    between) is unchanged — round-N2's identity fix for THAT is still exactly
+    what's needed and isn't what moved this round."""
     monkeypatch.setattr(service_module, "_WORKER_CRASH_GRACE_S", 0.2)
     monkeypatch.setattr(service_module, "_WORKER_CRASH_POLL_INTERVAL_S", 0.02)
     service = await _make_service(tmp_path, monkeypatch)
@@ -458,7 +482,7 @@ async def test_worker_crash_watchdog_cancels_the_stuck_task_before_its_own_termi
 
         await service._on_worker_crash(session_id, 137)
 
-        assert order == ["cancel", "terminate"]
+        assert order == ["terminate", "cancel"]
     finally:
         hung.cancel()
         stuck_task.cancel()
@@ -999,7 +1023,7 @@ async def test_abandon_clears_the_pending_queue_and_marks_turns_cancelled(tmp_pa
         assert result["action"] == "abandon"
         assert result["cleared_queue_items"] == 1
 
-        items = await service.queue(session_id)
+        items = await _queue_items(service, session_id)
         assert items == []
 
         failed_turn = await run_in_db_thread(
@@ -1073,7 +1097,7 @@ async def test_user_stop_suspends_the_queue_instead_of_auto_advancing(tmp_path, 
         await _wait_for_queue_suspended(service, suspended=True)
 
         # R-N4: the queued item must NOT have been popped/started.
-        items = await service.queue(session_id)
+        items = await _queue_items(service, session_id)
         assert len(items) == 1
         assert items[0]["text"] == "queued behind the stop"
         assert session_id not in service._active_turns
@@ -1103,7 +1127,7 @@ async def test_error_termination_suspends_the_queue_instead_of_auto_advancing(
         assert card["kind"] == "error"
         await _wait_for_queue_suspended(service, suspended=True)
 
-        items = await service.queue(session_id)
+        items = await _queue_items(service, session_id)
         assert len(items) == 1
         assert session_id not in service._active_turns
         assert len(service.ctx.server.events("turn.started")) == 1
@@ -1146,7 +1170,7 @@ async def test_budget_termination_suspends_the_queue_instead_of_auto_advancing(
         assert card["kind"] == "budget"
         await _wait_for_queue_suspended(service, suspended=True)
 
-        items = await service.queue(session_id)
+        items = await _queue_items(service, session_id)
         assert len(items) == 1
         assert session_id not in service._active_turns
         assert len(service.ctx.server.events("turn.started")) == 1
@@ -1172,14 +1196,14 @@ async def test_queue_resume_starts_the_next_pending_item(tmp_path, monkeypatch):
         # for) fires strictly earlier, inside `_terminate_run`, before
         # `_run_turn`'s `finally: await self._advance_queue(...)` even starts.
         await _wait_for_queue_suspended(service, suspended=True)
-        assert len(await service.queue(session_id)) == 1
+        assert len(await _queue_items(service, session_id)) == 1
 
         result = await service.queue_resume(session_id)
         assert result["resumed"] is True
         # `queue_resume`'s own broadcast is fully awaited before it returns —
         # no extra wait needed for this one, unlike the racier sibling below.
         assert _queue_changed_events(service)[-1]["suspended"] is False
-        assert (await service.queue(session_id)) == []
+        assert (await _queue_items(service, session_id)) == []
 
         # The resumed Turn runs the fake agent's plain "normal" path (no
         # marker in "resume me") and completes on its own.
@@ -1241,7 +1265,7 @@ async def test_send_a_new_message_implicitly_resumes_a_suspended_queue(tmp_path,
         # `finally`) clears — `run.terminated` alone fires strictly earlier
         # (see `_wait_for_queue_suspended`'s own docstring).
         await _wait_for_queue_suspended(service, suspended=True)
-        assert len(await service.queue(session_id)) == 1
+        assert len(await _queue_items(service, session_id)) == 1
 
         new_msg = await service.send(session_id, "brand new message, jumps the queue")
         assert new_msg["queued"] is False  # nothing "running" -> starts immediately
@@ -1253,9 +1277,118 @@ async def test_send_a_new_message_implicitly_resumes_a_suspended_queue(tmp_path,
         # broadcast, fired from a different, concurrently-scheduled task —
         # the two have no guaranteed order relative to each other).
         await _wait_for_queue_suspended(service, suspended=False)
-        items = await service.queue(session_id)
+        items = await _queue_items(service, session_id)
         assert items == []
         assert len(service.ctx.server.events("turn.started")) == 3
+    finally:
+        await service.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# R-N9 (controller ruling, round-6, 2026-09-20; 04-w5-interfaces.md §4.3, PRD
+# 9.3): "挂起状态必须可查询、可重建，不能只活在 renderer 内存里" — R-N4's
+# `suspended`/`reason` were ephemeral (a `queue.changed` broadcast, fired
+# once, never replayed); `sessions.queue_suspended_reason` persists the same
+# fact so `session.get`/`session.queue` can reconstruct it after a restart or
+# a renderer reload, not just a live subscription.
+# ---------------------------------------------------------------------------
+
+
+async def test_session_get_and_queue_report_the_persisted_suspended_reason(
+    tmp_path, monkeypatch
+):
+    """The daemon-side half of "错误终止 → 切走切回 → 仍显示「已暂停」与「继续」
+    按钮" (R-N9's own acceptance test) — a renderer reload is just a fresh
+    `session.get`/`session.queue` round trip; this asserts what those two
+    RPCs actually return after a real error termination with a real pending
+    queue item, without needing an Electron renderer to observe it."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        assert (await service.get(session_id))["queue_suspended_reason"] is None
+
+        first = await service.send(session_id, "TOOL_EXCEPTION please")
+        assert first["queued"] is False
+        await _wait_until(lambda: session_id in service._active_turns)
+        second = await service.send(session_id, "queued behind the failure")
+        assert second["queued"] is True
+
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_for_queue_suspended(service, suspended=True)
+
+        # `session.get`'s row (`queries.get_session`'s plain `SELECT *`)
+        # carries the persisted column for free — no `SessionService.get()`
+        # code change was needed for this half.
+        session_row = await service.get(session_id)
+        assert session_row["queue_suspended_reason"] == "error"
+
+        # `session.queue` (this round's response-shape change) carries the
+        # same fact explicitly, alongside the items themselves.
+        queue_response = await service.queue(session_id)
+        assert queue_response["suspended"] is True
+        assert queue_response["reason"] == "error"
+        assert len(queue_response["items"]) == 1
+
+        # `queue_resume()` clears the persisted value, not just the live
+        # broadcast — simulating "切走切回" is exactly re-reading `session.get`
+        # after this, which a real renderer's `bindSession()` already does.
+        await service.queue_resume(session_id)
+        assert (await service.get(session_id))["queue_suspended_reason"] is None
+        cleared_queue = await service.queue(session_id)
+        assert cleared_queue["suspended"] is False
+        assert cleared_queue["reason"] is None
+    finally:
+        await service.shutdown()
+
+
+async def test_sending_a_new_message_clears_the_persisted_suspended_reason(
+    tmp_path, monkeypatch
+):
+    """The implicit-resume half of R-N9's persistence — `_run_turn` (not
+    `send()` itself, out of this round's authorized touch set) clears
+    `queue_suspended_reason` at the start of every Turn it runs, which is
+    where `send()`'s own "not running -> immediate execute" branch ends up."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "TOOL_EXCEPTION please")
+        await _wait_until(lambda: session_id in service._active_turns)
+        await service.send(session_id, "still queued behind the failure")
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_for_queue_suspended(service, suspended=True)
+        assert (await service.get(session_id))["queue_suspended_reason"] == "error"
+
+        await service.send(session_id, "brand new message, jumps the queue")
+        # This brand-new message has no marker (no SLEEP_MS/TOOL_EXCEPTION),
+        # so its Turn can complete near-instantly — polling `_active_turns`
+        # directly would race losing the window entirely. `_run_turn`'s own
+        # clear (see that method's comment) commits strictly before this
+        # Turn's `turn.started` broadcast, which strictly precedes its own
+        # eventual `_advance_queue` -> `queue.changed{suspended:false}` —
+        # waiting on that broadcast (same as this file's sibling send()-
+        # resume test above) is the non-racy signal.
+        await _wait_for_queue_suspended(service, suspended=False)
+        assert (await service.get(session_id))["queue_suspended_reason"] is None
+    finally:
+        await service.shutdown()
+
+
+async def test_abandon_clears_the_persisted_suspended_reason(tmp_path, monkeypatch):
+    """R-N9's third clear path — `retry(action="abandon")` already broadcasts
+    `suspended:false`; this asserts the persisted value follows it too."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "TOOL_EXCEPTION please")
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        failed_turn_id = _terminated(service)[0]["turn_id"]
+        assert (await service.get(session_id))["queue_suspended_reason"] == "error"
+
+        await service.retry(session_id, failed_turn_id, action="abandon")
+        assert (await service.get(session_id))["queue_suspended_reason"] is None
     finally:
         await service.shutdown()
 
@@ -1313,59 +1446,149 @@ async def test_step_count_budget_terminates_the_run_with_a_budget_card(tmp_path,
         await service.shutdown()
 
 
-async def test_run_duration_budget_terminates_the_run_via_injected_clock(tmp_path, monkeypatch):
-    """"注入时钟超时长" (R-N5's own test description) — injects the clock by
-    reaching into the live `ctx_turn.started_at` this Turn's `_run_turn`
-    already set (`service._active_turns[session_id]`, the same direct-state
-    access this file's other tests already use — see e.g. the N07 watchdog
-    tests further below) and pushing it back past the PRD 11.2 default
-    (7200s), rather than monkeypatching the global `time.monotonic` function
-    itself. Tried that first; it breaks far more than intended — CPython's
-    `asyncio.BaseEventLoop.time()` IS `time.monotonic()`, so patching the
-    module attribute also patches every OTHER piece of scheduling in the
-    process for the rest of the test: any callback already scheduled via
-    `call_later`/`asyncio.sleep` (this daemon's own idle-worker reaper
-    included — `workers/manager.py::_reap_idle_loop`, already sleeping when
-    `service.worker_manager.start()` ran, well before this test even begins)
-    sees its deadline as having already passed the instant the clock jumps,
-    and fires immediately — the reaper's own idle check then reads the SAME
-    patched clock against `worker.last_active` (set with the *original*,
-    pre-jump value) and — confirmed by reproducing it while writing this
-    test — reaps this Turn's still-busy worker mid-flight as "idle", which
-    surfaces here as `kind="error"`/`worker_crash`, not the `kind="budget"`
-    duration cap this test actually wants to exercise. Mutating just this one
-    Turn's own `started_at` sidesteps all of that: nothing else in the
-    process reads it.
+async def test_budget_termination_sends_a_real_acp_cancel_before_terminate_and_before_local_cancel(
+    tmp_path, monkeypatch
+):
+    """R-N7 (controller ruling, round-6, 2026-09-20): round-5 review, correctly
+    — "取消 _run_turn 只是放弃等待 prompt()，worker 里的 agent 照跑不误、继续调
+    工具" — cancelling only the LOCAL `_run_turn` asyncio task (what this used
+    to do) never told the real worker/agent anything happened. The fix walks
+    the SAME path `stop()` (a user-initiated termination) already uses: a real
+    ACP `session/cancel` notification to the actual fake-agent subprocess over
+    the wire, BEFORE `_terminate_run`, and the local task only cancelled
+    AFTER that.
 
-    Timing still needs care even without touching the clock: `session_id in
-    service._active_turns` becomes true well BEFORE the worker startup
-    self-check even starts (`ctx_turn` is stored there long before `ensure_
-    started` runs it) — waiting only on that, then mutating `started_at`,
-    raced the real `USE_TOOL` tool_call event arriving first often enough in
-    practice to flake (self-check + the real prompt's "Hel"/"lo" deltas +
-    its `USE_TOOL` tool_call can all complete within that same window). The
-    fix mirrors the (removed) clock-patching version's own synchronization:
-    `SLEEP_MS:200` makes the fake agent hold its `USE_TOOL` tool_call for
-    200ms of real wall time — AFTER it has already sent its "Hel"/"lo"
-    deltas — giving a deterministic window once this test observes the
-    first `message.delta` (proof self-check finished and the REAL prompt,
-    not the probe, is the one now in flight — probe updates never reach
-    `SessionService` at all, see `workers/manager.py::_collect_startup_
-    update`'s docstring)."""
+    Monkeypatches `AcpClient.cancel` at the class level (not the `worker.
+    client` instance — the worker doesn't exist yet when this patch has to go
+    in, before `service.worker_manager.start()`) to record when it fires
+    relative to `_terminated(service)` — real wire effect preserved, `await
+    orig_cancel(self, session_id)` still runs, so this is a REAL round trip to
+    the real `fake_acp_agent.py` subprocess, not a mock standing in for one."""
+    from jones_daemon.kernel.acp_client import AcpClient
+
+    order: list[str] = []
+    orig_cancel = AcpClient.cancel
+
+    async def _recording_cancel(self: AcpClient, session_id: str) -> None:
+        # The strongest form of "cancel happens before terminate": assert it
+        # right here, not just record it — a `run.terminated` broadcast
+        # already having landed by the time this notification goes out would
+        # mean R-N7's ordering regressed.
+        assert _terminated(service) == []
+        order.append("acp_cancel")
+        await orig_cancel(self, session_id)
+
+    monkeypatch.setattr(AcpClient, "cancel", _recording_cancel)
     service = await _make_service(tmp_path, monkeypatch)
     await service.worker_manager.start()
     try:
         session_id = await _new_session(service, title="s1")
+        # "持续发 tool_call" (R-N7's own test description) — same real ACP
+        # round trip `test_step_count_budget_terminates_the_run_with_a_budget_
+        # card` above uses.
+        await service.send(session_id, "MANY_TOOL_CALLS:201")
+        task = service._turn_tasks[session_id]
 
-        result = await service.send(session_id, "SLEEP_MS:200 USE_TOOL")
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        assert order == ["acp_cancel"]
+        card = _terminated(service)[0]
+        assert card["kind"] == "budget"
+
+        run = await run_in_db_thread(
+            service_module.queries.get_run, service.ctx.db, card["run_id"]
+        )
+        # 不再有新 Step 落库 (R-N7's own test description) past the limit —
+        # same assertion the sibling test above makes.
+        assert run["terminated_step_seq"] == 200
+        steps = await service.run_steps(card["run_id"])
+        assert len(steps) == 200
+
+        # The LOCAL task actually got cancelled too (last, not skipped).
+        await _wait_until(lambda: task.done(), timeout=5)
+        assert task.cancelled()
+    finally:
+        await service.shutdown()
+
+
+async def test_budget_termination_still_terminates_when_the_acp_cancel_notification_fails(
+    tmp_path, monkeypatch
+):
+    """R-N7: "cancel 本身失败（worker 已死/超时）要记日志并继续终止流程，不能
+    因此卡住" — mirrors `stop()`'s own `except (AcpProtocolError, AcpError)`
+    handling. `AcpProtocolError` here (rather than actually killing the
+    worker) is the simpler, deterministic way to exercise the SAME `except`
+    branch `stop()`'s own tests already cover for `stop()` itself — this
+    tests that `_terminate_run_for_exceeded_budget` doesn't hang or skip
+    termination when it fires."""
+    from jones_daemon.kernel.acp_client import AcpClient, AcpProtocolError
+
+    async def _failing_cancel(self: AcpClient, session_id: str) -> None:
+        raise AcpProtocolError("boom: simulated cancel failure")
+
+    monkeypatch.setattr(AcpClient, "cancel", _failing_cancel)
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        await service.send(session_id, "MANY_TOOL_CALLS:201")
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        card = _terminated(service)[0]
+        assert card["kind"] == "budget"
+        await _wait_until(lambda: session_id not in service._active_turns, timeout=5)
+    finally:
+        await service.shutdown()
+
+
+async def test_run_duration_budget_terminates_a_tool_call_free_turn_via_the_resident_watchdog(
+    tmp_path, monkeypatch
+):
+    """R-N8 (controller ruling, round-6, 2026-09-20) moved the 时长上限 check
+    off `_handle_tool_call_start` entirely, onto `_check_run_durations` (a
+    resident poll over `_active_turns`, `_run_budget_watchdog_loop`) — this
+    supersedes the predecessor test that used to live here (round-5's "注入
+    时钟超时长", `git log` has the full docstring on why it mutated `ctx_turn.
+    started_at` directly rather than monkeypatching the real `time.monotonic`:
+    that broke `workers/manager.py`'s own idle-worker reaper). This proves the
+    NEW mechanism specifically for the ONE case the OLD tool_call-triggered
+    check could never cover — R-N5's own report's documented scope gap: "纯
+    文本、零工具调用的 Turn" (no `USE_TOOL` marker in the prompt at all — the
+    predecessor test's own prompt, "SLEEP_MS:200 USE_TOOL", doesn't exist
+    anymore because there's no longer a tool_call event for the check to hang
+    off of).
+
+    Uses the injectable `self._clock` (R-N8, `SessionService.__init__`'s own
+    comment) — real time never advances, and `_check_run_durations` is called
+    directly rather than waiting the real `_BUDGET_WATCHDOG_INTERVAL_S` (15s),
+    the same "prove the mechanism, not the timer" approach `replay/
+    retention.py`'s own tests already use for its sweep loop. Nothing else in
+    the process reads `service._clock` (unlike the real `time.monotonic` the
+    predecessor test avoided touching), so there's no `_reap_idle_loop`
+    interaction to worry about here."""
+    fake_now = [1_000.0]
+
+    def _clock() -> float:
+        return fake_now[0]
+
+    service = await _make_service(tmp_path, monkeypatch, clock=_clock)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+
+        # "SLEEP_MS:500", no "USE_TOOL" — this Turn calls zero tools; the fake
+        # agent still streams its "Hel"/"lo" deltas first, giving this test a
+        # deterministic ~500ms real-wall-time window (same synchronization
+        # technique the predecessor test used) to act before it finishes on
+        # its own.
+        result = await service.send(session_id, "SLEEP_MS:500")
         assert result["queued"] is False
         await _wait_until(
             lambda: len(service.ctx.server.events("message.delta")) >= 1, timeout=5
         )
-        # Push this Turn's own start time back past the PRD 11.2 default —
-        # `_handle_tool_call_start`'s duration check reads `time.monotonic() -
-        # ctx_turn.started_at`, real `time.monotonic()`, unpatched.
-        service._active_turns[session_id].started_at = time.monotonic() - (7200.0 + 10.0)
+
+        ctx_turn = service._active_turns[session_id]
+        assert ctx_turn.started_at == 1_000.0  # sanity: `_run_turn` used the injected clock
+        fake_now[0] = 1_000.0 + ctx_turn.max_run_duration_s + 10.0
+        await service._check_run_durations()
 
         await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
         card = _terminated(service)[0]
@@ -1376,5 +1599,9 @@ async def test_run_duration_budget_terminates_the_run_via_injected_clock(tmp_pat
         assert budget["limit"] == 7200
         assert budget["unit"] == "秒"
         assert budget["used"] >= 7200
+
+        # R-N4: a budget termination suspends the queue too, same as the
+        # tool-call-triggered path's own test asserts.
+        await _wait_until(lambda: session_id not in service._active_turns, timeout=5)
     finally:
         await service.shutdown()

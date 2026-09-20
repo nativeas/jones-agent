@@ -220,7 +220,13 @@ export class MockTransport implements RpcTransport {
       case 'session.retry':
         return this.handleRetry(params.id, params.turn_id, params.action ?? 'retry', params.model_override)
       case 'session.queue':
-        return this.queue.get(params.id) ?? []
+        // R-N9 (controller ruling, round-6, 2026-09-20): `{items, suspended,
+        // reason}`, not a bare array — this mock has no persisted-suspend
+        // state to report (see `session.queue_resume`'s own comment: it
+        // already doesn't replicate `_advance_queue`'s full suspend
+        // bookkeeping), so `suspended`/`reason` are always the "not
+        // suspended" values here.
+        return { items: this.queue.get(params.id) ?? [], suspended: false, reason: null }
       case 'session.queue_remove': {
         const items = (this.queue.get(params.id) ?? []).filter((q) => q.id !== params.item_id)
         this.queue.set(params.id, items)

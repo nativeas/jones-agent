@@ -41,6 +41,63 @@ describe('chatStore', () => {
     expect(useChatStore.getState().timeline).toEqual([])
   })
 
+  it('bindSession reconstructs "已暂停" from the persisted session.get value, surviving a switch away and back (R-N9, controller ruling round-6, 2026-09-20)', async () => {
+    // R-N9: `queue.changed`'s own `suspended`/`reason` (R-N4) only ever
+    // arrived as a live broadcast — nothing rebuilt it from a fresh
+    // `bindSession()` before this round. A hand-rolled transport (matching
+    // this file's own "superseded bind" tests above) rather than
+    // `MockTransport` — that mock doesn't track persisted suspend state at
+    // all (see its own `session.queue` comment), so it can't exercise this.
+    const sessionRow = {
+      id: 'session_suspended',
+      project_id: 'proj',
+      agent_id: 'agent',
+      parent_id: null,
+      is_main: false,
+      mode: 'task',
+      title: 'suspended session',
+      status: 'idle',
+      queue_suspended_reason: 'error'
+    }
+    let sessionGetCalls = 0
+    const transport: RpcTransport = {
+      call: async <T,>(method: string, params?: Record<string, unknown>): Promise<RpcCallResult<T>> => {
+        const id = (params as { id?: string } | undefined)?.id
+        if (method === 'session.get') {
+          sessionGetCalls += 1
+          if (id === sessionRow.id) return { ok: true, result: sessionRow as T }
+          return { ok: true, result: { ...sessionRow, id, queue_suspended_reason: null } as T }
+        }
+        if (method === 'session.queue' && id === sessionRow.id) {
+          return { ok: true, result: { items: [], suspended: true, reason: 'error' } as T }
+        }
+        if (method === 'session.queue') {
+          return { ok: true, result: { items: [], suspended: false, reason: null } as T }
+        }
+        return { ok: true, result: [] as T }
+      },
+      on: () => () => {}
+    }
+
+    await useChatStore.getState().bindSession(transport, sessionRow.id)
+    expect(useChatStore.getState().queueSuspendedReason).toBe('error')
+
+    // "切走": bind a different session — a real renderer's own reset (both
+    // the initial `null` in `bindSession()` and a fresh `session.get` for
+    // the OTHER session, which has no suspended reason) must not leave this
+    // session's "error" lingering in some shared/global slot.
+    await useChatStore.getState().bindSession(transport, 'session_other')
+
+    // "切回": rebinding the ORIGINAL session must reconstruct "已暂停" from
+    // the server's persisted value again — not from anything this store
+    // itself remembered in memory (each `bindSession()` above reset the
+    // whole store's session-scoped state, including `queueSuspendedReason`,
+    // back to `null` first).
+    await useChatStore.getState().bindSession(transport, sessionRow.id)
+    expect(useChatStore.getState().queueSuspendedReason).toBe('error')
+    expect(sessionGetCalls).toBe(3) // once per bindSession() call above
+  })
+
   it('send() runs a full turn to completion: running toggles, assistant message + step land in the timeline', async () => {
     const transport = new MockTransport({ schedule: (fn) => fn() })
     await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)

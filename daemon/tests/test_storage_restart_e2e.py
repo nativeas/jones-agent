@@ -149,7 +149,9 @@ async def test_restart_does_not_replay_pending_queue_items(jones_home):
 
         queue_response = await _rpc(sock_path, "session.queue", {"id": "s-restart"})
         assert "error" not in queue_response, queue_response
-        items = queue_response["result"]
+        # R-N9 (controller ruling, round-6, 2026-09-20): `session.queue` now
+        # returns `{items, suspended, reason}`, not a bare array.
+        items = queue_response["result"]["items"]
         assert len(items) == 3
         assert all(item["state"] == "pending" for item in items)
 

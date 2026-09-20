@@ -34,6 +34,29 @@ export interface Session {
   mode: SessionMode
   title: string
   status: SessionStatus
+  /** R-N9 (controller ruling, round-6, 2026-09-20; PRD 9.3): persisted
+   * counterpart of `queue.changed`'s own `suspended`/`reason` — `null`/
+   * absent when the queue isn't suspended, one of the three outer
+   * termination kinds otherwise. Lets `chatStore`'s `bindSession()`
+   * reconstruct "已暂停" + "继续" from `session.get` after a reload/session
+   * switch, not only from a live broadcast this pane happened to be
+   * subscribed for when it fired. Optional (not on every existing `Session`
+   * fixture in this codebase's own tests/mock — a real daemon `session.get`
+   * response always has it; `chatStore` treats an absent value the same as
+   * `null`, same as `queue.changed`'s own `suspended`/`reason` already do). */
+  queue_suspended_reason?: 'user' | 'error' | 'budget' | null
+}
+
+/** R-N9 (controller ruling, round-6, 2026-09-20): `session.queue`'s response
+ * shape — used to be a bare `QueueItem[]`, now carries the same persisted
+ * suspended state `Session.queue_suspended_reason` does, so a caller that
+ * only ever calls `session.queue` (not `session.get`) can still reconstruct
+ * it. `session.queue_remove`/`session.queue_reorder` are unaffected by this
+ * round's ruling and keep returning a bare `QueueItem[]`. */
+export interface SessionQueueResponse {
+  items: QueueItem[]
+  suspended: boolean
+  reason: 'user' | 'error' | 'budget' | null
 }
 
 export type MessageRole = 'user' | 'assistant' | 'system' | 'tool'

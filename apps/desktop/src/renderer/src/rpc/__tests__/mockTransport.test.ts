@@ -58,8 +58,12 @@ describe('MockTransport', () => {
     const second = await transport.call<{ queued: boolean }>('session.send', { id: sessionId, text: '第二条' })
     expect(second.result?.queued).toBe(true)
 
-    const queue = await transport.call<Array<{ text: string }>>('session.queue', { id: sessionId })
-    expect(queue.result).toEqual([expect.objectContaining({ text: '第二条' })])
+    // R-N9 (controller ruling, round-6, 2026-09-20): `session.queue` now
+    // returns `{items, suspended, reason}`, not a bare array.
+    const queue = await transport.call<{ items: Array<{ text: string }> }>('session.queue', {
+      id: sessionId
+    })
+    expect(queue.result?.items).toEqual([expect.objectContaining({ text: '第二条' })])
   })
 
   it('/error produces a run.terminated kind:"error" and returns the session to idle', async () => {

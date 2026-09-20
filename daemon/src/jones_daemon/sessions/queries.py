@@ -97,6 +97,29 @@ def set_session_mode(conn: sqlite3.Connection, session_id: str, mode: str) -> di
     return get_session(conn, session_id)
 
 
+def set_queue_suspended_reason(
+    conn: sqlite3.Connection, session_id: str, reason: str | None
+) -> None:
+    """R-N9 (controller ruling, round-6, 2026-09-20): persists what
+    `_advance_queue`'s `queue.changed` broadcast (`suspended`/`reason`,
+    R-N4) has always computed on the fly but never wrote down —
+    `_terminate_run` calls this with the outer `kind` (`"user"|"error"|
+    "budget"`) the same moment it sets `ctx_turn.terminated_kind` (see that
+    method's own comment); `_run_turn` calls this with `None` at the start of
+    every Turn (send()'s immediate-run path, `retry()`, `queue_resume()`, and
+    `_advance_queue`'s own auto-continue all end up here), since a Turn now
+    running is definitionally not a suspended queue. `session.get`/
+    `session.queue` both read this back (via `get_session`'s plain `SELECT *`
+    for the former; explicitly for the latter, see `SessionService.queue()`)
+    so a renderer that reloads/switches sessions can reconstruct "已暂停" +
+    "继续" instead of only ever learning about it from a live broadcast."""
+    conn.execute(
+        "UPDATE sessions SET queue_suspended_reason = ?, updated_at = ? WHERE id = ?",
+        (reason, iso_now(), session_id),
+    )
+    conn.commit()
+
+
 def latest_turn(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
     return _d(
         conn.execute(

@@ -46,6 +46,7 @@ import base64
 import contextlib
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -102,6 +103,14 @@ _EDIT_APPROVAL_HERMES_TIMEOUT_SECONDS = 60.0
 # widening `SessionService.__init__`'s signature.
 _WORKER_CRASH_GRACE_S = 5.0
 _WORKER_CRASH_POLL_INTERVAL_S = 0.1
+# R-N8 (controller ruling, round-6, 2026-09-20; PRD 11.2 单个 Run 最大时长):
+# how often `_run_budget_watchdog_loop` scans `_active_turns` for a Turn past
+# its `max_run_duration_s` — not from `settings.json` (that config's job is
+# "how long is too long", not "how often to check"); a Run running well past
+# its 2-hour default budget being caught within 15s of tripping it is more
+# than timely enough, and cheap: an O(active Turns) in-memory scan, no DB
+# round trip unless one has actually exceeded its budget.
+_BUDGET_WATCHDOG_INTERVAL_S = 15.0
 
 
 def _extract_text(content: Any) -> str:
@@ -362,14 +371,17 @@ class _TurnContext:
     # turn` 记录开始时刻" (see that method's own comment). Deliberately NOT a
     # `field(default_factory=time.monotonic)` for `started_at`: a default
     # factory is resolved to a plain function reference once, at this class's
-    # own module-import moment -- a test that `monkeypatch.setattr(service_
-    # module.time, "monotonic", fake_clock)` (exactly what a duration-cap
-    # test needs) would silently keep hitting the ORIGINAL real `time.
-    # monotonic` through that captured reference, never the patched one.
-    # `_run_turn`'s own `ctx_turn.started_at = time.monotonic()` line
-    # resolves the `time` module attribute fresh at call time instead, same
-    # as `_handle_tool_call_start`'s own read of it -- both honor a test's
-    # monkeypatch this way. `max_steps_per_run`/`max_run_duration_s` mirror
+    # own module-import moment -- a test wanting a fake clock would silently
+    # keep hitting whatever real callable got captured at import time, never
+    # a later substitution. `_run_turn`'s own `ctx_turn.started_at = self.
+    # _clock()` line reads `SessionService._clock` fresh at call time instead
+    # -- R-N8 (round-6) replaced this field's original rationale here (a
+    # `monkeypatch.setattr(service_module.time, "monotonic", ...)` a
+    # duration-cap test used to need) with that constructor-injected callable
+    # instead, once the duration check itself moved off `_handle_tool_call_
+    # start` onto a resident poll (`_check_run_durations`) that needed its own
+    # deterministic-clock test story — see `SessionService.__init__`'s own
+    # comment on `self._clock` for why. `max_steps_per_run`/`max_run_duration_s` mirror
     # the module-level `_DEFAULT_MAX_STEPS_PER_RUN`/`_DEFAULT_MAX_RUN_
     # DURATION_S` constants right below this class for a related reason: a
     # tool_call event that somehow raced ahead of `_run_turn`'s settings read
@@ -433,8 +445,25 @@ class _PendingPermission:
 
 
 class SessionService:
-    def __init__(self, ctx: DaemonContext, *, worker_cmd: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        ctx: DaemonContext,
+        *,
+        worker_cmd: list[str] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.ctx = ctx
+        # R-N8 (controller ruling, round-6, 2026-09-20): injectable so
+        # `_run_budget_watchdog_loop`/`_check_run_durations` (and `_run_turn`'s
+        # own `started_at` stamp, kept on the same clock for consistency) can be
+        # driven deterministically by a test without monkeypatching the real
+        # `time.monotonic` — that was tried for the tool_call-triggered duration
+        # check this replaces and broke `workers/manager.py`'s own idle-worker
+        # reaper, which also reads `time.monotonic()` (see `test_errors_
+        # sessions_integration.py`'s superseded docstring for the reproduction).
+        # Defaults to the real clock so every non-test construction is
+        # unaffected.
+        self._clock = clock
         self.worker_manager = WorkerManager(
             user_root=ctx.paths.user_root(),
             on_session_update=self._on_session_update,
@@ -453,6 +482,14 @@ class SessionService:
         # dangling tasks nobody awaits.
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._retention_task: asyncio.Task[None] | None = None
+        # R-N8 (controller ruling, round-6, 2026-09-20; PRD 11.2 单个 Run 最大
+        # 时长): a resident poll over `_active_turns`, replacing R-N5's
+        # tool_call-triggered check (`_handle_tool_call_start`, removed this
+        # round) — that check never fired for a Turn with zero tool calls (pure
+        # text generation), the exact gap R-N5's own report flagged as a known
+        # scope gap. Same lifecycle shape as `_retention_task` right above:
+        # started in `startup()`, cancelled+awaited in `shutdown()`.
+        self._budget_watchdog_task: asyncio.Task[None] | None = None
         # `permission.decide(remember="session")`'s target (Issue #11,
         # 02-w3-interfaces.md §1.1's "remember"): in-memory only, gone on
         # restart (matches PRD 5.8/9.2 — nothing about a restart should
@@ -510,6 +547,8 @@ class SessionService:
         # FR06 回放保留策略 (02-w3-interfaces.md §2/§3: "清理在空闲时跑") — a plain
         # background loop, not tied to any request's critical path.
         self._retention_task = asyncio.create_task(replay_retention.run_sweep_loop(self.ctx))
+        # R-N8: same shape, this branch's own background loop.
+        self._budget_watchdog_task = asyncio.create_task(self._run_budget_watchdog_loop())
 
     async def shutdown(self) -> None:
         # Close off every still-pending permission wait before tearing workers
@@ -555,6 +594,10 @@ class SessionService:
             self._retention_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._retention_task
+        if self._budget_watchdog_task is not None:
+            self._budget_watchdog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._budget_watchdog_task
         # Let already-scheduled Step-payload writes (`_write_step_payload`)
         # finish rather than abandoning them mid-write — bounded, not indefinite:
         # a shutdown must still make forward progress even if a write is stuck
@@ -984,6 +1027,12 @@ class SessionService:
             # here so a renderer that had this session's queue marked
             # suspended (from an earlier `_advance_queue` broadcast) doesn't
             # keep showing "已暂停" against a queue this abandon just emptied.
+            # R-N9 (round-6): the persisted counterpart of that same clear —
+            # `session.get`/`session.queue` must stop reporting this session
+            # suspended too, not just this one broadcast.
+            await run_in_db_thread(
+                queries.set_queue_suspended_reason, self.ctx.db, session_id, None
+            )
             await self.ctx.server.broadcast(
                 session_id,
                 "queue.changed",
@@ -1011,8 +1060,21 @@ class SessionService:
             self._turn_model_override[result["turn_id"]] = model_override
         return {**result, "action": "retry", "retried_turn_id": turn_id}
 
-    async def queue(self, session_id: str) -> list[dict[str, Any]]:
-        return await run_in_db_thread(queries.list_queue_items, self.ctx.db, session_id)
+    async def queue(self, session_id: str) -> dict[str, Any]:
+        """R-N9 (controller ruling, round-6, 2026-09-20): used to return the
+        bare `QueueItem[]` — now wraps it with the same `suspended`/`reason`
+        shape `queue.changed` broadcasts (R-N4) and `session.get` already
+        carries via its own row (`queries.set_queue_suspended_reason`'s own
+        docstring has the full read/write map), so a caller that only ever
+        polls `session.queue` (not `session.get`) can still reconstruct
+        "已暂停" + "继续" after a reload. Breaking response-shape change to
+        this one RPC's `SessionService` method — `queue_remove`/
+        `queue_reorder` (untouched, still bare `QueueItem[]`) aren't part of
+        this round's ruling and keep their existing shape."""
+        items = await run_in_db_thread(queries.list_queue_items, self.ctx.db, session_id)
+        session = await run_in_db_thread(queries.get_session, self.ctx.db, session_id)
+        reason = session["queue_suspended_reason"] if session else None
+        return {"items": items, "suspended": reason is not None, "reason": reason}
 
     async def queue_remove(self, session_id: str, item_id: str) -> list[dict[str, Any]]:
         async with self._lock(session_id):
@@ -1077,6 +1139,17 @@ class SessionService:
                     {"id": session_id},
                 )
             self._start_turn(session_id, item["turn_id"], item["text"])
+            # R-N9 (controller ruling, round-6, 2026-09-20): the persisted
+            # counterpart of this method's own `suspended:false` broadcast
+            # below. Redundant with (but strictly earlier than) the clear
+            # `_run_turn` itself will also do once its just-scheduled task
+            # actually runs (`_start_turn` above only schedules it) — awaited
+            # here so `session.get`/`session.queue` are already consistent
+            # with this RPC's own response the instant it returns, not just
+            # eventually once that task gets its turn on the loop.
+            await run_in_db_thread(
+                queries.set_queue_suspended_reason, self.ctx.db, session_id, None
+            )
         items = await run_in_db_thread(queries.list_queue_items, self.ctx.db, session_id)
         await self.ctx.server.broadcast(
             session_id,
@@ -1310,6 +1383,16 @@ class SessionService:
         await run_in_db_thread(
             queries.create_run, self.ctx.db, run_id=run_id, turn_id=turn_id, session_id=session_id
         )
+        # R-N9 (controller ruling, round-6, 2026-09-20; PRD 9.3): a Turn about
+        # to run is, by definition, not a suspended queue — clears whatever
+        # `_terminate_run` last persisted here (see that method's own
+        # comment), regardless of which of the three paths that can start a
+        # Turn got here (send()'s immediate-run branch, `retry()`,
+        # `queue_resume()`, or `_advance_queue`'s own auto-continue — all of
+        # them end up in this one function). Covers "send 一条新消息" as an
+        # implicit resume without this branch needing to touch `send()`
+        # itself (out of this round's authorized touch set).
+        await run_in_db_thread(queries.set_queue_suspended_reason, self.ctx.db, session_id, None)
         # FR06 回放, 02-w3-interfaces.md §2: `runs.prompt_snapshot_ref` — ACP
         # doesn't expose the fully assembled prompt actually sent to the model
         # (00-foundation.md §7), so this records, honestly, only what's available
@@ -1350,8 +1433,12 @@ class SessionService:
         # why this is a plain call, not that field's default) rather than at
         # the settings-resolution point a few lines below, so the 时长上限
         # clock starts from when the Turn actually begins, not from whenever
-        # the Session/settings DB round trip happens to finish.
-        ctx_turn.started_at = time.monotonic()
+        # the Session/settings DB round trip happens to finish. `self._clock()`
+        # (R-N8, round-6) rather than a bare `time.monotonic()` call — the same
+        # clock `_check_run_durations` compares against, injectable by tests
+        # without monkeypatching the real `time` module (see `__init__`'s
+        # comment on `self._clock`).
+        ctx_turn.started_at = self._clock()
         self._active_turns[session_id] = ctx_turn
         self.worker_manager.mark_busy(session_id, True)
         # RPC v0 §4.2's `turn.started {session_id, turn_id, run_id}` — the only
@@ -1691,6 +1778,21 @@ class SessionService:
         # it first.
         ctx_turn.terminated_kind = effective_kind
 
+        # R-N9 (controller ruling, round-6, 2026-09-20; PRD 9.3): persist the
+        # same fact `ctx_turn.terminated_kind` above just recorded in memory —
+        # `_advance_queue`'s `queue.changed` broadcast (R-N4) already computes
+        # "suspended" from exactly this value, but that broadcast is fired
+        # once and never replayed; a renderer that reloads or switches
+        # sessions away and back had nothing durable to rebuild "已暂停" +
+        # "继续" from (round-6 review finding). `queries.set_queue_suspended_
+        # reason`'s own docstring has the full read/write map; the matching
+        # clear lives in `_run_turn` (every Turn that starts, however it got
+        # started, is definitionally not a suspended queue) and in `retry()`'s
+        # `abandon` branch (which already broadcasts `suspended:false`).
+        await run_in_db_thread(
+            queries.set_queue_suspended_reason, self.ctx.db, ctx_turn.session_id, effective_kind
+        )
+
         # Round-1 review fix (#6): `card.message`/`card.raw_excerpt` above are
         # built from a redacted copy of `reason`, but this function then used
         # to pass the raw `reason` on to both `mark_run_terminated` (persisted
@@ -1833,25 +1935,20 @@ class SessionService:
             # (never touches `terminated_kind`) — the only case that still
             # auto-advances.
             #
-            # Known narrow scope gap (documented, not silently accepted): the
-            # N07 crash watchdog (`_on_worker_crash`, out of this round's
-            # authorized touch set) calls `task.cancel()` BEFORE its own
-            # `_terminate_run` call, not after. If the just-cancelled
-            # `_run_turn` task reaches this very function (via its `finally`)
-            # before that watchdog — now running as a separate coroutine —
-            # gets back around to `_terminate_run` and sets
-            # `terminated_kind`, this one specific interleaving sees `None`
-            # and auto-advances a worker_crash termination instead of
-            # suspending it. None of this round's own authorized call sites
-            # into `_terminate_run` have that gap: `_run_turn`'s own `except`
-            # blocks always fully `await` it before ever reaching `finally`,
-            # and this round's new `_terminate_run_for_exceeded_budget`
-            # (`_handle_tool_call_start`) awaits it to completion before its
-            # own `task.cancel()`. Closing the N07 case fully means
-            # reordering ITS cancel/terminate calls — not one of
-            # `_advance_queue`/`_run_turn`/`_handle_tool_call_start` — left as
-            # an open item for the controller/a future round rather than
-            # patched around here (see 04-w5-interfaces.md §4.3).
+            # R-N10 (controller ruling, round-6, 2026-09-20): the gap that used
+            # to be documented here — the N07 crash watchdog (`_on_worker_
+            # crash`) calling `task.cancel()` BEFORE its own `_terminate_run`
+            # call, letting a just-cancelled `_run_turn` task reach this
+            # function's `terminated_kind` read before the watchdog got back
+            # around to setting it — is closed: `_on_worker_crash` (now one of
+            # this round's authorized touch points) reordered its own
+            # finalize/terminate/cancel calls to match `_terminate_run_for_
+            # exceeded_budget`'s (R-N7) shape, terminate-then-cancel. Every
+            # path that can set `finished_turn.terminated_kind` now fully
+            # `await`s `_terminate_run` (which sets it synchronously, before
+            # any of its own awaits — see that method's own comment) before
+            # ever cancelling this Turn's task, so this read can no longer
+            # observe a termination that "hasn't set it yet".
             suspended_kind = finished_turn.terminated_kind if finished_turn is not None else None
             if suspended_kind is not None:
                 # Suspended: leave every pending `queue_items` row exactly as
@@ -1961,18 +2058,22 @@ class SessionService:
         self, ctx_turn: _TurnContext, update: dict[str, Any]
     ) -> None:
         # R-N5 (controller ruling, 2026-09-20; PRD 11.2 "单个 Run 最大 Step 数
-        # 200"/"单个 Run 最大时长 2 h", PRD 9.3's 预算终止 row): this fires on
-        # every ACP `tool_call` "started" event — this branch's only authorized
-        # touch point that sees each one as it happens (a Turn with no tool
-        # calls at all, e.g. pure text generation, has no checkpoint here to
-        # catch a duration overrun on; documented as a known scope gap in the
-        # PR report rather than adding a standalone polling task, which would
-        # need touching `_on_worker_crash`/`__main__.py` — outside this round's
-        # authorized change set). Checked BEFORE incrementing `ctx_turn.
-        # step_seq`/inserting a `steps` row for this call — a call that trips
-        # either cap never gets counted or persisted as a Step; `runs.
-        # terminated_step_seq` (below, via `_terminate_run`) stays at the last
-        # Step that actually ran.
+        # 200"): this fires on every ACP `tool_call` "started" event — this
+        # branch's only authorized touch point that sees each one as it
+        # happens. Checked BEFORE incrementing `ctx_turn.step_seq`/inserting a
+        # `steps` row for this call — a call that trips the cap never gets
+        # counted or persisted as a Step; `runs.terminated_step_seq` (below,
+        # via `_terminate_run`) stays at the last Step that actually ran.
+        #
+        # R-N8 (controller ruling, round-6, 2026-09-20): the 时长上限 half of
+        # this check USED to live here too — removed. Tying a duration check
+        # to `tool_call` events meant a Turn with zero tool calls (pure text
+        # generation) had no checkpoint to catch a duration overrun on at all
+        # (R-N5's own report flagged this as a known scope gap; round-6 review
+        # said it can't stay one). `_check_run_durations` (driven by
+        # `_run_budget_watchdog_loop`, started from `startup()`) now scans
+        # `_active_turns` directly on a resident timer instead, independent of
+        # any ACP event — see that method's own docstring.
         if ctx_turn.step_seq + 1 > ctx_turn.max_steps_per_run:
             await self._terminate_run_for_exceeded_budget(
                 ctx_turn,
@@ -1981,21 +2082,6 @@ class SessionService:
                 limit=ctx_turn.max_steps_per_run,
                 unit="步",
                 reason=f"exceeded max_steps_per_run ({ctx_turn.max_steps_per_run} 步)",
-            )
-            return
-        # `ctx_turn.started_at is None` -> this `_TurnContext` never went
-        # through `_run_turn`'s own assignment (test scaffolding building one
-        # directly, see that field's own comment) — no duration budget to
-        # enforce against an unknown start time.
-        elapsed_s = None if ctx_turn.started_at is None else time.monotonic() - ctx_turn.started_at
-        if elapsed_s is not None and elapsed_s > ctx_turn.max_run_duration_s:
-            await self._terminate_run_for_exceeded_budget(
-                ctx_turn,
-                name="单个 Run 最大时长",
-                used=round(elapsed_s),
-                limit=int(ctx_turn.max_run_duration_s),
-                unit="秒",
-                reason=f"exceeded max_run_duration_s ({ctx_turn.max_run_duration_s:.0f}s)",
             )
             return
         tool_call_id = update.get("toolCallId")
@@ -2042,39 +2128,67 @@ class SessionService:
         unit: str,
         reason: str,
     ) -> None:
-        """R-N5 (controller ruling, 2026-09-20): `_handle_tool_call_start`'s
-        Step-count/时长上限 checks share this one path to actually stop the
-        Run, mirroring the N07 crash watchdog's own cancel+terminate shape
-        (`_on_worker_crash`, out of this round's authorized touch set — this
-        is a NEW call site reusing that established mechanism, not an edit to
-        that function).
+        """R-N5 (controller ruling, 2026-09-20): shared by `_handle_tool_call_
+        start`'s Step-count check and `_check_run_durations`'s resident 时长
+        上限 poll (R-N8, round-6 — the duration half of this used to live in
+        `_handle_tool_call_start` too, see that method's own comment for why
+        it moved off ACP events entirely) to actually stop the Run —
+        `_terminate_run` alone only writes `runs`/broadcasts `run.terminated`,
+        it never stops anything by itself.
 
-        `_terminate_run` alone only writes `runs`/broadcasts `run.terminated`
-        — it never stops the worker. Without cancelling `_run_turn`'s own task
-        too, a runaway Turn would keep calling tools forever: every further
-        `tool_call` "started" event would trip this same check again and
-        again, and `_terminate_run`'s own idempotency guard (R-N1) would just
-        no-op each one — a `run.terminated` card sitting in the UI while the
-        worker process silently keeps burning API calls underneath it,
-        exactly the "看起来在跑、其实已死" PRD 9.3 forbids turned inside out
-        ("看起来已死、其实还在跑"). Cancelling `_run_turn`'s task is what
-        actually stops that — its `finally: await self._advance_queue(...)`
-        still runs (R-N4 reads `ctx_turn.terminated_kind`, set by
-        `_terminate_run` below, from there to suspend rather than advance the
-        queue), same as N07's own task.cancel() already relies on.
+        R-N7 (controller ruling, round-6, 2026-09-20): cancelling only
+        `_run_turn`'s own LOCAL asyncio task used to be the whole story here
+        — round-5 review, correctly: "取消 _run_turn 只是放弃等待
+        prompt()，worker 里的 agent 照跑不误、继续调工具" — the worker
+        process's own agent loop never learned anything happened and kept
+        calling tools/burning the budget underneath a UI that already showed
+        a terminated Run (exactly the "看起来已死、其实还在跑" PRD 9.3
+        forbids). Fixed by walking the SAME path `stop()` (a user-initiated
+        termination) already uses: a real ACP `session/cancel` notification
+        to the worker FIRST (so Hermes actually stops the in-flight Turn),
+        THEN `_terminate_run` (DB write + broadcast; also sets `ctx_turn.
+        terminated_kind` — R-N4 needs that landed before `_advance_queue`
+        reads it from this Turn's own `finally` block), and only THEN the
+        local task cancel. A `cancel()` failure (worker already dead, or
+        unreachable) is logged and does NOT block the rest of this — same
+        `except (AcpProtocolError, AcpError)` shape `stop()` already uses;
+        there's nothing left to notify and the termination must still
+        proceed regardless.
 
-        This runs on the ACP read-loop's own task (`kernel/acp_client.py::
-        AcpClient._read_loop`'s `await self._on_session_update(params)`), not
-        `_run_turn`'s — verified the same way N07's own docstring already
-        verifies it for that watchdog: `_run_turn`'s task is parked awaiting
-        `worker.client.prompt(...)` while this one is what's actually
-        dispatching this notification, so there is no self-cancellation risk
-        here, and `_terminate_run` is awaited to completion (its DB write +
-        broadcast) before the cancel below — unlike N07, nothing here needs to
-        race a second writer for the same Run, so there is no reason to
-        reorder these two calls the way N07's own docstring explains it had
-        to.
+        Cancelling `_run_turn`'s own task LAST (not first) is still what
+        guarantees its `finally: await self._advance_queue(...)` runs and
+        unsticks the session's queue — `_terminate_run`'s idempotency guard
+        (R-N1) makes any further termination this Run's own `_run_turn` might
+        still attempt on its own a harmless no-op, not a second real one.
+
+        Called from two different tasks depending on which check tripped:
+        `_handle_tool_call_start`'s Step-count check runs inline on the ACP
+        read-loop's own task (`kernel/acp_client.py::AcpClient._read_loop`'s
+        `await self._on_session_update(params)` chain — see N07's own
+        docstring for why that matters: no self-cancellation risk, and the
+        read loop can't even read `_run_turn`'s own in-flight `prompt()`
+        response until this whole call returns, so there's no race between
+        this awaiting `_terminate_run` and that response independently
+        resolving `_run_turn`'s own success/error paths first).
+        `_check_run_durations`'s resident poll (R-N8) instead runs on its own
+        background task (`_run_budget_watchdog_loop`, unrelated to any one
+        Turn's worker) — `worker.client.cancel(...)` still targets THIS
+        Turn's own worker/session by id regardless of which task calls it, so
+        the same ordering guarantee holds either way.
         """
+        worker = self.worker_manager.get(ctx_turn.session_id)
+        if worker is not None and worker.client is not None and worker.acp_session_id is not None:
+            try:
+                # Same notification `stop()` sends for a user-initiated
+                # termination (PRD 9.3) — see this method's own docstring
+                # (R-N7) for why this must happen before `_terminate_run`.
+                await worker.client.cancel(worker.acp_session_id)
+            except (AcpProtocolError, AcpError) as exc:
+                logger.warning(
+                    "session/cancel notification failed while terminating for "
+                    "exceeded budget (worker likely already gone)",
+                    extra={"detail": {"session_id": ctx_turn.session_id, "error": str(exc)}},
+                )
         await self._terminate_run(
             ctx_turn,
             kind="budget",
@@ -2084,6 +2198,54 @@ class SessionService:
         task = self._turn_tasks.get(ctx_turn.session_id)
         if task is not None and not task.done():
             task.cancel()
+
+    async def _run_budget_watchdog_loop(self) -> None:
+        """R-N8 (controller ruling, round-6, 2026-09-20; PRD 11.2 单个 Run 最
+        大时长): a resident poll, started from `startup()`/cancelled+awaited
+        from `shutdown()` — same shape as `replay/retention.py::
+        run_sweep_loop`'s own background loop, not N07's per-crash deadline
+        poll (`_on_worker_crash`), which exists for one specific race, not a
+        general pattern. Exists because tying the duration check to
+        `tool_call` events (as it lived before this round, in `_handle_
+        tool_call_start`) never fired for a Turn that calls no tools at all —
+        pure text generation could run past `max_run_duration_s` forever with
+        no checkpoint to catch it (R-N5's own report's documented scope gap;
+        round-6 review: this can't stay a documented gap)."""
+        try:
+            while True:
+                await asyncio.sleep(_BUDGET_WATCHDOG_INTERVAL_S)
+                await self._check_run_durations()
+        except asyncio.CancelledError:
+            raise
+
+    async def _check_run_durations(self) -> None:
+        """The actual check `_run_budget_watchdog_loop` drives — split out so
+        a test can call it directly against an injected `self._clock` (see
+        `__init__`'s comment on that) instead of waiting real wall-clock
+        seconds for the loop's own `asyncio.sleep`. Snapshots `_active_turns.
+        items()` into a list before iterating: `_terminate_run_for_exceeded_
+        budget` awaits (DB writes, an ACP notification, `_terminate_run`'s own
+        broadcast) that can let another coroutine — most notably this same
+        Turn's own `_advance_queue`, once its task gets cancelled — mutate
+        `_active_turns` while this loop is still walking it."""
+        now = self._clock()
+        for _session_id, ctx_turn in list(self._active_turns.items()):
+            if ctx_turn.started_at is None:
+                # This `_TurnContext` never went through `_run_turn`'s own
+                # assignment (test scaffolding building one directly, see
+                # that field's own comment) — no duration budget to enforce
+                # against an unknown start time.
+                continue
+            elapsed_s = now - ctx_turn.started_at
+            if elapsed_s > ctx_turn.max_run_duration_s:
+                await self._terminate_run_for_exceeded_budget(
+                    ctx_turn,
+                    name="单个 Run 最大时长",
+                    used=round(elapsed_s),
+                    limit=int(ctx_turn.max_run_duration_s),
+                    unit="秒",
+                    reason=f"exceeded max_run_duration_s ({ctx_turn.max_run_duration_s:.0f}s)",
+                )
 
     async def _handle_tool_call_update(
         self, ctx_turn: _TurnContext, update: dict[str, Any]
@@ -2688,37 +2850,58 @@ class SessionService:
             f"{_WORKER_CRASH_GRACE_S}s; force-terminating the Run (N07)",
             extra={"detail": {"session_id": session_id, "returncode": returncode}},
         )
+        # Captured here — immediately after the `current_run` status read
+        # above, no `await` in between — for the identity guarantee the long
+        # comment block above this method already spells out: this is what
+        # keeps a late queue-advance from swapping in a NEW task before this
+        # function could grab it. Round-N10 (controller ruling, round-6,
+        # 2026-09-20) only moved WHEN this is actually cancelled (below), not
+        # where it's captured.
         task = self._turn_tasks.get(session_id)
-        if task is not None and not task.done():
-            # Cancelling (rather than awaiting) `_run_turn`'s own stuck task is
-            # what still lets its `finally: await self._advance_queue(...)` run
-            # and unstick the session's queue — `asyncio.CancelledError` isn't
-            # caught by that function's `except Exception`, so this can never
-            # turn into a second uncontrolled `_terminate_run` call from that
-            # task — at worst that task's own call, if it gets there first,
-            # no-ops (or rebroadcasts, R-N1) via `_terminate_run`'s idempotency
-            # guard.
-            task.cancel()
         # Round-1 review fix (#7): every other termination path (`_run_turn`'s
         # own `except (AcpError, AcpProtocolError)` and its catch-all backstop)
         # calls this before `_terminate_run` — streamed `message.delta` text
         # only lives on `ctx_turn` until finalized, so skipping it here (as
         # this watchdog path used to) meant a Run force-terminated by N07 could
         # drop assistant text the user had already watched stream past,
-        # forever, from the `messages` table (FR06 replay). Cancelling
-        # `_run_turn`'s task raises `CancelledError` in it — a `BaseException`,
-        # not caught by that function's `except Exception` — so it could never
-        # reach its own finalize call either; this watchdog has to do it.
+        # forever, from the `messages` table (FR06 replay).
         #
-        # This call, and `_terminate_run` right after it, are what guarantee
-        # `run.terminated` broadcasts at least once for the crashed Run no
-        # matter how the race against the just-cancelled task's own write/
-        # broadcast resolves (R-N1's split idempotency guard) — replacing
-        # round-2's approach of reordering this call before the cancel above to
-        # *try* to win that race through ordering alone.
+        # R-N10 (controller ruling, round-6, 2026-09-20): finalize+terminate
+        # now run BEFORE `task.cancel()` below, not after — round-N2 (R-N1)
+        # had put the cancel first, specifically to win the race for which
+        # coroutine's `mark_run_terminated` call lands first; R-N1's own
+        # write/broadcast split (this method's idempotency guard, see
+        # `_terminate_run`) made winning that race unnecessary — a second,
+        # losing write just no-ops or rebroadcasts. What cancel-first left
+        # open instead (documented as a known scope gap in `_advance_queue`'s
+        # own comment, R-N4): if this watchdog cancelled the stuck task
+        # before `_terminate_run` (below) had a chance to set `ctx_turn.
+        # terminated_kind`, and the just-cancelled task reached its own
+        # `finally: await self._advance_queue(...)` before this watchdog got
+        # back around to calling `_terminate_run`, `_advance_queue` would read
+        # `terminated_kind` as still `None` and auto-advance a worker_crash
+        # termination instead of suspending the queue for it (PRD 9.3).
+        # Finalizing and terminating first closes that — `ctx_turn.
+        # terminated_kind` is set synchronously inside `_terminate_run` (see
+        # that method's own comment) strictly before this function ever
+        # reaches `task.cancel()` below, so `_advance_queue` can never observe
+        # it unset for a worker_crash termination again. Mirrors the ordering
+        # R-N7 (round-6) already established for `_terminate_run_for_
+        # exceeded_budget` — this function now being one of this round's
+        # authorized touch points is what makes reusing that order here
+        # possible for the first time.
         await self._finalize_streamed_messages(ctx_turn)
         await self._terminate_run(
             ctx_turn,
             kind="error",
             reason=f"worker process exited unexpectedly (code {returncode})",
         )
+        if task is not None and not task.done():
+            # Cancelling (rather than awaiting) `_run_turn`'s own stuck task is
+            # what still lets its `finally: await self._advance_queue(...)` run
+            # and unstick the session's queue — `asyncio.CancelledError` isn't
+            # caught by that function's `except Exception`, so this can never
+            # turn into a second uncontrolled `_terminate_run` call from that
+            # task. R-N10: this now happens AFTER the finalize/terminate above,
+            # not before — see the comment above those two calls.
+            task.cancel()

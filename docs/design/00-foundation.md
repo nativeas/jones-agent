@@ -123,10 +123,11 @@ spike #2（§2 已定案的 python-build-standalone 方案）在真实 daemon（
 | `agent.list` / `agent.get` / `agent.upsert` / `agent.delete` | `Agent` | `Agent` |
 | `session.list` | `{project_id?}` | `Session[]` |
 | `session.create` | `{project_id, agent_id, parent_id?, mode?, title?}` | `Session` |
-| `session.get` | `{id}` | `Session` + 最近 Turn |
+| `session.get` | `{id}` | `Session` + 最近 Turn — `Session` 起 R-N9（controller ruling，2026-09-20）带 `queue_suspended_reason: "user"\|"error"\|"budget"\|null`（见下方 `session.queue` 行与 §4.2 队列变更通知同一字段的说明） |
 | `session.set_mode` | `{id, mode: "chat"\|"task"\|"auto"}` | `Session` |
 | `session.send` | `{id, text, attachments?}` | `{turn_id, queued: bool}` — 运行中则入队（PRD 9.2） |
-| `session.queue` / `session.queue_remove` / `session.queue_reorder` | `{id, ...}` | `QueueItem[]` |
+| `session.queue` | `{id}` | `{items: QueueItem[], suspended: bool, reason: "user"\|"error"\|"budget"\|null}` — R-N9（controller ruling，2026-09-20；PRD 9.3）起带 `suspended`/`reason`（原为裸 `QueueItem[]`），持久化 §4.2 队列变更通知同一次广播计算过的挂起原因（`sessions` 表新增的 `queue_suspended_reason` 列），使重新 `session.get`/`session.queue`（会话切走切回、daemon 重启后的渲染端重连）也能重建「已暂停」，不再只活在某一次广播里 |
+| `session.queue_remove` / `session.queue_reorder` | `{id, ...}` | `QueueItem[]`（未受 R-N9 影响，仍是裸数组） |
 | `session.stop` | `{id}` | `{stopped: bool}` — 用户终止（PRD 9.3） |
 | `session.delete` | `{id}` | `{deleted: bool}` — 真删（G20，issue #23）：级联 turns/messages/runs/steps/permission_decisions/queue_items，拒绝主会话与仍有子会话/运行中 Run 的会话 |
 | `session.export` | `{id, delete_after?: bool}` | `{path: string}` — 导出该 Session 为 JSON（PRD 10.3「导出」），`delete_after` 导出成功后调用 `session.delete`（issue #23） |
