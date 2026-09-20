@@ -1,5 +1,8 @@
 # Jones Agent
 
+[![CI](https://github.com/nativeas/jones-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nativeas/jones-agent/actions/workflows/ci.yml?query=branch%3Amain)
+[![Acceptance](https://github.com/nativeas/jones-agent/actions/workflows/acceptance.yml/badge.svg?branch=main)](https://github.com/nativeas/jones-agent/actions/workflows/acceptance.yml?query=branch%3Amain)
+
 装在你自己电脑上、自主运行的通用 AI 工作体。
 
 以对话为核心，配备文件、终端、浏览器、互联网、媒体生成、办公文档等全域能力，在你授权的边界内自主完成多步骤工作，全程可观察、可拦截、可回放。
@@ -51,6 +54,13 @@ make check        # ruff + pytest + eslint + tsc + vitest
 ```
 
 Hermes 内核目前是本机 path 依赖（上游无可安装 artifact），`make check` 用 `UV_FROZEN=1` 绕开该组解析——细节见 [docs/DEV.md](docs/DEV.md) §2.2。
+
+### CI
+
+每次 push 到 `main` 与每个 PR 跑两个 workflow（状态见页首徽章）：
+
+- **[CI](.github/workflows/ci.yml)** — `daemon`（ubuntu：ruff + 全量 pytest）、`desktop`（macos：eslint + tsc + vitest + build + 真机 Electron smoke + 真 daemon e2e）
+- **[Acceptance](.github/workflows/acceptance.yml)** — 只跑 G01–G21 / N01–N18 里可自动化的发布门禁，两端各一个 job。与 CI 有意重复：CI 证明「全仓库绿」，Acceptance 证明「发布门禁绿」，发布前一眼可辨。
 
 ## 文档
 
