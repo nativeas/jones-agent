@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync, openSync } from 'node:fs'
 import { join } from 'node:path'
 import os from 'node:os'
 import { spawn } from 'node:child_process'
@@ -12,6 +12,24 @@ import { RPC_V0_METHODS } from '../shared/rpcMethods'
 function daemonSocketPath(): string {
   const home = process.env.JONES_HOME || join(os.homedir(), '.jones')
   return join(home, 'runtime', 'daemon.sock')
+}
+
+/** An append fd under `<JONES_HOME>/logs/` for a daemon WE spawn, so its death
+ * reason survives. Previously both spawn branches used `stdio: 'ignore'`: when a
+ * spawned daemon died on startup the user (and CI) got a bare "daemon connection
+ * closed" with no way to find out why — PRD 5.5 失败诚实 says an error must be
+ * presented, never swallowed, and "nowhere at all" is the worst kind of swallow.
+ * Returns `'ignore'` if the log can't be opened, so spawning still proceeds. */
+function daemonSpawnLogStdio(): 'ignore' | ['ignore', number, number] {
+  try {
+    const home = process.env.JONES_HOME || join(os.homedir(), '.jones')
+    const logs = join(home, 'logs')
+    mkdirSync(logs, { recursive: true })
+    const fd = openSync(join(logs, 'daemon-spawn.log'), 'a')
+    return ['ignore', fd, fd]
+  } catch {
+    return 'ignore'
+  }
 }
 
 const rpcClient = new RpcClient(daemonSocketPath())
@@ -128,7 +146,11 @@ function spawnDevDaemon(): void {
     // not a `service install` call.
     const exe = findPackagedDaemonExecutable()
     if (!exe) return
-    const child = spawn(exe, [], { env: process.env, stdio: 'ignore', detached: true })
+    const child = spawn(exe, [], {
+      env: process.env,
+      stdio: daemonSpawnLogStdio(),
+      detached: true
+    })
     child.on('error', () => {
       // Best-effort, same reasoning as the dev-mode branch below.
     })
@@ -140,7 +162,7 @@ function spawnDevDaemon(): void {
   const child = spawn('uv', ['run', 'python', '-m', 'jones_daemon'], {
     cwd: daemonDir,
     env: process.env,
-    stdio: 'ignore',
+    stdio: daemonSpawnLogStdio(),
     detached: true
   })
   child.on('error', () => {

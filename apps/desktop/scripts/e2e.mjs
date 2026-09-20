@@ -110,6 +110,19 @@ async function cleanupAndExit(code) {
     // best-effort cleanup only — never let a cleanup failure mask the real
     // pass/fail result below
   }
+  // Before wiping the sandbox, surface whatever the daemon itself said. Without
+  // this the only evidence of a startup failure was the renderer's generic
+  // "daemon connection closed" — true but useless (exactly what made the macOS
+  // CI failure undiagnosable from the job log).
+  for (const name of code === 0 ? [] : ['daemon.log', 'daemon-spawn.log']) {
+    try {
+      const text = fs.readFileSync(path.join(jonesHome, 'logs', name), 'utf-8').trim()
+      console.log(`[e2e] --- ${name} (last 40 lines) ---`)
+      console.log(text.split('\n').slice(-40).join('\n') || '<empty>')
+    } catch {
+      console.log(`[e2e] --- ${name}: not present ---`)
+    }
+  }
   try {
     fs.rmSync(jonesHome, { recursive: true, force: true })
   } catch {
