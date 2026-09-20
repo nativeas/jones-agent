@@ -230,6 +230,14 @@ function ensureDaemonRunning(): Promise<boolean> {
   return runDaemonLifecycle(daemonLifecycleDeps)
 }
 
+/** True when a failed `rpcClient.call` never reached the daemon (socket closed,
+ * connect refused, timed out waiting for a connection) rather than the daemon
+ * answering with an application error. An `RpcError` means the daemon DID answer
+ * — replaying that would just repeat a real, already-reported failure. */
+function isConnectionLevelFailure(err: unknown): boolean {
+  return !(err instanceof RpcError)
+}
+
 rpcClient.onAnyNotification((method, params) => {
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('rpc:notify', method, params)
@@ -243,7 +251,32 @@ ipcMain.handle('rpc:call', async (_event, method: string, params?: Record<string
   try {
     return { ok: true as const, result: await rpcClient.call(method, params) }
   } catch (err) {
-    return { ok: false as const, message: err instanceof Error ? err.message : String(err) }
+    // A connection-level failure here is very often just "the daemon hasn't
+    // finished starting yet": on a cold first launch main spawns it and needs a
+    // few seconds, while the renderer's first `project.list`/`session.list` fire
+    // as soon as the window loads. Those calls used to reject with a bare
+    // "daemon connection closed" and no caller retried — the left pane then
+    // stayed empty for the rest of the session (reproduced on a cold CI runner;
+    // invisible on a warm dev machine where the daemon is already up).
+    //
+    // Daemon lifecycle knowledge belongs here, not in every renderer store, so
+    // recover once and replay the call. `ensureDaemonRunning()` de-duplicates
+    // concurrent recoveries internally (daemonLifecycle.ts's `inFlightRecovery`),
+    // so a burst of first-paint calls triggers exactly one.
+    if (!isConnectionLevelFailure(err)) {
+      return { ok: false as const, message: err instanceof Error ? err.message : String(err) }
+    }
+    try {
+      if (!(await ensureDaemonRunning())) {
+        return { ok: false as const, message: err instanceof Error ? err.message : String(err) }
+      }
+      return { ok: true as const, result: await rpcClient.call(method, params) }
+    } catch (retryErr) {
+      return {
+        ok: false as const,
+        message: retryErr instanceof Error ? retryErr.message : String(retryErr)
+      }
+    }
   }
 })
 
