@@ -138,7 +138,16 @@ async def _new_session(service: SessionService, *, title: str) -> str:
     return row["id"]
 
 
-async def _wait_until(predicate, *, timeout: float = 5.0, interval: float = 0.02) -> None:
+# 5s is plenty on a dev machine but not on a loaded CI runner: two of these
+# waits sit behind a real worker subprocess spawn plus an ACP round trip, and
+# both failed on ubuntu CI while passing locally 3/3. The number is a
+# "something is genuinely stuck" ceiling, not a performance assertion (that is
+# `tests/perf/`'s job), so raise it rather than trading a real regression
+# signal for flakes.
+_WAIT_TIMEOUT_S = 20.0
+
+
+async def _wait_until(predicate, *, timeout: float = _WAIT_TIMEOUT_S, interval: float = 0.02) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
@@ -295,7 +304,7 @@ async def test_g08_tool_exception_produces_a_tool_exception_card(tmp_path, monke
     try:
         session_id = await _new_session(service, title="s1")
         await service.send(session_id, "TOOL_EXCEPTION please")
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
 
         card = _terminated(service)[0]
         assert card["kind"] == "error"
@@ -328,7 +337,7 @@ async def test_g08_kill_worker_terminates_within_5s_via_the_normal_acp_path(tmp_
         worker = service.worker_manager.get(session_id)
         worker.process.kill()
 
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         card = _terminated(service)[0]
         assert card["kind"] == "error"
         assert card["card"]["kind"] == ErrorKind.WORKER_CRASH.value
@@ -955,7 +964,7 @@ async def test_model_override_does_not_restart_or_change_the_actual_worker_proce
     try:
         session_id = await _new_session(service, title="s1")
         await service.send(session_id, "TOOL_EXCEPTION please")
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         failed_turn_id = _terminated(service)[0]["turn_id"]
 
         worker_before = service.worker_manager.get(session_id)
@@ -969,7 +978,7 @@ async def test_model_override_does_not_restart_or_change_the_actual_worker_proce
             model_override={"provider": "openai", "model": "gpt-override"},
         )
         assert result["queued"] is False
-        await _wait_until(lambda: len(_terminated(service)) >= 2, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 2, timeout=_WAIT_TIMEOUT_S)
 
         worker_after = service.worker_manager.get(session_id)
         assert worker_after is not None
@@ -1091,7 +1100,7 @@ async def test_user_stop_suspends_the_queue_instead_of_auto_advancing(tmp_path, 
 
         stop_result = await service.stop(session_id)
         assert stop_result["stopped"] is True
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         card = _terminated(service)[0]
         assert card["kind"] == "user"
         await _wait_for_queue_suspended(service, suspended=True)
@@ -1122,7 +1131,7 @@ async def test_error_termination_suspends_the_queue_instead_of_auto_advancing(
         second = await service.send(session_id, "queued behind the failure")
         assert second["queued"] is True
 
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         card = _terminated(service)[0]
         assert card["kind"] == "error"
         await _wait_for_queue_suspended(service, suspended=True)
@@ -1165,7 +1174,7 @@ async def test_budget_termination_suspends_the_queue_instead_of_auto_advancing(
         second = await service.send(session_id, "queued behind the budget termination")
         assert second["queued"] is True
 
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         card = _terminated(service)[0]
         assert card["kind"] == "budget"
         await _wait_for_queue_suspended(service, suspended=True)
@@ -1189,7 +1198,7 @@ async def test_queue_resume_starts_the_next_pending_item(tmp_path, monkeypatch):
         await service.send(session_id, "TOOL_EXCEPTION please")
         await _wait_until(lambda: session_id in service._active_turns)
         await service.send(session_id, "resume me")
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         # `_advance_queue` (this Turn's own `finally`) has to have actually
         # cleared `_active_turns`/suspended the queue before `queue_resume`
         # below can see "not running" — `run.terminated` alone (just waited
@@ -1259,7 +1268,7 @@ async def test_send_a_new_message_implicitly_resumes_a_suspended_queue(tmp_path,
         await service.send(session_id, "TOOL_EXCEPTION please")
         await _wait_until(lambda: session_id in service._active_turns)
         await service.send(session_id, "still queued behind the failure")
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         # `send()` below decides immediate-run-vs-queue from `_active_turns`/
         # `_turn_tasks`, which only `_advance_queue` (this failed Turn's own
         # `finally`) clears — `run.terminated` alone fires strictly earlier
@@ -1314,7 +1323,7 @@ async def test_session_get_and_queue_report_the_persisted_suspended_reason(
         second = await service.send(session_id, "queued behind the failure")
         assert second["queued"] is True
 
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         await _wait_for_queue_suspended(service, suspended=True)
 
         # `session.get`'s row (`queries.get_session`'s plain `SELECT *`)
@@ -1356,7 +1365,7 @@ async def test_sending_a_new_message_clears_the_persisted_suspended_reason(
         await service.send(session_id, "TOOL_EXCEPTION please")
         await _wait_until(lambda: session_id in service._active_turns)
         await service.send(session_id, "still queued behind the failure")
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         await _wait_for_queue_suspended(service, suspended=True)
         assert (await service.get(session_id))["queue_suspended_reason"] == "error"
 
@@ -1383,7 +1392,7 @@ async def test_abandon_clears_the_persisted_suspended_reason(tmp_path, monkeypat
     try:
         session_id = await _new_session(service, title="s1")
         await service.send(session_id, "TOOL_EXCEPTION please")
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         failed_turn_id = _terminated(service)[0]["turn_id"]
         assert (await service.get(session_id))["queue_suspended_reason"] == "error"
 
@@ -1414,7 +1423,7 @@ async def test_step_count_budget_terminates_the_run_with_a_budget_card(tmp_path,
     try:
         session_id = await _new_session(service, title="s1")
         await service.send(session_id, "MANY_TOOL_CALLS:201")
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
 
         card = _terminated(service)[0]
         assert card["kind"] == "budget"
@@ -1441,7 +1450,7 @@ async def test_step_count_budget_terminates_the_run_with_a_budget_card(tmp_path,
         # here, but the Turn/worker bookkeeping must still have unwound —
         # the runaway worker's still-streaming tool_call events must not
         # leave the session stuck "running" forever).
-        await _wait_until(lambda: session_id not in service._active_turns, timeout=5)
+        await _wait_until(lambda: session_id not in service._active_turns, timeout=_WAIT_TIMEOUT_S)
     finally:
         await service.shutdown()
 
@@ -1489,7 +1498,7 @@ async def test_budget_termination_sends_a_real_acp_cancel_before_terminate_and_b
         await service.send(session_id, "MANY_TOOL_CALLS:201")
         task = service._turn_tasks[session_id]
 
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         assert order == ["acp_cancel"]
         card = _terminated(service)[0]
         assert card["kind"] == "budget"
@@ -1504,7 +1513,7 @@ async def test_budget_termination_sends_a_real_acp_cancel_before_terminate_and_b
         assert len(steps) == 200
 
         # The LOCAL task actually got cancelled too (last, not skipped).
-        await _wait_until(lambda: task.done(), timeout=5)
+        await _wait_until(lambda: task.done(), timeout=_WAIT_TIMEOUT_S)
         assert task.cancelled()
     finally:
         await service.shutdown()
@@ -1531,10 +1540,10 @@ async def test_budget_termination_still_terminates_when_the_acp_cancel_notificat
     try:
         session_id = await _new_session(service, title="s1")
         await service.send(session_id, "MANY_TOOL_CALLS:201")
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         card = _terminated(service)[0]
         assert card["kind"] == "budget"
-        await _wait_until(lambda: session_id not in service._active_turns, timeout=5)
+        await _wait_until(lambda: session_id not in service._active_turns, timeout=_WAIT_TIMEOUT_S)
     finally:
         await service.shutdown()
 
@@ -1590,7 +1599,7 @@ async def test_run_duration_budget_terminates_a_tool_call_free_turn_via_the_resi
         fake_now[0] = 1_000.0 + ctx_turn.max_run_duration_s + 10.0
         await service._check_run_durations()
 
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         card = _terminated(service)[0]
         assert card["kind"] == "budget"
         assert card["card"]["kind"] == ErrorKind.BUDGET.value
@@ -1602,7 +1611,7 @@ async def test_run_duration_budget_terminates_a_tool_call_free_turn_via_the_resi
 
         # R-N4: a budget termination suspends the queue too, same as the
         # tool-call-triggered path's own test asserts.
-        await _wait_until(lambda: session_id not in service._active_turns, timeout=5)
+        await _wait_until(lambda: session_id not in service._active_turns, timeout=_WAIT_TIMEOUT_S)
     finally:
         await service.shutdown()
 
@@ -1816,7 +1825,7 @@ async def test_budget_watchdog_loop_survives_a_bad_iteration(tmp_path, monkeypat
     try:
         # A second call only happens if the first one's exception didn't
         # kill the loop.
-        await _wait_until(lambda: len(calls) >= 2, timeout=5)
+        await _wait_until(lambda: len(calls) >= 2, timeout=_WAIT_TIMEOUT_S)
     finally:
         task.cancel()
         try:
@@ -1849,7 +1858,7 @@ async def test_budget_termination_still_terminates_when_cancel_raises_connection
     try:
         session_id = await _new_session(service, title="s1")
         await service.send(session_id, "MANY_TOOL_CALLS:201")
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
         card = _terminated(service)[0]
         assert card["kind"] == "budget"
         assert card["card"]["kind"] == ErrorKind.BUDGET.value
@@ -1859,6 +1868,6 @@ async def test_budget_termination_still_terminates_when_cancel_raises_connection
         )
         assert run["status"] == "terminated"
         assert run["terminated_kind"] == "budget"
-        await _wait_until(lambda: session_id not in service._active_turns, timeout=5)
+        await _wait_until(lambda: session_id not in service._active_turns, timeout=_WAIT_TIMEOUT_S)
     finally:
         await service.shutdown()

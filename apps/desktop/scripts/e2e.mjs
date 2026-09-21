@@ -252,10 +252,17 @@ app
     })()`)
     await ev(`document.querySelectorAll('.input-bar__actions button')[0].click()`)
 
+    // #22 replaced the single `.termination-card--error` with one class per
+    // ErrorKind (--auth / --quota / --network / --tool / --crash / --timeout /
+    // --budget-kind / --generic, plus --user for a plain user stop). What this
+    // check is actually about is G08/N16: an explicit card rather than a blank
+    // or stuck screen — so match any termination card that isn't the user-stop
+    // one, and let the kind assertion below pin down that it's the provider
+    // failure we provoked (no Key configured).
     const errorCard = await waitFor(
       () =>
         ev(`(() => {
-          const el = document.querySelector('.termination-card--error')
+          const el = document.querySelector('.termination-card:not(.termination-card--user)')
           return el ? el.innerText : null
         })()`),
       { timeoutMs: 30000 }
@@ -264,11 +271,15 @@ app
     if (!errorCard) {
       const bodyText = await ev('document.body.innerText').catch(() => '<could not read body>')
       return fail(
-        `no .termination-card--error ever appeared (blank/stuck screen instead of an explicit error) — body: ${bodyText.slice(0, 800)}`
+        `no non-user .termination-card ever appeared (blank/stuck screen instead of an explicit error) — body: ${bodyText.slice(0, 800)}`
       )
     }
-    if (!errorCard.includes('provider_error')) {
-      return fail(`error card appeared but doesn't mention provider_error — got: ${JSON.stringify(errorCard)}`)
+    // No provider Key configured -> `errors/classify.py` reports it as an auth
+    // failure; its card is labelled 认证 (see TerminationCard.tsx's KIND map).
+    if (!/认证|provider_auth|配额|provider_quota|provider_error/.test(errorCard)) {
+      return fail(
+        `a termination card appeared but not the provider one — got: ${JSON.stringify(errorCard)}`
+      )
     }
 
     const bodyNotBlank = await ev('document.body.innerText.length > 0')
@@ -276,7 +287,7 @@ app
 
     clearTimeout(timer)
     pass(
-      'project.list → session.create → session.send with no provider Key shows an explicit provider_error card, not a blank screen'
+      'project.list → session.create → session.send with no provider Key shows an explicit provider error card, not a blank screen'
     )
   })
   .catch((err) => fail(`unhandled error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`))
