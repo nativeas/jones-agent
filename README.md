@@ -75,13 +75,12 @@ Hermes 内核目前是本机 path 依赖（上游无可安装 artifact），`mak
 
 ## 状态
 
-**v1.0（macOS）实施中**，P0 共 25 项已完成 22 项，测试 960 pytest + 113 vitest 全绿。
+**v1.0（macOS）实施中**，P0 共 25 项已完成 24 项，测试 1030 pytest + 129 vitest 全绿。
 
 已落地：三栏工作台与多会话、Project / Agent 配置、BYOK 六厂商、权限三道闸、Run 回放、文件五件套、终端、浏览器（Jones 专属 Chrome，CDP attach）、深度调研、MCP 接入与能力透明页、Skill 三层加载与内置 Skill、Cron 定时任务、守护进程生命周期、存储收口与真删、打包与性能基准、G01–G21 / N01–N18 验收套件。
 
 发布前待办（[open issues](https://github.com/nativeas/jones-agent/issues)）：
 
-- **#22** 错误面板收口（终止后队列挂起）、**#37** PRD 11.2 的 Step / 时长上限
 - **#36** `cryptography` 无 macOS x86_64 wheel，arm64 机器出不了 Intel 包（挡 G18 双架构）
 - **#33** 真实 Apple 公证（需开发者证书）、**#35** daemon 退出阶段偶发挂起
 - 手工验收：G01 全新机器、G02 六厂商（需 Key）、G11 launchd 全流程、G16 抓包、G18 Intel 真机
