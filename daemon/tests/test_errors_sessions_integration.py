@@ -1609,66 +1609,143 @@ async def test_run_duration_budget_terminates_a_tool_call_free_turn_via_the_resi
 
 # ---------------------------------------------------------------------------
 # Round-7 controller ruling: R-N11/R-N12/R-N13/R-N14
+# (R-N11 itself was superseded by round-8's R-N16 below — see that test.)
 # ---------------------------------------------------------------------------
 
 
-async def test_budget_termination_intent_survives_a_racing_cancelled_stop_reason(
+async def test_finalize_always_terminates_and_defers_the_kind_to_termination_intent(
     tmp_path, monkeypatch
 ):
-    """R-N11 (controller ruling, round-7, 2026-09-20): R-N7 (round-6) made
-    budget termination send the SAME real ACP `session/cancel` notification
-    `stop()` sends for a user-initiated termination — the worker can (and, in
-    the real race this closes, sometimes does) respond to that notification
-    by returning `prompt()`'s response with `stopReason:"cancelled"` on its
-    own, same as it would for an actual `session.stop`. Before this fix,
-    `_finalize_turn_success` unconditionally treated any `stopReason:
-    "cancelled"` as `kind="user"` and called `_terminate_run` again — which
-    could win the race against the budget path's own `_terminate_run` call
-    and overwrite `runs.terminated_kind`/`sessions.queue_suspended_reason`
-    from "budget" to "user" (losing the budget details in the process).
-    `ctx_turn.termination_intent` — pinned to `"budget"` by
-    `_terminate_run_for_exceeded_budget` BEFORE it ever sends that
-    notification — is what `_finalize_turn_success` must defer to instead.
+    """R-N16 (controller ruling, round-8, 2026-09-20) — supersedes round-7's
+    R-N11 and its regression test (renamed/rewritten here; the old one is
+    gone, not left alongside this).
 
-    Reproduces the race directly (same "prove the mechanism, not real
-    asyncio scheduling nondeterminism" approach this file already uses for
-    the duration watchdog above) rather than fighting real event-loop
-    timing: runs the real budget termination to completion, then calls
-    `_finalize_turn_success` again on the SAME `ctx_turn` with a
-    `stopReason:"cancelled"` response — exactly what the racing `prompt()`
-    call would eventually, and legitimately, deliver — and asserts it does
-    NOT re-terminate the Run as "user"."""
+    R-N11's own fix protected the *kind* (round-6's bug: a racing
+    `stopReason:"cancelled"` winning the DB write and overwriting a budget/
+    error termination with `kind="user"`) by making `_finalize_turn_success`
+    `return` WITHOUT calling `_terminate_run` at all whenever `ctx_turn.
+    termination_intent` was already `"budget"`/`"error"` — reasoning that the
+    claiming path's own `_terminate_run` call (a SEPARATE background task,
+    `_terminate_run_for_exceeded_budget`) would handle the write instead.
+
+    Round-8 review found that fix opens a WORSE race: `_run_turn`'s own
+    `finally` block calls `_advance_queue` immediately after `_finalize_
+    turn_success` returns, on the SAME task, with no `await` between them —
+    but the claiming path's own `_terminate_run` call, running on that
+    separate background task, might not have reached its write yet.
+    `_advance_queue` would then read `ctx_turn.terminated_kind` as still
+    `None` (indistinguishable from an ordinary completion) and AUTO-ADVANCE
+    the queue instead of suspending it (PRD 9.3) — even though the real
+    write, a moment later, would have correctly landed `kind="budget"`. The
+    original R-N11 regression test below (now rewritten) never exercised
+    this: it drove the REAL budget termination to completion first, so by
+    the time its "racing" `_finalize_turn_success` call ran, `_terminate_run`
+    's idempotency guard alone (a much older, unrelated mechanism) already
+    made it a no-op — reverting R-N16/R-N11 back to round-7's shape left that
+    old test passing unchanged (confirmed below in the branch report's
+    "第 8 轮修复记录", which also has the revert/run/restore transcript this
+    docstring doesn't repeat).
+
+    Fix: `_finalize_turn_success` now ALWAYS calls `_terminate_run` on a
+    cancelled `stopReason`, unconditionally — `_terminate_run` is the one
+    necessary, sufficient path that writes `terminated_kind` (see its own
+    docstring), so by the time `_run_turn`'s `finally` block reaches
+    `_advance_queue`, this Turn's `ctx_turn.terminated_kind` is guaranteed
+    non-`None` no matter which of the two racing `_terminate_run` calls
+    (this one, or the claiming path's own) gets there first — one performs
+    the real write, the other hits the existing idempotency guard. To still
+    close round-6's original bug under that "always call" rule,
+    `_terminate_run` now gives `ctx_turn.termination_intent` priority over
+    its caller's own `kind` argument when it's the one actually doing the
+    write — `_finalize_turn_success` still passes `kind="user"`, but a
+    pinned `"budget"`/`"error"` intent overrides it regardless of which call
+    wins the race.
+
+    Reproduces the exact ordering the round-7 bug depended on directly (same
+    "prove the mechanism, not real asyncio scheduling nondeterminism"
+    approach this file already uses elsewhere) instead of racing a real
+    background watchdog task: manufactures a Run/Turn genuinely still
+    'running' in the DB with a real pending queue item behind it, pins
+    `termination_intent = "budget"` on its `_TurnContext` (standing in for
+    `_terminate_run_for_exceeded_budget` having already done so, BEFORE its
+    own `_terminate_run` call — which this test deliberately never invokes),
+    then calls `_finalize_turn_success` immediately followed by
+    `_advance_queue` — the exact two calls `_run_turn`'s own task makes back
+    to back, with nothing else racing them at all. Asserts all three of
+    R-N17's requirements: (a) `runs.terminated_kind == "budget"`, (b)
+    `sessions.queue_suspended_reason` is the budget reason, not "user", and
+    (c) the queued item behind it is still 'pending' — never auto-advanced."""
     service = await _make_service(tmp_path, monkeypatch)
     await service.worker_manager.start()
     try:
         session_id = await _new_session(service, title="s1")
-        await service.send(session_id, "MANY_TOOL_CALLS:201")
-        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=5)
-        card = _terminated(service)[0]
-        assert card["kind"] == "budget"
-
-        # `_terminate_run_for_exceeded_budget` already set this to "budget"
-        # on the real `ctx_turn` before sending its cancel notification — a
-        # fresh `_TurnContext` here stands in for it with the exact same
-        # field, since the real one has already been popped off
-        # `_active_turns` by `_advance_queue` by now.
+        run_id = "run_race01"
+        turn_id = "turn_race01"
+        await run_in_db_thread(
+            service_module.queries.create_turn_and_user_message,
+            service.ctx.db,
+            turn_id=turn_id,
+            message_id="msg_race01",
+            session_id=session_id,
+            text="hello",
+            queued=False,
+        )
+        await run_in_db_thread(
+            service_module.queries.create_run,
+            service.ctx.db,
+            run_id=run_id,
+            turn_id=turn_id,
+            session_id=session_id,
+        )
         ctx_turn = service_module._TurnContext(
-            turn_id=card["turn_id"], run_id=card["run_id"], session_id=session_id,
+            turn_id=turn_id, run_id=run_id, session_id=session_id
         )
-        ctx_turn.termination_intent = "budget"
-        await service._finalize_turn_success(ctx_turn, {"stopReason": "cancelled"})
+        service._active_turns[session_id] = ctx_turn
 
-        # No second `run.terminated` broadcast — `_finalize_turn_success`
-        # deferred entirely instead of racing a second `_terminate_run` call.
-        assert len(_terminated(service)) == 1
-        run = await run_in_db_thread(
-            service_module.queries.get_run, service.ctx.db, card["run_id"]
+        # A real pending queue item behind this Turn — R-N17(c) needs
+        # something that a wrongly-unset `terminated_kind` CAN auto-advance.
+        await run_in_db_thread(
+            service_module.queries.create_turn_and_user_message,
+            service.ctx.db,
+            turn_id="turn_race01_queued",
+            message_id="msg_race01_queued",
+            session_id=session_id,
+            text="queued behind the race",
+            queued=True,
         )
-        assert run["terminated_kind"] == "budget"
+        await run_in_db_thread(
+            service_module.queries.enqueue,
+            service.ctx.db,
+            session_id=session_id,
+            turn_id="turn_race01_queued",
+            text="queued behind the race",
+            attachments=None,
+        )
+
+        # Stands in for `_terminate_run_for_exceeded_budget` having already
+        # pinned this BEFORE sending its cancel notification — its own
+        # subsequent `_terminate_run` call is deliberately never made here,
+        # since this test's whole point is that `_finalize_turn_success`
+        # must not depend on it having run yet.
+        ctx_turn.termination_intent = "budget"
+
+        # The racing `prompt()` future resolving "cancelled" first.
+        await service._finalize_turn_success(ctx_turn, {"stopReason": "cancelled"})
+        # `_run_turn`'s own `finally` block, immediately after, same task, no
+        # `await` in between in the real code either.
+        await service._advance_queue(session_id)
+
+        run = await run_in_db_thread(service_module.queries.get_run, service.ctx.db, run_id)
+        assert run["terminated_kind"] == "budget"  # R-N17(a)
+
         session = await run_in_db_thread(
             service_module.queries.get_session, service.ctx.db, session_id
         )
-        assert session["queue_suspended_reason"] == "budget"
+        assert session["queue_suspended_reason"] == "budget"  # R-N17(b), not "user"
+
+        items = await _queue_items(service, session_id)
+        assert len(items) == 1  # R-N17(c): not popped/auto-advanced
+        assert items[0]["turn_id"] == "turn_race01_queued"
     finally:
         await service.shutdown()
 

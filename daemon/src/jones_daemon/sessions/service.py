@@ -433,10 +433,18 @@ class _TurnContext:
     # write lands — `_finalize_turn_success`'s old, unconditional "stopReason
     # cancelled -> kind=user" could then win that race and silently overwrite
     # a budget/error termination with a wrong `kind="user"` (and no budget
-    # details). `None` means no active termination has claimed this Turn yet
-    # — only then does `_finalize_turn_success` fall back to `"user"`;
-    # otherwise it defers entirely to the claiming path's own `_terminate_run`
-    # call rather than gambling on which one's DB write lands first.
+    # details). `None` means no active termination has claimed this Turn yet.
+    #
+    # R-N16 (controller ruling, round-8, 2026-09-20): round-7's own fix for
+    # the above (`_finalize_turn_success` skipping its `_terminate_run` call
+    # entirely whenever this was non-`None`, deferring to the claiming path's
+    # own call) opened a WORSE race — see `_finalize_turn_success`'s own
+    # comment. `_terminate_run` is now the one call `_finalize_turn_success`
+    # always makes on a cancelled `stopReason`, and `_terminate_run` itself
+    # reads this field back to decide WHAT KIND to record (taking priority
+    # over its caller's own `kind` argument whenever this isn't `None`) —
+    # this field's job narrowed to exactly that: deciding what gets recorded,
+    # never whether `_terminate_run` gets called at all.
     termination_intent: str | None = None
 
 
@@ -1659,31 +1667,36 @@ class SessionService:
     ) -> None:
         await self._finalize_streamed_messages(ctx_turn)
         if response.get("stopReason") == "cancelled":
-            # R-N11 (controller ruling, round-7, 2026-09-20): a `stopReason:
-            # "cancelled"` return is ambiguous on its own — `stop()` (user),
-            # `_terminate_run_for_exceeded_budget` (budget) and a would-be
-            # crash notification (error) all send the SAME ACP `session/
-            # cancel` that produces it. `ctx_turn.termination_intent` — set
-            # by whichever of those paths actually initiated this, BEFORE it
-            # sent that notification (see that field's own comment) — is the
-            # only reliable signal for which one this is. `None` or `"user"`
-            # both mean this really is a user stop: `None` is an honest, un-
-            # prompted `stopReason:"cancelled"` (nothing else has claimed
-            # this Turn), and `"user"` is `stop()` having pinned the intent
-            # itself right before sending the SAME cancel notification that
-            # produced this — `stop()` never calls `_terminate_run` on its
-            # own, this is the only place that does it for a user stop.
-            # `"budget"`/`"error"` mean a more specific termination is
-            # already in flight (or already landed) with its own
-            # `_terminate_run` call — calling it again here with a blind
-            # `kind="user"` would either lose that race and get silently
-            # dropped by `_terminate_run`'s idempotency guard (harmless), or
-            # WIN it and overwrite a budget/error termination with the wrong
-            # kind and no budget details (the actual round-6 bug this
-            # closes) — so this defers to that path entirely instead of
-            # gambling on which one lands first.
-            if ctx_turn.termination_intent in (None, "user"):
-                await self._terminate_run(ctx_turn, kind="user", reason="stopped by user")
+            # R-N16 (controller ruling, round-8, 2026-09-20): round-7's R-N11
+            # made this an early `return` WITHOUT calling `_terminate_run` at
+            # all whenever `ctx_turn.termination_intent` was already
+            # `"budget"`/`"error"`, reasoning that the claiming path's own
+            # `_terminate_run` call (`_terminate_run_for_exceeded_budget`/
+            # `_on_worker_crash`) would handle the write instead. That opened
+            # a WORSE race than the one it closed: `_run_turn`'s own `finally`
+            # block calls `_advance_queue` immediately after this function
+            # returns, on the SAME task, no `await` in between — but the
+            # claiming path's own `_terminate_run` call runs on a SEPARATE
+            # background task (the budget watchdog) and might not have
+            # reached its write yet. `_advance_queue` would then read
+            # `ctx_turn.terminated_kind` as still `None` — indistinguishable
+            # from a normal completion — and auto-advance the queue instead
+            # of suspending it (PRD 9.3), even though the eventual write a
+            # moment later would have landed the correct `kind="budget"`.
+            #
+            # `_terminate_run` is the one necessary, sufficient path to that
+            # write (see its own docstring) — so this now ALWAYS calls it
+            # when a Turn comes back cancelled, unconditionally, with no
+            # branch that skips it. `kind="user"` here is only ever the
+            # honest default for the case nothing else has claimed this Turn
+            # (`termination_intent is None`) — `_terminate_run` itself now
+            # gives `ctx_turn.termination_intent` priority over this `kind`
+            # argument when it's the one actually performing the write, so a
+            # `"budget"`/`"error"` intent still lands as the correct kind
+            # regardless of whether this call or the claiming path's own call
+            # is the one that gets there first; whichever one loses that race
+            # just hits `_terminate_run`'s existing idempotency guard.
+            await self._terminate_run(ctx_turn, kind="user", reason="stopped by user")
             return
         await run_in_db_thread(
             queries.mark_run_completed, self.ctx.db, ctx_turn.run_id, ctx_turn.turn_id
@@ -1799,6 +1812,25 @@ class SessionService:
                 extra={"detail": {"run_id": ctx_turn.run_id, "status": existing["status"]}},
             )
             return
+
+        # R-N16 (controller ruling, round-8, 2026-09-20): from here on this
+        # call IS the one that actually performs the write (the idempotency
+        # guard above didn't return) — `ctx_turn.termination_intent`, pinned
+        # by whichever active-termination path (`stop()`/`_terminate_run_
+        # for_exceeded_budget`/`_on_worker_crash`) actually claimed this Turn
+        # BEFORE it sent its ACP cancel notification (see that field's own
+        # comment), takes priority over the caller's own `kind` argument for
+        # deciding what gets recorded. This is what makes the outcome no
+        # longer depend on which of two racing `_terminate_run` calls for the
+        # same Turn gets here first: `_finalize_turn_success` now always
+        # calls this method with `kind="user"` on a cancelled `stopReason`
+        # (R-N16), so without this override, whichever call happened to win
+        # that race would decide the kind — round-6's original bug, just
+        # moved to a different call site. `termination_intent is None` (a
+        # Turn nothing has claimed — an honest, un-prompted user stop) is the
+        # only case that falls back to the caller's own `kind`.
+        if ctx_turn.termination_intent is not None:
+            kind = ctx_turn.termination_intent
 
         # Issue #22 (04-w5-interfaces.md §4): "run.terminated 的 card 字段统一用
         # ErrorCard". kind="user" (`_finalize_turn_success`'s own call site,
