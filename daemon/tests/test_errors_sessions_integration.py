@@ -1665,16 +1665,27 @@ async def test_finalize_always_terminates_and_defers_the_kind_to_termination_int
     "prove the mechanism, not real asyncio scheduling nondeterminism"
     approach this file already uses elsewhere) instead of racing a real
     background watchdog task: manufactures a Run/Turn genuinely still
-    'running' in the DB with a real pending queue item behind it, pins
-    `termination_intent = "budget"` on its `_TurnContext` (standing in for
-    `_terminate_run_for_exceeded_budget` having already done so, BEFORE its
-    own `_terminate_run` call — which this test deliberately never invokes),
-    then calls `_finalize_turn_success` immediately followed by
+    'running' in the DB with a real pending queue item behind it, pins a
+    `_TerminationIntent` on its `_TurnContext` (standing in for
+    `_terminate_run_for_exceeded_budget` having already built and pinned one,
+    BEFORE its own `_terminate_run` call — which this test deliberately never
+    invokes), then calls `_finalize_turn_success` immediately followed by
     `_advance_queue` — the exact two calls `_run_turn`'s own task makes back
-    to back, with nothing else racing them at all. Asserts all three of
-    R-N17's requirements: (a) `runs.terminated_kind == "budget"`, (b)
+    to back, with nothing else racing them at all. Asserts all of R-N17's
+    requirements: (a) `runs.terminated_kind == "budget"`, (b)
     `sessions.queue_suspended_reason` is the budget reason, not "user", and
-    (c) the queued item behind it is still 'pending' — never auto-advanced."""
+    (c) the queued item behind it is still 'pending' — never auto-advanced.
+
+    R-N20/R-N21 (controller ruling, round-9, 2026-09-20): the pinned intent
+    used to be a bare `"budget"` string, so this test couldn't tell "kind
+    recorded right, reason/card still `_finalize_turn_success`'s own
+    hard-coded 'stopped by user'" (R-N20's bug) from a fully correct fix —
+    every assertion above passed either way. Extended with (d): the
+    persisted `runs.terminated_reason` and the broadcast `run.terminated`
+    card are the pinned budget ones, not "stopped by user"/no budget
+    numbers. Verified failing against a revert of the R-N20 fix before
+    confirming it passes again — see the branch report's "第 9 轮修复记录"
+    for that revert/run/restore transcript."""
     service = await _make_service(tmp_path, monkeypatch)
     await service.worker_manager.start()
     try:
@@ -1727,7 +1738,28 @@ async def test_finalize_always_terminates_and_defers_the_kind_to_termination_int
         # subsequent `_terminate_run` call is deliberately never made here,
         # since this test's whole point is that `_finalize_turn_success`
         # must not depend on it having run yet.
-        ctx_turn.termination_intent = "budget"
+        #
+        # R-N20/R-N21 (controller ruling, round-9, 2026-09-20): a bare
+        # `"budget"` string here used to be enough to make this test pass
+        # even with the R-N20 bug present (it only checked the outer
+        # `terminated_kind`/`queue_suspended_reason`, never the actual
+        # reason/card a user sees) — pin the FULL record
+        # `_terminate_run_for_exceeded_budget` itself now builds (a real
+        # budget reason + a card with `budget` numbers on it), same shape
+        # `_terminate_run` would compute on its own for `kind="budget"`.
+        budget_reason = "Step 数超限 (used=201, limit=200)"
+        budget_detail = {"name": "steps", "used": 201, "limit": 200, "unit": "steps"}
+        budget_error_kind = service_module.classify.classify(
+            kind_hint="budget", reason=budget_reason
+        )
+        ctx_turn.termination_intent = service_module._TerminationIntent(
+            kind=service_module.classify.terminated_kind_for("budget", budget_error_kind),
+            reason=budget_reason,
+            card=service_module.classify.build_card(
+                budget_error_kind, reason=budget_reason, step_seq=None, budget=budget_detail
+            ),
+            step_seq=None,
+        )
 
         # The racing `prompt()` future resolving "cancelled" first.
         await service._finalize_turn_success(ctx_turn, {"stopReason": "cancelled"})
@@ -1737,6 +1769,11 @@ async def test_finalize_always_terminates_and_defers_the_kind_to_termination_int
 
         run = await run_in_db_thread(service_module.queries.get_run, service.ctx.db, run_id)
         assert run["terminated_kind"] == "budget"  # R-N17(a)
+        # R-N21: the persisted `reason` must be the real budget reason, not
+        # `_finalize_turn_success`'s own hard-coded "stopped by user" (the
+        # exact R-N20 bug: kind correct, reason/card still the user-stop
+        # ones).
+        assert run["terminated_reason"] == budget_reason
 
         session = await run_in_db_thread(
             service_module.queries.get_session, service.ctx.db, session_id
@@ -1746,6 +1783,15 @@ async def test_finalize_always_terminates_and_defers_the_kind_to_termination_int
         items = await _queue_items(service, session_id)
         assert len(items) == 1  # R-N17(c): not popped/auto-advanced
         assert items[0]["turn_id"] == "turn_race01_queued"
+
+        # R-N21: the broadcast card itself must be the budget one too — not
+        # just the outer `kind`/persisted `reason`.
+        terminated = _terminated(service)
+        assert len(terminated) == 1
+        broadcast_card = terminated[0]["card"]
+        assert broadcast_card["kind"] == "budget"
+        assert broadcast_card["budget"] == budget_detail
+        assert terminated[0]["reason"] == budget_reason
     finally:
         await service.shutdown()
 

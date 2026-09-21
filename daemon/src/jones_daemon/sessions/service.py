@@ -330,6 +330,33 @@ def _fetch_turn_user_text(conn: Any, turn: dict[str, Any]) -> str | None:
     return text if isinstance(text, str) else None
 
 
+@dataclass(frozen=True)
+class _TerminationIntent:
+    """R-N20 (controller ruling, round-9, 2026-09-20): what an active
+    termination path (`stop()`/`_terminate_run_for_exceeded_budget`/
+    `_on_worker_crash`) pins onto `ctx_turn.termination_intent` BEFORE it
+    sends its ACP cancel notification — the FULL description `_terminate_run`
+    needs to record, not just the outer `kind`. Round-8's R-N16 narrowed this
+    field to a bare `str` (see `_TurnContext.termination_intent`'s own
+    comment) and made `_terminate_run` give it priority over its caller's own
+    `kind` argument — that closed round-6's original "wrong kind" bug, but
+    left `reason`/`card`/`step_seq` themselves still coming from whichever
+    call actually reaches `_terminate_run`'s write first. When that's
+    `_finalize_turn_success`'s own generic `kind="user", reason="stopped by
+    user"` call racing ahead of the claiming path's own (separate-task)
+    `_terminate_run` call, the persisted `kind` came out right (R-N16) but
+    the `reason`/`card` a user actually sees were still the hard-coded "用户
+    终止" ones — no budget numbers, wrong message — same bug, one field over.
+    Carrying the whole record here closes that: `_terminate_run` now adopts
+    every field of a pinned intent wholesale, never mixing it with its
+    caller's own arguments."""
+
+    kind: str
+    reason: str
+    card: classify.ErrorCard
+    step_seq: int | None
+
+
 @dataclass
 class _TurnContext:
     turn_id: str
@@ -445,7 +472,16 @@ class _TurnContext:
     # over its caller's own `kind` argument whenever this isn't `None`) —
     # this field's job narrowed to exactly that: deciding what gets recorded,
     # never whether `_terminate_run` gets called at all.
-    termination_intent: str | None = None
+    #
+    # R-N20 (controller ruling, round-9, 2026-09-20): narrowing this to just
+    # `kind` (R-N16) fixed WHICH outer kind gets persisted, but left `reason`/
+    # `card`/`step_seq` themselves still coming from whichever call actually
+    # performs the write — when that was `_finalize_turn_success`'s own
+    # generic call, the card/reason a user saw stayed the hard-coded "用户
+    # 终止" ones even for a Run correctly recorded as `kind="budget"`. Now a
+    # `_TerminationIntent` (the whole record `_terminate_run` needs, not a
+    # bare string) — see that dataclass's own comment for the full story.
+    termination_intent: _TerminationIntent | None = None
 
 
 # R-N5 (controller ruling, 2026-09-20; PRD 11.2 "单个 Run 最大 Step 数 200"/
@@ -905,9 +941,19 @@ class SessionService:
             # R-N11 (controller ruling, round-7, 2026-09-20): pin the
             # termination intent BEFORE sending the cancel notification below
             # — see `_TurnContext.termination_intent`'s own comment for why.
+            # R-N20 (controller ruling, round-9, 2026-09-20): the pinned
+            # value is now the full `_TerminationIntent` record (reason/card/
+            # step_seq included), not just the kind — see that dataclass's
+            # own comment.
             ctx_turn = self._active_turns.get(session_id)
             if ctx_turn is not None:
-                ctx_turn.termination_intent = "user"
+                user_stop_reason = "stopped by user"
+                ctx_turn.termination_intent = _TerminationIntent(
+                    kind="user",
+                    reason=user_stop_reason,
+                    card=classify.build_user_card(user_stop_reason),
+                    step_seq=ctx_turn.step_seq or None,
+                )
             try:
                 # A notification, not a hard kill: PRD 9.3 "用户终止" requires the
                 # in-flight tool call to finish cleanly. `cancel()` sets Hermes's
@@ -1710,6 +1756,28 @@ class SessionService:
         reason: str,
         budget: dict[str, Any] | None = None,
     ) -> None:
+        """R-N16 (controller ruling, round-8, 2026-09-20): the one and only
+        in-process exit point that writes `runs.terminated_kind` — every
+        active termination path (`stop()`/`_terminate_run_for_exceeded_
+        budget`/`_on_worker_crash`/`_run_turn`'s own exception handlers)
+        reaches `terminated_kind` exclusively by calling this method; none of
+        them ever writes it directly.
+
+        R-N22 (controller ruling, round-9, 2026-09-20): `sessions/queries.py
+        ::interrupt_stale_runs` (PRD 11.3 崩溃恢复) is a DIFFERENT, narrower
+        path that also writes `runs.terminated_kind='error'` directly via raw
+        SQL, deliberately bypassing this method entirely — that is not a gap
+        this method's "sole exit point" claim overlooked. It runs at daemon
+        *startup*, before this process's own event loop has any `ctx_turn`/
+        `_active_turns` for the stale rows it's marking (they belong to the
+        *previous* process, which is why they're stale) — there is no
+        in-process `_TurnContext` to call this method with, and manufacturing
+        a fake one would be worse than the raw SQL it would replace. The two
+        paths' job is disjoint by construction: this method is the only exit
+        point *within a running process*; cross-process restart recovery is
+        the one path that runs only at startup, outside that process's own
+        Run lifecycle altogether.
+        """
         # `budget` (R-N5, controller ruling 2026-09-20): the `{name, used, limit,
         # unit}` PRD 9.3's 预算终止 row requires ("显式卡片说明是哪个预算、用了
         # 多少、上限多少") — only `_handle_tool_call_start`'s new Step-count/
@@ -1819,25 +1887,42 @@ class SessionService:
         # by whichever active-termination path (`stop()`/`_terminate_run_
         # for_exceeded_budget`/`_on_worker_crash`) actually claimed this Turn
         # BEFORE it sent its ACP cancel notification (see that field's own
-        # comment), takes priority over the caller's own `kind` argument for
+        # comment), takes priority over the caller's own arguments for
         # deciding what gets recorded. This is what makes the outcome no
         # longer depend on which of two racing `_terminate_run` calls for the
         # same Turn gets here first: `_finalize_turn_success` now always
         # calls this method with `kind="user"` on a cancelled `stopReason`
         # (R-N16), so without this override, whichever call happened to win
-        # that race would decide the kind — round-6's original bug, just
-        # moved to a different call site. `termination_intent is None` (a
-        # Turn nothing has claimed — an honest, un-prompted user stop) is the
-        # only case that falls back to the caller's own `kind`.
-        if ctx_turn.termination_intent is not None:
-            kind = ctx_turn.termination_intent
-
+        # that race would decide what gets recorded — round-6's original bug,
+        # just moved to a different call site. `termination_intent is None`
+        # (a Turn nothing has claimed — an honest, un-prompted user stop) is
+        # the only case that falls back to the caller's own arguments.
+        #
+        # R-N20 (controller ruling, round-9, 2026-09-20): R-N16 only read
+        # `kind` off the pinned intent, leaving `reason`/`card`/`step_seq`
+        # still whatever the WINNING call happened to pass — when that was
+        # `_finalize_turn_success`'s own generic `reason="stopped by user"`
+        # call, the persisted `kind` came out right but the reason/card a
+        # user actually sees stayed the hard-coded "用户终止" ones, no budget
+        # numbers included, even for a Run correctly recorded as
+        # `kind="budget"`. `ctx_turn.termination_intent` is now the whole
+        # `_TerminationIntent` record (built by the claiming path itself,
+        # before it sent its cancel notification — see that dataclass's own
+        # comment) and, when present, is adopted wholesale: none of this
+        # method's own `kind`/`reason`/`budget`/`step_seq` arguments are
+        # consulted at all in that case.
+        intent = ctx_turn.termination_intent
+        if intent is not None:
+            effective_kind = intent.kind
+            reason = intent.reason
+            card = intent.card
+            step_seq = intent.step_seq
         # Issue #22 (04-w5-interfaces.md §4): "run.terminated 的 card 字段统一用
         # ErrorCard". kind="user" (`_finalize_turn_success`'s own call site,
         # untouched by this branch) never goes through `ErrorKind` — PRD 9.3
         # doesn't call a user-initiated stop an "error", and none of the three
         # card actions apply to it (see `classify.build_user_card`'s docstring).
-        if classify.is_user_stop(kind):
+        elif classify.is_user_stop(kind):
             card = classify.build_user_card(reason)
             effective_kind = "user"
         else:
@@ -2253,12 +2338,18 @@ class SessionService:
         the termination must still proceed regardless.
 
         R-N11 (controller ruling, round-7, 2026-09-20): pins `ctx_turn.
-        termination_intent = "budget"` BEFORE sending that cancel notification
-        — see `_TurnContext.termination_intent`'s own comment for the race
-        this closes (this function runs on a background watchdog task, not
+        termination_intent` BEFORE sending that cancel notification — see
+        `_TurnContext.termination_intent`'s own comment for the race this
+        closes (this function runs on a background watchdog task, not
         `_run_turn`'s own — the read loop resolving `_run_turn`'s in-flight
         `prompt()` future with `stopReason:"cancelled"` can race ahead of
         this same call's own `_terminate_run` below).
+
+        R-N20 (controller ruling, round-9, 2026-09-20): the pinned value now
+        carries the full budget card (reason + `{name, used, limit, unit}`),
+        not just `kind="budget"` — if `_finalize_turn_success`'s own generic
+        call wins that race, `_terminate_run` must still record and broadcast
+        the real budget reason/card, not the hard-coded "用户终止" one.
 
         Cancelling `_run_turn`'s own task LAST (not first) is still what
         guarantees its `finally: await self._advance_queue(...)` runs and
@@ -2284,7 +2375,24 @@ class SessionService:
         # R-N11 (controller ruling, round-7, 2026-09-20): pin this BEFORE
         # sending the cancel notification below — see this method's own
         # docstring and `_TurnContext.termination_intent`'s own comment.
-        ctx_turn.termination_intent = "budget"
+        # R-N20 (controller ruling, round-9, 2026-09-20): the pinned value is
+        # the full record `_terminate_run` would itself compute for
+        # `kind="budget"` with this same `reason`/`budget` dict — built here,
+        # synchronously, with the same `classify` calls `_terminate_run` uses
+        # when nothing has claimed the Turn (no DB round trip needed: an
+        # explicit `kind_hint="budget"` is trusted outright by `classify.
+        # classify()`, see its own docstring, so `last_step_status` is moot).
+        budget_detail = {"name": name, "used": used, "limit": limit, "unit": unit}
+        step_seq = ctx_turn.step_seq or None
+        budget_error_kind = classify.classify(kind_hint="budget", reason=reason)
+        ctx_turn.termination_intent = _TerminationIntent(
+            kind=classify.terminated_kind_for("budget", budget_error_kind),
+            reason=reason,
+            card=classify.build_card(
+                budget_error_kind, reason=reason, step_seq=step_seq, budget=budget_detail
+            ),
+            step_seq=step_seq,
+        )
         worker = self.worker_manager.get(ctx_turn.session_id)
         if worker is not None and worker.client is not None and worker.acp_session_id is not None:
             try:
@@ -2302,11 +2410,15 @@ class SessionService:
                     "exceeded budget (worker likely already gone)",
                     extra={"detail": {"session_id": ctx_turn.session_id, "error": str(exc)}},
                 )
+        # These arguments are only the honest fallback for the (never
+        # actually reachable here) case `ctx_turn.termination_intent` is
+        # `None` by the time this runs — the pin above already set it, so
+        # `_terminate_run` always adopts the record above wholesale instead
+        # (R-N20). Kept identical to that record rather than left stale, in
+        # case a future refactor ever calls this with `termination_intent`
+        # unset.
         await self._terminate_run(
-            ctx_turn,
-            kind="budget",
-            reason=reason,
-            budget={"name": name, "used": used, "limit": limit, "unit": unit},
+            ctx_turn, kind="budget", reason=reason, budget=budget_detail
         )
         task = self._turn_tasks.get(ctx_turn.session_id)
         if task is not None and not task.done():
@@ -2880,7 +2992,26 @@ class SessionService:
         # `_finalize_turn_success`'s `stopReason:"cancelled"` race doesn't
         # apply here in practice, but claiming the intent up front costs
         # nothing and keeps all termination paths consistent.
-        ctx_turn.termination_intent = "error"
+        #
+        # R-N20 (controller ruling, round-9, 2026-09-20): the pinned value
+        # carries the full worker_crash card, not just `kind="error"` — same
+        # reason string this function's own `_terminate_run` call below uses.
+        # No DB round trip needed to build it: `"worker process exited
+        # unexpectedly"` is `errors/classify.py::_WORKER_CRASH_MARKERS`'s own
+        # first marker, matched before `classify()` ever consults
+        # `last_step_status`, so passing `None` for it here is exact, not an
+        # approximation.
+        worker_crash_reason = f"worker process exited unexpectedly (code {returncode})"
+        worker_crash_step_seq = ctx_turn.step_seq or None
+        worker_crash_error_kind = classify.classify(kind_hint="error", reason=worker_crash_reason)
+        ctx_turn.termination_intent = _TerminationIntent(
+            kind=classify.terminated_kind_for("error", worker_crash_error_kind),
+            reason=worker_crash_reason,
+            card=classify.build_card(
+                worker_crash_error_kind, reason=worker_crash_reason, step_seq=worker_crash_step_seq
+            ),
+            step_seq=worker_crash_step_seq,
+        )
         # In the common case, the in-flight `worker.client.prompt()` call in
         # `_run_turn` observes the closed stdio pipe on its own (AcpClient's read
         # loop fails every pending future the instant the process's stdout hits
@@ -3021,11 +3152,12 @@ class SessionService:
         # authorized touch points is what makes reusing that order here
         # possible for the first time.
         await self._finalize_streamed_messages(ctx_turn)
-        await self._terminate_run(
-            ctx_turn,
-            kind="error",
-            reason=f"worker process exited unexpectedly (code {returncode})",
-        )
+        # `kind`/`reason` here are only the honest fallback for the (never
+        # actually reachable here) case `ctx_turn.termination_intent` is
+        # `None` by the time this runs — the pin above already set it, so
+        # `_terminate_run` always adopts that record wholesale instead
+        # (R-N20). Kept identical to it rather than left stale.
+        await self._terminate_run(ctx_turn, kind="error", reason=worker_crash_reason)
         if task is not None and not task.done():
             # Cancelling (rather than awaiting) `_run_turn`'s own stuck task is
             # what still lets its `finally: await self._advance_queue(...)` run
