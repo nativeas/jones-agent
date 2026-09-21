@@ -147,7 +147,9 @@ async def _new_session(service: SessionService, *, title: str) -> str:
 _WAIT_TIMEOUT_S = 20.0
 
 
-async def _wait_until(predicate, *, timeout: float = _WAIT_TIMEOUT_S, interval: float = 0.02) -> None:
+async def _wait_until(
+    predicate, *, timeout: float = _WAIT_TIMEOUT_S, interval: float = 0.02
+) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
