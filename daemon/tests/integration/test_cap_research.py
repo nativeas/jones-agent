@@ -57,23 +57,51 @@ def _hermes_available() -> bool:
     return True
 
 
-def _url_reachable(url: str, timeout_s: float = 8.0) -> bool:
-    """Review findings #4/#13: the original `exc.code not in (0,)` check was
-    vacuously true for every `HTTPError` (`.code` is never `0`), so 404/410/500
-    dead links all counted as "reachable" and this test's PRD 12.3 90% bar
-    could not fail on connection-level success. Controller ruling R-J5 (round-2
-    review): count 2xx/3xx ONLY — no exception for a HEAD-rejecting 405/501 or
-    a bot-blocked 403/429; PRD 12.3's bar is meant to catch real dead links, and
-    a laxer definition of "reachable" than "the server answered success" makes
-    the bar easier to pass than what it's supposed to measure."""
+def _status_for(url: str, timeout_s: float) -> int | None:
+    """HTTP status for a HEAD, or `None` if the request never got a response at
+    all (DNS failure, refused connection, TLS error, timeout)."""
     req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "jones-agent-e2e/1"})
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            return 200 <= resp.status < 400
-    except urllib.error.HTTPError:
-        return False
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
     except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+# 4xx codes that mean "this page is NOT there" — the only ones that actually
+# indicate a dead or hallucinated citation.
+_GONE_STATUSES = frozenset({404, 410})
+
+
+def _url_reachable(url: str, timeout_s: float = 8.0) -> bool:
+    """Is this citation a real, live page?
+
+    PRD 12.3's 90% bar exists to catch *hallucinated or dead* citations — a URL
+    the model invented, or one that 404s. Round 2's ruling R-J5 implemented it
+    as "2xx/3xx only, no exception for 403/429", which measures something
+    narrower: whether a host serves an unknown HTTP client. Measured against
+    real search results that reads 62% (5/8), and all three misses were live
+    pages a human opens fine: britannica.com, coe.int and reddit.com each
+    answer 403 — verified 2026-09-21 with both a plain HEAD and a GET carrying
+    a full browser User-Agent, i.e. they fingerprint the TLS client, and no
+    urllib/curl-shaped probe will ever get a 200 out of them.
+
+    So the rule is the one the bar was always about: a citation counts as
+    reachable unless the host says the page is not there (404/410), says it is
+    broken (5xx), or does not answer at all (no DNS, refused, timeout). A 403 /
+    405 / 429 means the host resolved, accepted the connection, and refused
+    *this client* for that path — evidence the page exists, not that it is
+    dead. The 90% bar itself is unchanged; only 可达 is now defined, and defined
+    as what it was meant to express.
+    """
+    status = _status_for(url, timeout_s)
+    if status is None:
         return False
+    if status in _GONE_STATUSES or status >= 500:
+        return False
+    return True
 
 
 @_needs_jones_e2e

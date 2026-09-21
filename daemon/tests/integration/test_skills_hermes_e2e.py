@@ -73,8 +73,14 @@ def test_a_copied_hermes_skill_is_listed_and_loadable_via_external_dirs(tmp_path
     # asserted first so a failure here (vs. below) tells the reader which
     # half broke.
     listed = service.list_skills(project_path=None)
-    assert [s["name"] for s in listed] == ["weekly-review-planning"]
-    assert listed[0]["valid"] is True
+    # Written when the bundled tier was still empty, so this used to assert the
+    # whole list equals just the copied skill. #21 then shipped `office-docs`
+    # and `media-gen` as bundled Skills, which legitimately show up here too —
+    # what this test is about is that a stock Hermes skill copied into Jones's
+    # user-level dir gets picked up, so assert that, not the absence of others.
+    by_name = {s["name"]: s for s in listed}
+    assert "weekly-review-planning" in by_name, f"copied skill not listed; got {sorted(by_name)}"
+    assert by_name["weekly-review-planning"]["valid"] is True
 
     # A fresh, isolated HERMES_HOME with `skills.external_dirs` pointing at
     # Jones's user skills dir — same shape H's `_prepare_hermes_home` should

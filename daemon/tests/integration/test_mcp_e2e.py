@@ -1,6 +1,6 @@
 """Real-Hermes MCP end-to-end check (Issue #17 §2 / FR13's acceptance
 criterion: "stdio 与 HTTP 各接一个 MCP Server"). Same gating as
-`test_real_hermes_e2e.py` (`JONES_E2E=1` + `ANTHROPIC_API_KEY`) and for the
+`test_real_hermes_e2e.py` (`JONES_E2E=1` + 任一厂商 Key) and for the
 same reason — a real worker's startup self-check alone already needs one real
 model Turn (`workers/manager.py::_startup_self_check`), so there's no cheaper
 way to prove MCP wiring end to end than a real Hermes worker.
@@ -25,10 +25,11 @@ import pytest
 
 from jones_daemon.workers.manager import WorkerManager
 
+from . import _provider_gate
+
 pytestmark = pytest.mark.skipif(
-    not (os.environ.get("JONES_E2E") and os.environ.get("ANTHROPIC_API_KEY")),
-    reason="real-Hermes MCP e2e: set JONES_E2E=1 and ANTHROPIC_API_KEY to run (see module "
-    "docstring)",
+    not (os.environ.get("JONES_E2E") and _provider_gate.configured_vendor()),
+    reason=_provider_gate.NEEDS_REAL_MODEL_REASON,
 )
 
 _STDIO_SERVER = str(Path(__file__).parent / "mcp_echo_stdio.py")

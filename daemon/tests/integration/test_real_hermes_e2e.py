@@ -26,9 +26,11 @@ import pytest
 from jones_daemon.workers import manager as manager_module
 from jones_daemon.workers.manager import WorkerManager
 
+from . import _provider_gate
+
 pytestmark = pytest.mark.skipif(
-    not (os.environ.get("JONES_E2E") and os.environ.get("ANTHROPIC_API_KEY")),
-    reason="real-Hermes e2e: set JONES_E2E=1 and ANTHROPIC_API_KEY to run (see module docstring)",
+    not (os.environ.get("JONES_E2E") and _provider_gate.configured_vendor()),
+    reason=_provider_gate.NEEDS_REAL_MODEL_REASON,
 )
 
 
@@ -45,7 +47,7 @@ async def test_real_worker_starts_and_completes_a_trivial_turn(tmp_path):
             # Model id from providers/catalog.py's own VENDORS["anthropic"] (the
             # cheapest of the three, since this only needs to prove the wire
             # works end to end, not produce a useful answer).
-            fh.write("model:\n  default: claude-haiku-4-6\n  provider: anthropic\n")
+            fh.write(_provider_gate.model_config_block())
 
     manager_module._prepare_hermes_home = _prepare_with_model_config
 
