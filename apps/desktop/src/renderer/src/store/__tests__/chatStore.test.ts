@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { MockTransport } from '../../rpc/mockTransport'
 import type { RpcCallResult, RpcTransport } from '../../rpc/transport'
 import { useChatStore } from '../chatStore'
@@ -12,12 +12,15 @@ function resetStore(): void {
     activeSessionId: null,
     timeline: [],
     queue: [],
+    queueSuspendedReason: null,
     pendingPermissions: [],
     running: false,
     error: null,
     runToSession: new Map(),
     unsubscribers: [],
     bindGeneration: 0,
+    pendingTerminations: new Set(),
+    handledTerminations: new Map(),
     // fresh batcher per test so a leftover scheduled flush from a previous
     // test's real rAF/timeout can never leak state into the next one. Only
     // used to drain buffered deltas between tests — the store's own flush
@@ -36,6 +39,63 @@ describe('chatStore', () => {
     await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
     expect(useChatStore.getState().activeSessionId).toBe(MAIN_SESSION_ID)
     expect(useChatStore.getState().timeline).toEqual([])
+  })
+
+  it('bindSession reconstructs "已暂停" from the persisted session.get value, surviving a switch away and back (R-N9, controller ruling round-6, 2026-09-20)', async () => {
+    // R-N9: `queue.changed`'s own `suspended`/`reason` (R-N4) only ever
+    // arrived as a live broadcast — nothing rebuilt it from a fresh
+    // `bindSession()` before this round. A hand-rolled transport (matching
+    // this file's own "superseded bind" tests above) rather than
+    // `MockTransport` — that mock doesn't track persisted suspend state at
+    // all (see its own `session.queue` comment), so it can't exercise this.
+    const sessionRow = {
+      id: 'session_suspended',
+      project_id: 'proj',
+      agent_id: 'agent',
+      parent_id: null,
+      is_main: false,
+      mode: 'task',
+      title: 'suspended session',
+      status: 'idle',
+      queue_suspended_reason: 'error'
+    }
+    let sessionGetCalls = 0
+    const transport: RpcTransport = {
+      call: async <T,>(method: string, params?: Record<string, unknown>): Promise<RpcCallResult<T>> => {
+        const id = (params as { id?: string } | undefined)?.id
+        if (method === 'session.get') {
+          sessionGetCalls += 1
+          if (id === sessionRow.id) return { ok: true, result: sessionRow as T }
+          return { ok: true, result: { ...sessionRow, id, queue_suspended_reason: null } as T }
+        }
+        if (method === 'session.queue' && id === sessionRow.id) {
+          return { ok: true, result: { items: [], suspended: true, reason: 'error' } as T }
+        }
+        if (method === 'session.queue') {
+          return { ok: true, result: { items: [], suspended: false, reason: null } as T }
+        }
+        return { ok: true, result: [] as T }
+      },
+      on: () => () => {}
+    }
+
+    await useChatStore.getState().bindSession(transport, sessionRow.id)
+    expect(useChatStore.getState().queueSuspendedReason).toBe('error')
+
+    // "切走": bind a different session — a real renderer's own reset (both
+    // the initial `null` in `bindSession()` and a fresh `session.get` for
+    // the OTHER session, which has no suspended reason) must not leave this
+    // session's "error" lingering in some shared/global slot.
+    await useChatStore.getState().bindSession(transport, 'session_other')
+
+    // "切回": rebinding the ORIGINAL session must reconstruct "已暂停" from
+    // the server's persisted value again — not from anything this store
+    // itself remembered in memory (each `bindSession()` above reset the
+    // whole store's session-scoped state, including `queueSuspendedReason`,
+    // back to `null` first).
+    await useChatStore.getState().bindSession(transport, sessionRow.id)
+    expect(useChatStore.getState().queueSuspendedReason).toBe('error')
+    expect(sessionGetCalls).toBe(3) // once per bindSession() call above
   })
 
   it('send() runs a full turn to completion: running toggles, assistant message + step land in the timeline', async () => {
@@ -118,41 +178,129 @@ describe('chatStore', () => {
     expect(assistantMsg).toBeDefined()
   })
 
-  it('retryLastMessage() resends the most recent user message (PRD 9.3 错误终止卡片 "重试")', async () => {
+  it('retryTermination() resends the original message via session.retry (Issue #22 FR14 "重试")', async () => {
     const transport = new MockTransport({ schedule: (fn) => fn() })
     await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
     await useChatStore.getState().send('/error 网络中断')
     expect(useChatStore.getState().running).toBe(false)
 
-    const result = await useChatStore.getState().retryLastMessage()
+    const card = useChatStore.getState().timeline.find((e) => e.kind === 'termination')
+    const turnId = card?.kind === 'termination' ? card.card.turn_id : undefined
+    expect(turnId).toBeDefined()
 
-    expect(result).not.toBeNull()
-    const state = useChatStore.getState()
-    const userMessages = state.timeline.filter((e) => e.kind === 'message' && e.message.role === 'user')
+    await useChatStore.getState().retryTermination(turnId!)
+
+    expect(useChatStore.getState().error).toBeNull()
+    const userMessages = useChatStore
+      .getState()
+      .timeline.filter((e) => e.kind === 'message' && e.message.role === 'user')
     expect(userMessages).toHaveLength(2)
     if (userMessages[1]?.kind === 'message') expect(userMessages[1].message.content.text).toBe('/error 网络中断')
   })
 
-  it('retryLastMessage() is a no-op when the timeline has no user message yet', async () => {
+  it('retryTermination() surfaces a friendly error, not the raw RpcError text, when the daemon rejects a stale/unknown turn_id', async () => {
+    // Round-2 review #2: the daemon's own RpcError message ("turn not found",
+    // "turn ... is not in a retryable state (status=...)") is an internal
+    // state-machine string that must never reach the UI verbatim.
     const transport = new MockTransport({ schedule: (fn) => fn() })
     await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
 
-    const result = await useChatStore.getState().retryLastMessage()
+    await useChatStore.getState().retryTermination('turn_does_not_exist')
 
-    expect(result).toBeNull()
+    const error = useChatStore.getState().error
+    expect(error).toBeTruthy()
+    expect(error).not.toMatch(/turn not found|turn_does_not_exist/)
   })
 
-  it('dismissTermination() removes only the named card (PRD 9.3 错误终止卡片 "放弃" — no server action, just hide it)', async () => {
+  it('round-2 review #6: retrying the same card twice back-to-back only sends one session.retry', async () => {
     const transport = new MockTransport({ schedule: (fn) => fn() })
     await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
+    await useChatStore.getState().send('/error 网络中断')
+    const card = useChatStore.getState().timeline.find((e) => e.kind === 'termination')
+    const turnId = card?.kind === 'termination' ? card.card.turn_id : undefined
+    expect(turnId).toBeDefined()
+
+    const callSpy = vi.spyOn(transport, 'call')
+    // Deliberately not awaited — this is the double-click case: the second
+    // call must see the pending guard the first call already set (both run
+    // synchronously up to their first `await`, so there's no race to win).
+    const first = useChatStore.getState().retryTermination(turnId!)
+    const second = useChatStore.getState().retryTermination(turnId!)
+    await Promise.all([first, second])
+
+    const retryCalls = callSpy.mock.calls.filter(([method]) => method === 'session.retry')
+    expect(retryCalls).toHaveLength(1)
+  })
+
+  it('round-2 review #2/#6: a successful retry marks the original card handled', async () => {
+    const transport = new MockTransport({ schedule: (fn) => fn() })
+    await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
+    await useChatStore.getState().send('/error 网络中断')
+    const card = useChatStore.getState().timeline.find((e) => e.kind === 'termination')
+    const turnId = card?.kind === 'termination' ? card.card.turn_id : undefined
+    expect(turnId).toBeDefined()
+
+    await useChatStore.getState().retryTermination(turnId!)
+
+    expect(useChatStore.getState().handledTerminations.get(turnId!)).toEqual({ action: 'retry' })
+    expect(useChatStore.getState().pendingTerminations.has(turnId!)).toBe(false)
+  })
+
+  it('abandonTermination() clears the pending queue via session.retry (Issue #22 FR14 "放弃")', async () => {
+    // A controllable scheduler (same pattern as the "rebinding" test below) —
+    // the first Turn's scripted termination must stay pending long enough for
+    // a second send() to actually land in the queue behind it.
+    const scheduled: Array<() => void> = []
+    const transport = new MockTransport({ schedule: (fn) => scheduled.push(fn) })
+    await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
+
     await useChatStore.getState().send('/error 第一次出错')
-    const firstCard = useChatStore.getState().timeline.find((e) => e.kind === 'termination')
-    const firstRunId = firstCard?.kind === 'termination' ? firstCard.card.run_id : undefined
-    expect(firstRunId).toBeDefined()
+    expect(useChatStore.getState().running).toBe(true) // termination not fired yet
 
-    useChatStore.getState().dismissTermination(firstRunId!)
+    await useChatStore.getState().send('排在后面的第二条')
+    expect(useChatStore.getState().queue).toHaveLength(1)
 
-    expect(useChatStore.getState().timeline.some((e) => e.kind === 'termination')).toBe(false)
+    scheduled.shift()!() // fire the scripted termination now
+
+    const card = useChatStore.getState().timeline.find((e) => e.kind === 'termination')
+    const turnId = card?.kind === 'termination' ? card.card.turn_id : undefined
+    expect(turnId).toBeDefined()
+
+    await useChatStore.getState().abandonTermination(turnId!)
+
+    expect(useChatStore.getState().error).toBeNull()
+    expect(useChatStore.getState().queue).toHaveLength(0)
+    // The card itself stays in the timeline as history — 04-w5-interfaces.md
+    // §4 / PRD FR06: 错误卡片本身进入 Session 记录，可回放. Abandoning clears
+    // the queue and the server-side Turn status, it doesn't hide the card.
+    expect(useChatStore.getState().timeline.some((e) => e.kind === 'termination')).toBe(true)
+    // Round-2 review #2: even when the queue was already empty (the most
+    // common case, not exercised by this particular scenario since it does
+    // have a queued item), "放弃" needs SOME visible confirmation — marking
+    // the card handled is what drives that in TerminationCard. Round-N2
+    // review #2: the RPC's own `cleared_queue_items` (1 here — the one
+    // queued message) rides along instead of being discarded.
+    expect(useChatStore.getState().handledTerminations.get(turnId!)).toEqual({
+      action: 'abandon',
+      clearedQueueItems: 1
+    })
+  })
+
+  it('round-N2 review #2: abandonTermination() with nothing queued reports clearedQueueItems: 0, not a false "已清空"', async () => {
+    const transport = new MockTransport({ schedule: (fn) => fn() })
+    await useChatStore.getState().bindSession(transport, MAIN_SESSION_ID)
+    await useChatStore.getState().send('/error 网络中断')
+    const card = useChatStore.getState().timeline.find((e) => e.kind === 'termination')
+    const turnId = card?.kind === 'termination' ? card.card.turn_id : undefined
+    expect(turnId).toBeDefined()
+    expect(useChatStore.getState().queue).toHaveLength(0)
+
+    await useChatStore.getState().abandonTermination(turnId!)
+
+    expect(useChatStore.getState().handledTerminations.get(turnId!)).toEqual({
+      action: 'abandon',
+      clearedQueueItems: 0
+    })
   })
 
   it('removeQueueItem drops the item from the queue panel', async () => {

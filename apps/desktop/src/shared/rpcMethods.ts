@@ -17,6 +17,9 @@
  *   - `daemon.clear_cache` / `session.delete` / `session.export` / `run.delete`
  *     — added by issue #23 (04-w5-interfaces.md §5, G20 真删) as real §4.1
  *     table rows, same as `skill.list` above — no special-casing needed here.
+ *   - `session.queue_resume` — added by issue #22 (controller ruling R-N4,
+ *     2026-09-20, 04-w5-interfaces.md §4.3) as a real §4.1 table row, same as
+ *     the two bullets above.
  *
  * `apps/desktop/src/main/index.ts`'s `ALLOWED_RPC_METHODS` is this exact set —
  * `src/shared/__tests__/rpcMethods.test.ts` parses 00-foundation.md §4.1's table
@@ -50,7 +53,9 @@ export const RPC_V0_METHODS = [
   'session.queue',
   'session.queue_remove',
   'session.queue_reorder',
+  'session.queue_resume',
   'session.stop',
+  'session.retry',
   'session.subscribe',
   'session.unsubscribe',
   'session.delete',

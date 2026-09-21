@@ -142,6 +142,25 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
     async def session_stop(params: dict[str, Any], conn: Connection) -> Any:
         return await service.stop(_require_str(params, "id"))
 
+    async def session_retry(params: dict[str, Any], conn: Connection) -> Any:
+        # Issue #22 (04-w5-interfaces.md §4): the error card's 重试/换模型/放弃
+        # actions all route through this one RPC — see `SessionService.retry`'s
+        # docstring for why "switch_model" isn't a separate `action` value.
+        action = params.get("action", "retry")
+        if action not in ("retry", "abandon"):
+            raise RpcError(INVALID_PARAMS, f"invalid action: {action!r}", {"params": params})
+        model_override = params.get("model_override")
+        if model_override is not None and not isinstance(model_override, dict):
+            raise RpcError(
+                INVALID_PARAMS, "'model_override' must be an object", {"params": params}
+            )
+        return await service.retry(
+            _require_str(params, "id"),
+            _require_str(params, "turn_id"),
+            action=action,
+            model_override=model_override,
+        )
+
     async def session_queue(params: dict[str, Any], conn: Connection) -> Any:
         return await service.queue(_require_str(params, "id"))
 
@@ -157,6 +176,12 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
                 INVALID_PARAMS, "'item_ids' must be a list of strings", {"params": params}
             )
         return await service.queue_reorder(_require_str(params, "id"), item_ids)
+
+    async def session_queue_resume(params: dict[str, Any], conn: Connection) -> Any:
+        # R-N4 (controller ruling, 2026-09-20; 04-w5-interfaces.md §4.3): the
+        # queue panel's "继续" button, params -> call translation same as
+        # every other thin handler in this file.
+        return await service.queue_resume(_require_str(params, "id"))
 
     async def session_subscribe(params: dict[str, Any], conn: Connection) -> Any:
         conn.subscriptions.add(_require_str(params, "id"))
@@ -287,9 +312,11 @@ def register(server: RpcServer, ctx: DaemonContext) -> SessionService:
     server.register("session.set_mode", session_set_mode)
     server.register("session.send", session_send)
     server.register("session.stop", session_stop)
+    server.register("session.retry", session_retry)
     server.register("session.queue", session_queue)
     server.register("session.queue_remove", session_queue_remove)
     server.register("session.queue_reorder", session_queue_reorder)
+    server.register("session.queue_resume", session_queue_resume)
     server.register("session.subscribe", session_subscribe)
     server.register("session.unsubscribe", session_unsubscribe)
     server.register("session.delete", session_delete)

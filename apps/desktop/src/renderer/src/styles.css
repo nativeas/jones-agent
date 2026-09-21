@@ -352,14 +352,53 @@ body {
   opacity: 0.8;
 }
 
-.termination-card--error {
+/* Issue #22 (04-w5-interfaces.md §4): 7 个视觉分组，对应
+   `errors/classify.py::VISUALLY_DISTINCT_KINDS`（provider_error/internal 没有
+   独立样式，回退到 --generic）。每种只定一个强调色，浅色/深色主题都靠低透明度
+   叠色，不单独写 prefers-color-scheme（呼应文件顶部 `color-scheme: light
+   dark` 的既有做法）。 */
+.termination-card--network {
   border-color: #d335;
   background: #d3330a;
 }
 
-.termination-card--budget {
+.termination-card--quota {
   border-color: #e6a23c55;
   background: #e6a23c0a;
+}
+
+.termination-card--auth {
+  border-color: #e6a23c55;
+  background: #e6a23c0a;
+}
+
+.termination-card--tool {
+  border-color: #d3335;
+  background: #d3330a;
+}
+
+.termination-card--crash {
+  border-color: #9333ea55;
+  background: #9333ea0a;
+}
+
+.termination-card--timeout {
+  border-color: #6b728055;
+  background: #6b72800a;
+}
+
+.termination-card--budget-kind {
+  border-color: #e6a23c55;
+  background: #e6a23c0a;
+}
+
+.termination-card--generic {
+  border-color: #d3335;
+  background: #d3330a;
+}
+
+.termination-card__icon {
+  margin-right: 4px;
 }
 
 .termination-card__detail {
@@ -370,6 +409,46 @@ body {
 
 .termination-card__actions {
   display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.termination-card__actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.termination-card__handled {
+  font-size: 12px;
+  opacity: 0.75;
+  margin-top: 8px;
+}
+
+.termination-card__raw {
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.termination-card__raw summary {
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.termination-card__raw pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow: auto;
+  background: #0001;
+  padding: 6px 8px;
+  border-radius: 4px;
+  margin: 4px 0 0;
+}
+
+.termination-card__model-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 6px;
   margin-top: 8px;
 }
@@ -385,6 +464,24 @@ body {
 .queue-panel__title {
   font-weight: 600;
   margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* R-N4 (04-w5-interfaces.md §4.3, PRD 9.3): 三类终止后队列挂起的提示 + 继续按钮 */
+.queue-panel__suspended {
+  font-weight: 400;
+  color: #b45309;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.queue-panel__resume {
+  font-weight: 600;
+  cursor: pointer;
 }
 
 .queue-panel__list {

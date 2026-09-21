@@ -3,7 +3,7 @@ import type { RpcTransport } from '../rpc/transport'
 import type { SessionMode } from '../domain/types'
 import { useChatStore } from '../store/chatStore'
 import { useSessionsStore } from '../store/sessionsStore'
-import { useNavigationStore } from '../store/navigationStore'
+import { useSettingsStore } from '../store/settingsStore'
 import { MessageList } from './chat/MessageList'
 import { InputBar } from './chat/InputBar'
 import { QueuePanel } from './chat/QueuePanel'
@@ -27,14 +27,46 @@ export function CenterPane({ transport }: CenterPaneProps): JSX.Element {
   const timeline = useChatStore((s) => s.timeline)
   const running = useChatStore((s) => s.running)
   const queue = useChatStore((s) => s.queue)
+  const queueSuspendedReason = useChatStore((s) => s.queueSuspendedReason)
+  const queueResume = useChatStore((s) => s.queueResume)
   const send = useChatStore((s) => s.send)
   const stop = useChatStore((s) => s.stop)
-  const retryLastMessage = useChatStore((s) => s.retryLastMessage)
-  const dismissTermination = useChatStore((s) => s.dismissTermination)
+  const retryTermination = useChatStore((s) => s.retryTermination)
+  const switchModelTermination = useChatStore((s) => s.switchModelTermination)
+  const abandonTermination = useChatStore((s) => s.abandonTermination)
   const removeQueueItem = useChatStore((s) => s.removeQueueItem)
   const reorderQueue = useChatStore((s) => s.reorderQueue)
   const error = useChatStore((s) => s.error)
-  const goToAgentModelSettings = useNavigationStore((s) => s.goToAgentModelSettings)
+  // Round-2 review #2/#6: per-card in-flight guard + "already used" marker,
+  // threaded down to TerminationCard via MessageList.
+  const pendingTerminations = useChatStore((s) => s.pendingTerminations)
+  const handledTerminations = useChatStore((s) => s.handledTerminations)
+  // Issue #22 (04-w5-interfaces.md §4): the "换模型" card action needs a real
+  // provider/model list — only providers with a configured Key are offered
+  // (picking one without a Key would just fail `session.retry` the same way
+  // the original Turn did).
+  // Round-1 review fix: the old selector was `(s) => s.providers.filter(...)`
+  // — zustand v5's `useStore` feeds the selector result straight into
+  // `useSyncExternalStore` with no memoization (v4's
+  // `useSyncExternalStoreWithSelector` cache is gone in v5), so a `.filter()`
+  // inside the selector returns a new array on every call. React's
+  // `checkIfSnapshotChanged` then sees a changed snapshot on every render,
+  // forever — `Maximum update depth exceeded` on mount, empty `providers` or
+  // not. Select the stable `providers` reference and filter in the component
+  // body instead.
+  const settingsInit = useSettingsStore((s) => s.init)
+  const providers = useSettingsStore((s) => s.providers)
+  const models = useSettingsStore((s) => s.models)
+  // Issue #22 (04-w5-interfaces.md §4): the "换模型" card action needs a real
+  // provider/model list — only providers with a configured Key are offered
+  // (picking one without a Key would just fail `session.retry` the same way
+  // the original Turn did).
+  const configuredProviders = providers.filter((p) => p.has_key)
+
+  useEffect(() => {
+    void settingsInit(transport)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transport])
 
   useEffect(() => {
     if (!selectedSessionId) return
@@ -71,12 +103,22 @@ export function CenterPane({ transport }: CenterPaneProps): JSX.Element {
       <div className="center-pane__body">
         <MessageList
           timeline={timeline}
-          onRetry={() => void retryLastMessage()}
-          onSwitchModel={goToAgentModelSettings}
-          onAbandon={dismissTermination}
+          providers={configuredProviders}
+          models={models}
+          onRetry={(turnId) => void retryTermination(turnId)}
+          onSwitchModel={(turnId, override) => void switchModelTermination(turnId, override)}
+          onAbandon={(turnId) => void abandonTermination(turnId)}
+          pendingTerminations={pendingTerminations}
+          handledTerminations={handledTerminations}
         />
       </div>
-      <QueuePanel items={queue} onRemove={removeQueueItem} onReorder={reorderQueue} />
+      <QueuePanel
+        items={queue}
+        suspendedReason={queueSuspendedReason}
+        onRemove={removeQueueItem}
+        onReorder={reorderQueue}
+        onResume={queueResume}
+      />
       <InputBar running={running} onSend={send} onStop={stop} />
     </main>
   )

@@ -97,6 +97,29 @@ def set_session_mode(conn: sqlite3.Connection, session_id: str, mode: str) -> di
     return get_session(conn, session_id)
 
 
+def set_queue_suspended_reason(
+    conn: sqlite3.Connection, session_id: str, reason: str | None
+) -> None:
+    """R-N9 (controller ruling, round-6, 2026-09-20): persists what
+    `_advance_queue`'s `queue.changed` broadcast (`suspended`/`reason`,
+    R-N4) has always computed on the fly but never wrote down —
+    `_terminate_run` calls this with the outer `kind` (`"user"|"error"|
+    "budget"`) the same moment it sets `ctx_turn.terminated_kind` (see that
+    method's own comment); `_run_turn` calls this with `None` at the start of
+    every Turn (send()'s immediate-run path, `retry()`, `queue_resume()`, and
+    `_advance_queue`'s own auto-continue all end up here), since a Turn now
+    running is definitionally not a suspended queue. `session.get`/
+    `session.queue` both read this back (via `get_session`'s plain `SELECT *`
+    for the former; explicitly for the latter, see `SessionService.queue()`)
+    so a renderer that reloads/switches sessions can reconstruct "已暂停" +
+    "继续" instead of only ever learning about it from a live broadcast."""
+    conn.execute(
+        "UPDATE sessions SET queue_suspended_reason = ?, updated_at = ? WHERE id = ?",
+        (reason, iso_now(), session_id),
+    )
+    conn.commit()
+
+
 def latest_turn(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
     return _d(
         conn.execute(
@@ -361,9 +384,31 @@ def cancel_turn(conn: sqlite3.Connection, turn_id: str) -> None:
 def interrupt_stale_runs(conn: sqlite3.Connection) -> int:
     """PRD 11.3 崩溃恢复: any Run/Turn still 'running' when the daemon starts means
     the previous process died mid-flight — mark them, never leave a UI showing
-    "running" against a Run nothing is driving anymore (N07)."""
+    "running" against a Run nothing is driving anymore (N07).
+
+    R-N14 (controller ruling, round-7, 2026-09-20): also writes each affected
+    Session's `queue_suspended_reason` to `'error'` — same semantic value
+    `_terminate_run` writes for an ordinary error termination (`set_queue_
+    suspended_reason`'s own docstring has the full read/write map). Without
+    this, a Session with a pending queue whose Run got force-restarted here
+    (rather than through `_terminate_run` itself, which normally does this
+    write) came back up with an un-terminated-looking queue: `queue_items`
+    correctly stayed 'pending' (nothing here touches those), but nothing
+    told the renderer this Session's queue was suspended and needed a
+    「继续」click — `session.get`/`session.queue` would report `suspended:
+    false` even though the Run that was supposed to feed the queue never
+    finished. Captures the affected `session_id`s BEFORE the `runs` UPDATE
+    below (rather than matching on the literal `terminated_reason` string
+    afterwards) — the more obviously correct order, and it doesn't depend on
+    that string staying unique to this function forever."""
     now = iso_now()
     try:
+        stale_session_ids = [
+            row["session_id"]
+            for row in conn.execute(
+                "SELECT DISTINCT session_id FROM runs WHERE status = 'running'"
+            ).fetchall()
+        ]
         cur = conn.execute(
             "UPDATE runs SET status = 'terminated', ended_at = ?, terminated_kind = 'error', "
             "terminated_reason = 'daemon restarted while this Run was in progress', updated_at = ? "
@@ -374,6 +419,13 @@ def interrupt_stale_runs(conn: sqlite3.Connection) -> int:
             "UPDATE turns SET status = 'terminated', updated_at = ? WHERE status = 'running'",
             (now,),
         )
+        if stale_session_ids:
+            placeholders = ",".join("?" * len(stale_session_ids))
+            conn.execute(
+                "UPDATE sessions SET queue_suspended_reason = 'error', updated_at = ? "
+                f"WHERE id IN ({placeholders})",
+                (now, *stale_session_ids),
+            )
         conn.commit()
         return cur.rowcount
     except sqlite3.Error:

@@ -34,6 +34,29 @@ export interface Session {
   mode: SessionMode
   title: string
   status: SessionStatus
+  /** R-N9 (controller ruling, round-6, 2026-09-20; PRD 9.3): persisted
+   * counterpart of `queue.changed`'s own `suspended`/`reason` — `null`/
+   * absent when the queue isn't suspended, one of the three outer
+   * termination kinds otherwise. Lets `chatStore`'s `bindSession()`
+   * reconstruct "已暂停" + "继续" from `session.get` after a reload/session
+   * switch, not only from a live broadcast this pane happened to be
+   * subscribed for when it fired. Optional (not on every existing `Session`
+   * fixture in this codebase's own tests/mock — a real daemon `session.get`
+   * response always has it; `chatStore` treats an absent value the same as
+   * `null`, same as `queue.changed`'s own `suspended`/`reason` already do). */
+  queue_suspended_reason?: 'user' | 'error' | 'budget' | null
+}
+
+/** R-N9 (controller ruling, round-6, 2026-09-20): `session.queue`'s response
+ * shape — used to be a bare `QueueItem[]`, now carries the same persisted
+ * suspended state `Session.queue_suspended_reason` does, so a caller that
+ * only ever calls `session.queue` (not `session.get`) can still reconstruct
+ * it. `session.queue_remove`/`session.queue_reorder` are unaffected by this
+ * round's ruling and keep returning a bare `QueueItem[]`. */
+export interface SessionQueueResponse {
+  items: QueueItem[]
+  suspended: boolean
+  reason: 'user' | 'error' | 'budget' | null
 }
 
 export type MessageRole = 'user' | 'assistant' | 'system' | 'tool'
@@ -85,13 +108,62 @@ export interface Step {
 
 export type TerminationKind = 'user' | 'error' | 'budget'
 
+/** Fixed 9-value enum, `daemon/src/jones_daemon/errors/classify.py::ErrorKind`'s
+ * mirror (Issue #22, 04-w5-interfaces.md §4) — `"user"` is NOT one of these
+ * (a user-initiated stop never goes through `ErrorKind`, see that module's
+ * `build_user_card`), it's `TerminationCard.kind` at the outer level only. */
+export type ErrorKind =
+  | 'network'
+  | 'provider_auth'
+  | 'provider_quota'
+  | 'provider_error'
+  | 'tool_exception'
+  | 'worker_crash'
+  | 'approval_timeout'
+  | 'budget'
+  | 'internal'
+
+export type CardAction = 'retry' | 'switch_model' | 'abandon'
+
+/** `ErrorCard.to_dict()`'s exact shape (04-w5-interfaces.md §4: "{kind, title,
+ * message, step_seq?, raw_excerpt(≤2KB, 已脱敏), actions, retryable}") — the
+ * `kind="user"` pass-through card `build_user_card()` produces has the same
+ * shape (empty `actions`), so this one interface covers every `card.card`
+ * value `run.terminated` can carry, no separate "budget card"/"error card"
+ * union needed. */
+/** Round-2 review #4: PRD 9.3's 预算终止 row requires "显式卡片说明是哪个预算、用
+ * 了多少、上限多少" — this is that structured slot. Optional/nullable because
+ * no call site has real numbers to put here yet (`errors/classify.py::
+ * ErrorCard`'s docstring explains why); present so the renderer can show it
+ * the moment a daemon build does populate it, without another interface
+ * change. */
+export interface BudgetDetail {
+  name?: string
+  used?: number
+  limit?: number
+  unit?: string
+}
+
+export interface ErrorCard {
+  kind: ErrorKind | 'user'
+  title: string
+  message: string
+  step_seq: number | null
+  raw_excerpt: string
+  actions: CardAction[]
+  retryable: boolean
+  budget?: BudgetDetail | null
+}
+
 export interface TerminationCard {
   run_id: string
+  /** Added by Issue #22 (`_terminate_run`'s broadcast, 04-w5-interfaces.md
+   * §4) — the only way the "重试/换模型/放弃" actions can name which Turn to
+   * act on via `session.retry {id, turn_id, action, model_override?}`. */
+  turn_id: string
   kind: TerminationKind
   reason: string
-  /** Free-form structured detail the three card renderings each read differently
-   * (error: step/message; budget: used/limit; user: nothing extra required). */
-  card: Record<string, unknown>
+  card: ErrorCard
 }
 
 export type PermissionGate = 'rule' | 'review' | 'user'

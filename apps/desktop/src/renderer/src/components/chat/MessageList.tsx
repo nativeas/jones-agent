@@ -1,4 +1,5 @@
 import type { TimelineEntry } from '../../store/chatStore'
+import type { CardAction, Model, Provider } from '../../domain/types'
 import { VirtualList } from '../common/VirtualList'
 import { StepCard } from './StepCard'
 import { TerminationCard } from './TerminationCard'
@@ -12,11 +13,19 @@ const ROLE_LABEL: Record<string, string> = {
 
 interface MessageListProps {
   timeline: TimelineEntry[]
-  onRetry?: () => void
-  onSwitchModel?: () => void
-  /** Dismiss one termination card — takes the card's run_id since the
-   * timeline can hold more than one past termination. */
-  onAbandon?: (runId: string) => void
+  /** Providers with a configured Key, for the "换模型" inline picker
+   * (Issue #22, 04-w5-interfaces.md §4). */
+  providers: Provider[]
+  models: Model[]
+  onRetry?: (turnId: string) => void
+  onSwitchModel?: (turnId: string, override: { provider: string; model: string }) => void
+  onAbandon?: (turnId: string) => void
+  /** Round-2 review #6: turn_ids currently awaiting a `session.retry` round-trip. */
+  pendingTerminations?: Set<string>
+  /** Round-2 review #2/#6: turn_id → which action already completed for it
+   * (round-N2 review #2: plus `cleared_queue_items` for "放弃", see
+   * `TerminationCard`'s `handled` prop doc comment). */
+  handledTerminations?: Map<string, { action: CardAction; clearedQueueItems?: number }>
 }
 
 function renderEntry(entry: TimelineEntry, props: MessageListProps): JSX.Element {
@@ -35,13 +44,17 @@ function renderEntry(entry: TimelineEntry, props: MessageListProps): JSX.Element
   if (entry.kind === 'step') {
     return <StepCard step={entry.step} />
   }
-  const runId = entry.card.run_id
+  const { turn_id: turnId } = entry.card
   return (
     <TerminationCard
       card={entry.card}
-      onRetry={props.onRetry}
-      onSwitchModel={props.onSwitchModel}
-      onAbandon={props.onAbandon ? () => props.onAbandon!(runId) : undefined}
+      providers={props.providers}
+      models={props.models}
+      onRetry={props.onRetry ? () => props.onRetry!(turnId) : undefined}
+      onSwitchModel={props.onSwitchModel ? (override) => props.onSwitchModel!(turnId, override) : undefined}
+      onAbandon={props.onAbandon ? () => props.onAbandon!(turnId) : undefined}
+      pending={props.pendingTerminations?.has(turnId)}
+      handled={props.handledTerminations?.get(turnId)}
     />
   )
 }

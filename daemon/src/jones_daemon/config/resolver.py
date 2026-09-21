@@ -28,6 +28,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "default_agent_id": "agent_default",
     "concurrency_limit": 4,
     "approval_timeout_minutes": None,  # None = 不超时 (PRD 9.4 default)
+    # R-N5 (controller ruling, 2026-09-20; PRD 11.2's own numbers, 01-w2-
+    # interfaces.md §4.1): `sessions/service.py::_run_turn`/
+    # `_handle_tool_call_start` read these to enforce the 单 Run Step 数/时长
+    # upper bounds as a 预算终止 (PRD 9.3).
+    "max_steps_per_run": 200,
+    "max_run_duration_s": 7200,  # 2h
 }
 
 RuleAction = Literal["allow", "deny"]

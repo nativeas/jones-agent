@@ -1,6 +1,15 @@
 import { create } from 'zustand'
 import type { RpcTransport } from '../rpc/transport'
-import type { Message, PermissionRequest, QueueItem, Session, Step, TerminationCard } from '../domain/types'
+import type {
+  CardAction,
+  Message,
+  PermissionRequest,
+  QueueItem,
+  Session,
+  SessionQueueResponse,
+  Step,
+  TerminationCard
+} from '../domain/types'
 import { createDeltaBatcher, type DeltaBatcher } from './deltaBatcher'
 
 export type TimelineEntry =
@@ -19,6 +28,15 @@ interface ChatState {
   activeSessionId: string | null
   timeline: TimelineEntry[]
   queue: QueueItem[]
+  /** R-N4 (controller ruling, 2026-09-20; 04-w5-interfaces.md §4.3, PRD 9.3):
+   * `null` when the queue is running normally; the terminated Run's outer
+   * `kind` ("user"|"error"|"budget") once `queue.changed`'s `suspended:true`
+   * arrives — the three termination kinds no longer auto-advance the queue,
+   * so `QueuePanel` shows "已暂停" + a "继续" button instead of silently
+   * looking like nothing is queued. Cleared by any `queue.changed` broadcast
+   * that carries `suspended:false` (a normal advance, `queueResume()`, or
+   * `abandonTermination()`'s own clear). */
+  queueSuspendedReason: 'user' | 'error' | 'budget' | null
   pendingPermissions: PermissionRequest[]
   running: boolean
   error: string | null
@@ -34,22 +52,57 @@ interface ChatState {
    * first `session.subscribe` round-trip returned) detect it's stale and
    * back out instead of overwriting a newer bind's state/listeners. */
   bindGeneration: number
+  /** turn_id currently awaiting a `session.retry` round-trip (round-2 review
+   * #6) — guards `retryTermination`/`switchModelTermination`/
+   * `abandonTermination` against a second click firing a second real RPC (and
+   * a second real Turn/model call) before the first resolves, and lets
+   * `TerminationCard` disable its buttons while true. */
+  pendingTerminations: Set<string>
+  /** turn_id → which action already completed successfully (round-2 review
+   * #2/#6) — once a termination card's action has been used, it renders inert
+   * (no buttons, a status line instead) rather than staying clickable forever
+   * (the bug that let one card spawn unlimited Turns). Round-N2 review #2:
+   * also carries `session.retry(action:"abandon")`'s own `cleared_queue_
+   * items` count, so the "放弃" status line can say how many (if any)
+   * queued instructions actually got cleared instead of always claiming the
+   * queue was cleared. */
+  handledTerminations: Map<string, { action: CardAction; clearedQueueItems?: number }>
 
   bindSession(transport: RpcTransport, sessionId: string): Promise<void>
   unbindSession(): void
   send(text: string): Promise<{ queued: boolean } | null>
-  /** PRD 9.3 错误终止卡片的"重试"：重发最近一条用户消息。 */
-  retryLastMessage(): Promise<{ queued: boolean } | null>
-  /** PRD 9.3 错误终止卡片的"放弃"：只是关闭这张卡片，run 早已终止，没有服务端动作可做。 */
-  dismissTermination(runId: string): void
+  /** Issue #22 (04-w5-interfaces.md §4) 错误卡片"重试" — `session.retry
+   * {action:"retry"}`，daemon 用原 Turn 的用户消息发起一个新 Turn。 */
+  retryTermination(turnId: string): Promise<void>
+  /** 错误卡片"换模型" — `session.retry {action:"retry", model_override}`。 */
+  switchModelTermination(turnId: string, override: { provider: string; model: string }): Promise<void>
+  /** 错误卡片"放弃" — `session.retry {action:"abandon"}`：daemon 清掉该 Session
+   * 排队中的后续指令并标记 Run/Turn（04-w5-interfaces.md §4），不只是本地隐藏。 */
+  abandonTermination(turnId: string): Promise<void>
   stop(): Promise<void>
   removeQueueItem(itemId: string): Promise<void>
   reorderQueue(orderedIds: string[]): Promise<void>
+  /** R-N4 队列面板"继续"按钮 — `session.queue_resume`。 */
+  queueResume(): Promise<void>
   decidePermission(
     requestId: string,
     decision: 'allow' | 'deny',
     remember?: 'session' | 'project'
   ): Promise<void>
+}
+
+/** The original user message text for `turnId`, read back from the client's
+ * own timeline — `session.retry`'s "用户消息复用" (Issue #22) reuses whatever
+ * text the daemon already has for that Turn, and the renderer already has the
+ * same text locally (it's how the failed Turn got there in the first place),
+ * so this avoids a round trip just to echo it back optimistically. */
+function findUserMessageText(timeline: TimelineEntry[], turnId: string): string | null {
+  for (const entry of timeline) {
+    if (entry.kind === 'message' && entry.message.turn_id === turnId && entry.message.role === 'user') {
+      return entry.message.content.text
+    }
+  }
+  return null
 }
 
 function upsertTimeline(timeline: TimelineEntry[], entry: TimelineEntry): TimelineEntry[] {
@@ -61,17 +114,43 @@ function upsertTimeline(timeline: TimelineEntry[], entry: TimelineEntry): Timeli
   return next
 }
 
+/** Round-2 review #2: `session.retry`'s `RpcError` text (`turn ... is not in
+ * a retryable state (status=...)`, `turn not found`, ...) is an internal
+ * state-machine string that was leaking straight into `CenterPane`'s error
+ * banner via `res.message` — never meant for an end user, and the main
+ * process's `ipcMain.handle('rpc:call', ...)` catch (`apps/desktop/src/main/
+ * index.ts`, outside this branch's touch list) drops the RpcError `code`
+ * before it reaches this transport, so there is no structured field to switch
+ * on here — only substring matching against the known daemon-side messages
+ * (`sessions/service.py::retry`). Anything unrecognized falls back to one
+ * generic line rather than ever showing the raw text again. */
+function friendlyTerminationError(message: string | undefined): string {
+  if (message && /not in a retryable state/.test(message)) {
+    return '这条错误卡片已经处理过了，请刷新查看最新状态。'
+  }
+  if (message && /turn not found/.test(message)) {
+    return '找不到这条消息了，可能已经被处理。'
+  }
+  if (message && /session not found/.test(message)) {
+    return '会话不存在，请刷新页面。'
+  }
+  return '操作未成功，请稍后再试。'
+}
+
 export const useChatStore = create<ChatState>()((set, get) => ({
   transport: null,
   activeSessionId: null,
   timeline: [],
   queue: [],
+  queueSuspendedReason: null,
   pendingPermissions: [],
   running: false,
   error: null,
   runToSession: new Map(),
   unsubscribers: [],
   bindGeneration: 0,
+  pendingTerminations: new Set(),
+  handledTerminations: new Map(),
   batcher: createDeltaBatcher((updates) => {
     set((state) => {
       let timeline = state.timeline
@@ -110,11 +189,14 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       activeSessionId: sessionId,
       timeline: [],
       queue: [],
+      queueSuspendedReason: null,
       pendingPermissions: [],
       running: false,
       error: null,
       runToSession: new Map(),
-      bindGeneration: generation
+      bindGeneration: generation,
+      pendingTerminations: new Set(),
+      handledTerminations: new Map()
     })
 
     const isActive = (): boolean => get().activeSessionId === sessionId && get().bindGeneration === generation
@@ -161,6 +243,14 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         if (params.session_id !== sessionId) return
         set((state) => ({
           running: true,
+          // R-N4: a Run just started for real — whatever suspended the
+          // queue before (this new Turn is exactly the "send a new message"
+          // implicit-resume path, or `queueResume()`'s own explicit one)
+          // no longer applies; the eventual `queue.changed` broadcast this
+          // Turn's own completion fires will re-confirm this, but the panel
+          // shouldn't keep showing "已暂停" while something is visibly
+          // running.
+          queueSuspendedReason: null,
           runToSession: new Map(state.runToSession).set(params.run_id, params.session_id)
         }))
       }),
@@ -203,9 +293,29 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         }))
       }),
       transport.on('queue.changed', (raw) => {
-        const params = raw as { session_id: string; items: QueueItem[] }
+        // R-N4 (04-w5-interfaces.md §4.3): `suspended`/`reason` are only
+        // populated by `_advance_queue`/`session.queue_resume`/`abandon`'s
+        // own broadcasts (00-foundation.md §4.2's `queue.changed` row) — the
+        // other, untouched broadcast points (`session.queue`/`_remove`/
+        // `_reorder`, `send()`'s enqueue branch) omit them entirely, so a
+        // missing `suspended` here means "no new information", not "no
+        // longer suspended" — only an explicit `false` clears it.
+        const params = raw as {
+          session_id: string
+          items: QueueItem[]
+          suspended?: boolean
+          reason?: 'user' | 'error' | 'budget' | null
+        }
         if (params.session_id !== sessionId) return
-        set({ queue: params.items })
+        set((state) => ({
+          queue: params.items,
+          queueSuspendedReason:
+            params.suspended === undefined
+              ? state.queueSuspendedReason
+              : params.suspended
+                ? (params.reason ?? null)
+                : null
+        }))
       }),
       // permission.requested carries session_id directly — confirmed against
       // `sessions/service.py`'s real broadcast (domain/types.ts's
@@ -236,6 +346,14 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       id: sessionId
     })
     if (isActive() && sessionRes.ok && sessionRes.result) {
+      // R-N9 (controller ruling, round-6, 2026-09-20; PRD 9.3): reconstruct
+      // "已暂停" from the persisted value `session.get`'s own row now carries
+      // (`Session.queue_suspended_reason`'s own doc comment), instead of
+      // leaving whatever `bindSession()`'s own reset above just set —
+      // `null`, every time, previously. A live `queue.changed` broadcast
+      // that arrives after this (this pane just (re)subscribed above) still
+      // wins going forward, same as before this round.
+      set({ queueSuspendedReason: sessionRes.result.queue_suspended_reason ?? null })
       const runId = sessionRes.result.turn?.run_id ?? null
       if (runId) {
         const running = sessionRes.result.status === 'running'
@@ -254,7 +372,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
 
     const [messagesRes, queueRes, pendingRes] = await Promise.all([
       transport.call<Message[]>('turn.messages', { session_id: sessionId, limit: 200 }),
-      transport.call<QueueItem[]>('session.queue', { id: sessionId }),
+      transport.call<SessionQueueResponse>('session.queue', { id: sessionId }),
       transport.call<PermissionRequest[]>('permission.pending', { session_id: sessionId })
     ])
     if (!isActive()) return
@@ -268,7 +386,16 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         )
       }))
     }
-    if (queueRes.ok) set({ queue: queueRes.result ?? [] })
+    if (queueRes.ok) {
+      // R-N9: `session.queue`'s response now carries the same persisted
+      // `suspended`/`reason` `session.get` above already applied — setting
+      // it again here is a harmless re-confirmation from the SAME
+      // underlying DB column, not a second independent source of truth.
+      set({
+        queue: queueRes.result?.items ?? [],
+        queueSuspendedReason: queueRes.result?.reason ?? null
+      })
+    }
     if (pendingRes.ok) set({ pendingPermissions: pendingRes.result ?? [] })
   },
 
@@ -319,21 +446,134 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     return res.result
   },
 
-  async retryLastMessage() {
-    const { timeline } = get()
-    for (let i = timeline.length - 1; i >= 0; i -= 1) {
-      const entry = timeline[i]
-      if (entry?.kind === 'message' && entry.message.role === 'user') {
-        return get().send(entry.message.content.text)
+  async retryTermination(turnId) {
+    const { transport, activeSessionId, timeline, pendingTerminations } = get()
+    if (!transport || !activeSessionId) return
+    // Round-2 review #6: a second click before the first round-trip resolves
+    // (or a second click after `handled` should already have hidden the
+    // button, in case some caller ignores that) must not fire a second real
+    // Turn — no-op instead of re-entering.
+    if (pendingTerminations.has(turnId)) return
+    set((state) => ({ pendingTerminations: new Set(state.pendingTerminations).add(turnId) }))
+    try {
+      const originalText = findUserMessageText(timeline, turnId)
+      const res = await transport.call<{ turn_id: string; queued: boolean }>('session.retry', {
+        id: activeSessionId,
+        turn_id: turnId,
+        action: 'retry'
+      })
+      if (!res.ok || !res.result) {
+        set({ error: friendlyTerminationError(res.message) })
+        return
       }
+      // Same optimistic local echo as send() (see its own comment) — the daemon
+      // has no "message created" notification for the user's own turn even when
+      // that turn was started by session.retry rather than session.send.
+      if (!res.result.queued && originalText) {
+        const message: Message = {
+          id: `local_${res.result.turn_id}`,
+          session_id: activeSessionId,
+          turn_id: res.result.turn_id,
+          role: 'user',
+          content: { kind: 'text', text: originalText },
+          seq: get().timeline.length
+        }
+        set((state) => ({ timeline: upsertTimeline(state.timeline, { kind: 'message', message }) }))
+      }
+      // Round-2 review #2/#6: mark the ORIGINAL failed turn's card inert —
+      // it already spawned a new Turn, retrying it again would spawn another.
+      set((state) => ({
+        handledTerminations: new Map(state.handledTerminations).set(turnId, { action: 'retry' })
+      }))
+    } finally {
+      set((state) => {
+        const next = new Set(state.pendingTerminations)
+        next.delete(turnId)
+        return { pendingTerminations: next }
+      })
     }
-    return null
   },
 
-  dismissTermination(runId) {
-    set((state) => ({
-      timeline: state.timeline.filter((e) => !(e.kind === 'termination' && e.card.run_id === runId))
-    }))
+  async switchModelTermination(turnId, override) {
+    const { transport, activeSessionId, timeline, pendingTerminations } = get()
+    if (!transport || !activeSessionId) return
+    if (pendingTerminations.has(turnId)) return
+    set((state) => ({ pendingTerminations: new Set(state.pendingTerminations).add(turnId) }))
+    try {
+      const originalText = findUserMessageText(timeline, turnId)
+      const res = await transport.call<{ turn_id: string; queued: boolean }>('session.retry', {
+        id: activeSessionId,
+        turn_id: turnId,
+        action: 'retry',
+        model_override: override
+      })
+      if (!res.ok || !res.result) {
+        set({ error: friendlyTerminationError(res.message) })
+        return
+      }
+      if (!res.result.queued && originalText) {
+        const message: Message = {
+          id: `local_${res.result.turn_id}`,
+          session_id: activeSessionId,
+          turn_id: res.result.turn_id,
+          role: 'user',
+          content: { kind: 'text', text: originalText },
+          seq: get().timeline.length
+        }
+        set((state) => ({ timeline: upsertTimeline(state.timeline, { kind: 'message', message }) }))
+      }
+      set((state) => ({
+        handledTerminations: new Map(state.handledTerminations).set(turnId, { action: 'switch_model' })
+      }))
+    } finally {
+      set((state) => {
+        const next = new Set(state.pendingTerminations)
+        next.delete(turnId)
+        return { pendingTerminations: next }
+      })
+    }
+  },
+
+  async abandonTermination(turnId) {
+    const { transport, activeSessionId, pendingTerminations } = get()
+    if (!transport || !activeSessionId) return
+    if (pendingTerminations.has(turnId)) return
+    set((state) => ({ pendingTerminations: new Set(state.pendingTerminations).add(turnId) }))
+    try {
+      // Round-N2 review #2: `session.retry(action:"abandon")` returns
+      // `cleared_queue_items` (sessions/service.py::retry) — carry it through
+      // instead of discarding it, so the status line below can say how many
+      // (if any) queued instructions actually got cleared.
+      const res = await transport.call<{
+        turn_id: string
+        action: string
+        cleared_queue_items: number
+      }>('session.retry', {
+        id: activeSessionId,
+        turn_id: turnId,
+        action: 'abandon'
+      })
+      if (!res.ok) {
+        set({ error: friendlyTerminationError(res.message) })
+        return
+      }
+      // Round-2 review #2: this used to leave the card exactly as it was —
+      // with an empty queue (the common case) that's zero visible change, so
+      // a user had no way to tell "放弃" actually did anything. Mark it
+      // handled so the card swaps its actions for a "已放弃" status line.
+      set((state) => ({
+        handledTerminations: new Map(state.handledTerminations).set(turnId, {
+          action: 'abandon',
+          clearedQueueItems: res.result?.cleared_queue_items
+        })
+      }))
+    } finally {
+      set((state) => {
+        const next = new Set(state.pendingTerminations)
+        next.delete(turnId)
+        return { pendingTerminations: next }
+      })
+    }
   },
 
   async stop() {
@@ -363,6 +603,20 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     })
     if (res.ok) set({ queue: res.result ?? [] })
     else set({ error: res.message ?? '调序失败' })
+  },
+
+  async queueResume() {
+    const { transport, activeSessionId } = get()
+    if (!transport || !activeSessionId) return
+    const res = await transport.call<{ resumed: boolean; items: QueueItem[] }>(
+      'session.queue_resume',
+      { id: activeSessionId }
+    )
+    if (res.ok && res.result) {
+      set({ queue: res.result.items, queueSuspendedReason: null })
+    } else {
+      set({ error: res.message ?? '继续失败' })
+    }
   },
 
   async decidePermission(requestId, decision, remember) {
