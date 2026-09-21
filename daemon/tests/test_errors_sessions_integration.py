@@ -1120,6 +1120,104 @@ async def test_user_stop_suspends_the_queue_instead_of_auto_advancing(tmp_path, 
         await service.shutdown()
 
 
+async def test_stop_before_worker_ready_pins_the_intent_and_skips_the_prompt(
+    tmp_path, monkeypatch
+):
+    """Issue #39 regression. `stop()` used to only pin `termination_intent`/send
+    the ACP cancel inside `if worker is not None and worker.client is not None
+    and worker.acp_session_id is not None` — all three are still unset in the
+    window between `send()` returning and `_run_turn`'s own `ensure_started()`
+    call actually returning. A `stop()` landing in that window pinned nothing,
+    sent no cancel, and the agent ran the Turn to completion once its worker
+    came up a moment later — while `stop()` had already told the caller
+    `{"stopped": True}`. Reproduced on unmodified pre-#39 code, not introduced
+    by any change in this branch (see that Issue).
+
+    Deterministic repro: `WorkerManager.ensure_started` is wrapped with an
+    injected delay, so it provably has not returned when `stop()` runs below.
+    `_run_turn` populates `_active_turns` BEFORE it ever calls `ensure_started`
+    (see `_TurnContext`'s own comment on the field) — waiting for that
+    predicate and then asserting `worker_manager.get(session_id) is None`
+    proves this test actually lands in the race window Issue #39 describes,
+    not merely "stop() was called at some point during the Turn"."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+
+    real_ensure_started = service.worker_manager.ensure_started
+
+    async def _delayed_ensure_started(*args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(0.3)
+        return await real_ensure_started(*args, **kwargs)
+
+    monkeypatch.setattr(service.worker_manager, "ensure_started", _delayed_ensure_started)
+
+    from jones_daemon.kernel.acp_client import AcpClient
+
+    # `_startup_self_check` (00-foundation.md §8.1, `workers/manager.py`) sends
+    # its own real `AcpClient.prompt()` call (the jones_gate probe) from
+    # *inside* `ensure_started`, before it returns — so "was `prompt()` called
+    # at all" isn't the right question; "was OUR Turn's text ever prompted" is.
+    # Track the actual text argument of every `prompt()` call instead of just
+    # counting them.
+    prompted_texts: list[str] = []
+    cancel_calls = 0
+    orig_prompt = AcpClient.prompt
+    orig_cancel = AcpClient.cancel
+
+    async def _tracking_prompt(self: AcpClient, session_id: str, text: str, **kwargs: Any) -> Any:
+        prompted_texts.append(text)
+        return await orig_prompt(self, session_id, text, **kwargs)
+
+    async def _tracking_cancel(self: AcpClient, *args: Any, **kwargs: Any) -> Any:
+        nonlocal cancel_calls
+        cancel_calls += 1
+        return await orig_cancel(self, *args, **kwargs)
+
+    monkeypatch.setattr(AcpClient, "prompt", _tracking_prompt)
+    monkeypatch.setattr(AcpClient, "cancel", _tracking_cancel)
+    try:
+        session_id = await _new_session(service, title="s1")
+        first = await service.send(session_id, "hello there")
+        assert first["queued"] is False
+        await _wait_until(lambda: session_id in service._active_turns)
+        # The window this test targets: the Turn is active but its worker is
+        # provably not ready yet (the injected 0.3s sleep hasn't elapsed).
+        assert service.worker_manager.get(session_id) is None
+
+        second = await service.send(session_id, "queued behind the stop")
+        assert second["queued"] is True
+
+        stop_result = await service.stop(session_id)
+        assert stop_result["stopped"] is True
+
+        await _wait_until(lambda: len(_terminated(service)) >= 1, timeout=_WAIT_TIMEOUT_S)
+        card = _terminated(service)[0]
+        assert card["kind"] == "user"
+        assert card["reason"] == "stopped by user"
+
+        # (a) the agent was never prompted with the actual Turn text: `_run_
+        # turn`'s post-`ensure_started` intent check (Issue #39 part 3) sends
+        # the one cancel `stop()` itself couldn't (worker wasn't ready when
+        # `stop()` ran) and terminates directly, without ever calling
+        # `prompt(..., "hello there")` — only the startup self-check's own
+        # unrelated probe prompt is allowed to have gone out.
+        assert "hello there" not in prompted_texts
+        assert cancel_calls == 1
+
+        # (c) queue stays suspended — R-N4 applies to every termination kind,
+        # `kind="user"` included, and this Turn's is no exception.
+        await _wait_for_queue_suspended(service, suspended=True)
+        items = await _queue_items(service, session_id)
+        assert len(items) == 1
+        assert items[0]["text"] == "queued behind the stop"
+        assert session_id not in service._active_turns
+
+        suspend_events = [e for e in _queue_changed_events(service) if e.get("suspended")]
+        assert suspend_events[-1]["reason"] == "user"
+    finally:
+        await service.shutdown()
+
+
 async def test_error_termination_suspends_the_queue_instead_of_auto_advancing(
     tmp_path, monkeypatch
 ):

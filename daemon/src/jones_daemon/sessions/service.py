@@ -936,24 +936,33 @@ class SessionService:
         task = self._turn_tasks.get(session_id)
         if task is None or task.done():
             return {"stopped": False}
+        # Issue #39 (controller ruling, 2026-09-21): pin the termination
+        # intent unconditionally — as soon as there's an active Turn to pin
+        # it on — not only when a worker happens to already be up. A user's
+        # stop is an intent about the TURN, not about whether its worker has
+        # finished `ensure_started()` yet. R-N11's "pin before cancel"
+        # ordering (below) only ever closed ONE race (`_finalize_turn_
+        # success` racing this same field's own write) — gating the PIN
+        # itself on `worker is not None and worker.client is not None and
+        # worker.acp_session_id is not None` left an earlier one open:
+        # `send()` immediately followed by `stop()`, before `_run_turn`'s own
+        # `ensure_started()` call has even returned, means all three of those
+        # are still `None`/unset here — nothing got pinned, no cancel got
+        # sent, the worker then finishes starting moments later, and
+        # `_run_turn` prompts the agent as if `stop()` had never been called
+        # — while `stop()` already told the caller `{"stopped": True}`
+        # (exactly Issue #39's "意图不落、cancel 不发、agent 照跑完").
+        ctx_turn = self._active_turns.get(session_id)
+        if ctx_turn is not None:
+            user_stop_reason = "stopped by user"
+            ctx_turn.termination_intent = _TerminationIntent(
+                kind="user",
+                reason=user_stop_reason,
+                card=classify.build_user_card(user_stop_reason),
+                step_seq=ctx_turn.step_seq or None,
+            )
         worker = self.worker_manager.get(session_id)
         if worker is not None and worker.client is not None and worker.acp_session_id is not None:
-            # R-N11 (controller ruling, round-7, 2026-09-20): pin the
-            # termination intent BEFORE sending the cancel notification below
-            # — see `_TurnContext.termination_intent`'s own comment for why.
-            # R-N20 (controller ruling, round-9, 2026-09-20): the pinned
-            # value is now the full `_TerminationIntent` record (reason/card/
-            # step_seq included), not just the kind — see that dataclass's
-            # own comment.
-            ctx_turn = self._active_turns.get(session_id)
-            if ctx_turn is not None:
-                user_stop_reason = "stopped by user"
-                ctx_turn.termination_intent = _TerminationIntent(
-                    kind="user",
-                    reason=user_stop_reason,
-                    card=classify.build_user_card(user_stop_reason),
-                    step_seq=ctx_turn.step_seq or None,
-                )
             try:
                 # A notification, not a hard kill: PRD 9.3 "用户终止" requires the
                 # in-flight tool call to finish cleanly. `cancel()` sets Hermes's
@@ -976,6 +985,13 @@ class SessionService:
                     "session/cancel notification failed (worker likely already gone)",
                     extra={"detail": {"session_id": session_id, "error": str(exc)}},
                 )
+        # else: no worker to cancel yet (still inside `ensure_started()`, or
+        # never started) — nothing lost. The intent pinned above is enough:
+        # `_run_turn` checks `ctx_turn.termination_intent` itself, right after
+        # its own `ensure_started()` call returns and before it ever calls
+        # `prompt()` (Issue #39's fix, part 3) — the worker IS ready by then,
+        # so that check sends the cancel this branch couldn't and goes
+        # straight to `_terminate_run`, never prompting the agent at all.
         # If this Turn's in-flight tool call is sitting on a pending
         # `session/request_permission` (no one has answered it yet — the user
         # just clicked "stop" instead of allow/deny), `cancel()` alone can't
@@ -1649,6 +1665,48 @@ class SessionService:
                     )
                     return
                 assert worker.client is not None and worker.acp_session_id is not None  # noqa: S101
+                # Issue #39 (controller ruling, 2026-09-21): `stop()` may have
+                # pinned `ctx_turn.termination_intent` while THIS Turn's
+                # worker was still inside `ensure_started()` above (see that
+                # method's own comment — it pins unconditionally now, not
+                # only when a worker already exists) — by the time control
+                # reaches here the worker IS ready, but the user's stop
+                # already happened and must not be silently lost by prompting
+                # the agent as if nothing happened. Check once, right here,
+                # before ever calling `prompt()`: a pinned intent means some
+                # active-termination path already claimed this Turn — send
+                # the cancel now (skipped by `stop()` itself because the
+                # worker wasn't ready when it ran) and go straight to
+                # `_terminate_run`, exactly like every other claiming path
+                # (`stop()` once the worker's ready, `_terminate_run_for_
+                # exceeded_budget`, `_on_worker_crash`) already does.
+                if ctx_turn.termination_intent is not None:
+                    try:
+                        await worker.client.cancel(worker.acp_session_id)
+                    except Exception as exc:  # noqa: BLE001 - R-N13: same broad
+                        # catch `stop()`/`_terminate_run_for_exceeded_budget`
+                        # already use — a worker that crashed moments earlier
+                        # can fail `AcpClient._send` with more than
+                        # `(AcpProtocolError, AcpError)`; termination must
+                        # still proceed regardless.
+                        logger.warning(
+                            "session/cancel notification failed for a Turn "
+                            "already claimed before its worker became ready "
+                            "(worker likely already gone)",
+                            extra={"detail": {"session_id": session_id, "error": str(exc)}},
+                        )
+                    # These `kind`/`reason` arguments are only the honest
+                    # fallback for the (never actually reachable here) case
+                    # `ctx_turn.termination_intent` became `None` again by the
+                    # time `_terminate_run` runs — the check above already
+                    # confirmed it's set, so `_terminate_run` always adopts
+                    # that pinned record wholesale instead (R-N20).
+                    await self._terminate_run(
+                        ctx_turn,
+                        kind=ctx_turn.termination_intent.kind,
+                        reason=ctx_turn.termination_intent.reason,
+                    )
+                    return
                 try:
                     response = await worker.client.prompt(worker.acp_session_id, text)
                 except (AcpError, AcpProtocolError) as exc:
