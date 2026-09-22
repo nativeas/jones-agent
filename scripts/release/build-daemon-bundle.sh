@@ -26,10 +26,48 @@ OUT_ARG="${2:?usage: build-daemon-bundle.sh <arm64|x64> <output-dir>}"
 mkdir -p "$(dirname "$OUT_ARG")"
 OUT="$(cd "$(dirname "$OUT_ARG")" && pwd)/$(basename "$OUT_ARG")"
 case "$ARCH" in
-  arm64) UV_PLATFORM="aarch64-apple-darwin" ;;
-  x64) UV_PLATFORM="x86_64-apple-darwin" ;;
+  arm64) UV_PLATFORM="aarch64-apple-darwin"; HOST_ARCH_FOR="arm64" ;;
+  x64) UV_PLATFORM="x86_64-apple-darwin"; HOST_ARCH_FOR="x86_64" ;;
   *) echo "unknown arch: $ARCH (want arm64 or x64)" >&2; exit 1 ;;
 esac
+
+# Native vs cross build (Issue #36): when the requested $ARCH matches the host
+# machine's own architecture (`uname -m`), this is a NATIVE build — the host
+# already has real x86_64/arm64 wheels and, for anything without a wheel, a
+# real matching Rust target to compile against. `--python-platform` exists
+# only to fake a foreign target platform's wheel tags without a local
+# interpreter of that architecture (see the comment on the install calls
+# below) — passing it on a native build is not just unnecessary, it's
+# actively wrong: it makes `uv` request wheel tags for a platform that then
+# happens to equal the host, but for anything that falls back to a source
+# build (`cryptography` on x86_64, see docs/release.md §2.2), the resulting
+# build still runs on THIS host's real toolchain — there is nothing to
+# "cross" about it. So on a native build, both `uv pip install` calls below
+# omit `--python-platform` entirely and let `uv` resolve against the host's
+# own interpreter/platform, exactly as "native install" implies.
+if [ "$(uname -m)" = "$HOST_ARCH_FOR" ]; then
+  IS_NATIVE=1
+  PLATFORM_FLAGS=()
+  # round-1 review fix: `--python-platform <triple>` was the only place this
+  # pipeline declared a target macOS MINIMUM VERSION — uv uses a fixed,
+  # host-independent default for a given triple there, overridable via
+  # MACOSX_DEPLOYMENT_TARGET. Dropping it for native builds (above) dropped
+  # that pin too, so without this, the product's actual floor (macOS 13+,
+  # docs/PRD.md "v1.0: macOS 13+"/README.md/docs/acceptance/v1.0/G18.md) just
+  # follows whatever macOS version the BUILD HOST happens to run — on the CI
+  # x64 leg that's macos-15-intel (macOS 15), not 13. This matters concretely
+  # for `cryptography`, which has no macOS x86_64 wheel for the pinned
+  # version and is compiled from sdist here (Rust/cargo) — its compiled `.so`
+  # would otherwise inherit whatever minimum the host's toolchain defaults to.
+  # Exporting this explicitly also makes the build reproducible across runner
+  # image upgrades instead of silently drifting with them. Respects an
+  # existing override (e.g. a future v1.1 raising the floor) rather than
+  # forcing 13.0 unconditionally.
+  export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+else
+  IS_NATIVE=0
+  PLATFORM_FLAGS=(--python-platform "$UV_PLATFORM")
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -52,7 +90,18 @@ mkdir -p "$SITE_PACKAGES"
 #        unchecked one) ------------------------------------------------------
 cd "$DAEMON_DIR"
 REQS_FILE="$(mktemp -t jones-release-reqs.XXXXXX)"
-trap 'rm -f "$REQS_FILE"' EXIT
+# `ec=$?; ...; exit $ec`, not a bare `rm -f "$REQS_FILE"`: an EXIT trap whose
+# last command exits 0 (which `rm -f` on an existing file always does)
+# silently OVERWRITES the script's real exit status with that 0 — bash uses
+# the trap's own last exit code as the shell's final one when the trap
+# doesn't explicitly `exit`. Round-1 CI verification for #36 hit exactly
+# this: the `--python-platform` bash-3.2 bug below made the build crash
+# outputting only a partial bundle, but this trap's bare `rm -f` silently
+# turned that crash into a reported `exit 0` — both CI jobs, and a plain
+# local rerun, showed green while shipping a broken bundle (no dependencies
+# installed, no DEPENDENCY-REPORT.md). Capturing `$?` before cleanup and
+# re-exiting with it is what makes a real failure actually surface as one.
+trap 'ec=$?; rm -f "$REQS_FILE"; exit $ec' EXIT
 # --no-default-groups: exclude `dev` (pytest/ruff — dev tooling, not shipped).
 # --group worker: `hermes-agent[acp]==<pinned>` + `mcp==2.0.0` (01-w2-interfaces
 # §2.2, daemon/pyproject.toml's own comment on the `worker` group) — this is
@@ -80,33 +129,54 @@ rm -rf dist
 UV_FROZEN=1 uv build --wheel >/dev/null
 WHEEL="$(ls dist/jones_daemon-*.whl)"
 
-# `--python-platform`/`--python <version>` (not a path): a pure resolve+
-# download of prebuilt wheels for the TARGET architecture, needing no local
-# interpreter of that architecture (spike 02 §1's whole point about
-# python-build-standalone: no target-arch code execution required) — this is
-# what makes producing the x64 bundle on this arm64 host possible AT ALL,
-# but only for dependencies that actually publish an x64 wheel for the
-# pinned version. **Known real failure on this host (see docs/release.md
-# §2.2, docs/design/00-foundation.md §3.1's addendum)**: `cryptography==50.0.0`
-# (daemon's exact-pinned dependency) ships zero macOS x86_64 wheels on PyPI
-# for this version — `uv` silently falls back to building it from source
-# (maturin/cargo), which then fails to cross-compile on an arm64 host with no
-# x86_64 Rust target installed. This is a real gap, not a benign warning; the
-# command below is left to fail loudly (not caught/retried) so that failure
-# is never silently swallowed into a broken bundle.
+# CROSS build only (`--python-platform`/`--python <version>`, not a path): a
+# pure resolve+download of prebuilt wheels for the TARGET architecture,
+# needing no local interpreter of that architecture (spike 02 §1's whole
+# point about python-build-standalone: no target-arch code execution
+# required) — this is what makes producing an x64 bundle on an arm64 host
+# possible AT ALL, but only for dependencies that actually publish a wheel
+# for the pinned version and target platform. **Known real failure doing
+# this cross (see docs/release.md §2.2, docs/design/00-foundation.md §3.1's
+# addendum)**: `cryptography==50.0.0` (daemon's exact-pinned dependency)
+# ships zero macOS x86_64 wheels on PyPI for this version — `uv` silently
+# falls back to building it from source (maturin/cargo), which then fails to
+# cross-compile on an arm64 host with no x86_64 Rust target installed. This
+# is a real gap, not a benign warning.
+#
+# NATIVE build (Issue #36, `$IS_NATIVE=1` above — a native Intel/Apple
+# Silicon runner building its own architecture): `$PLATFORM_FLAGS` is empty,
+# so these calls resolve/install against the host's own real interpreter
+# platform — including building `cryptography` from sdist with the host's
+# own real Rust toolchain when no wheel exists, which is an ordinary native
+# compile, not a cross-compile, and is expected to succeed.
+#
+# Either way the command is left to fail loudly (not caught/retried) so a
+# failure is never silently swallowed into a broken bundle.
 # Third-party deps first, hash-checked against uv.lock (-r "$REQS_FILE" now
 # carries hashes — see the export step above); the local wheel is a separate
 # call below since it has no hash to check against and pip's hash-checking
 # mode requires all-or-nothing within one invocation.
+# `"${PLATFORM_FLAGS[@]+"${PLATFORM_FLAGS[@]}"}"`, not the plain
+# `"${PLATFORM_FLAGS[@]}"`: macOS's shipped `/bin/bash` is stuck at 3.2 (Apple
+# won't ship GPLv3), and bash <4.4's `set -u` treats expanding an EMPTY array
+# as an unbound-variable error — fatal, immediately. The native branch above
+# sets `PLATFORM_FLAGS=()` (empty on purpose), so a plain `"${PLATFORM_FLAGS[@]}"`
+# here crashes every native build on this host's own /bin/bash (confirmed:
+# reproduced locally AND on both macos-14/macos-15-intel CI runners, which
+# also default to bash 3.2 — round-1 CI verification for #36 silently shipped
+# a broken bundle this way, see this branch's report for the full story). The
+# `${arr[@]+"${arr[@]}"}` form is the standard bash-3.2-safe idiom: it tests
+# "is this array SET" (true — `()` still counts as set) without ever forcing
+# nounset to evaluate an empty `[@]` on its own.
 uv pip install \
   --target "$SITE_PACKAGES" \
-  --python-platform "$UV_PLATFORM" \
+  "${PLATFORM_FLAGS[@]+"${PLATFORM_FLAGS[@]}"}" \
   --python 3.12 \
   -r "$REQS_FILE"
 
 uv pip install \
   --target "$SITE_PACKAGES" \
-  --python-platform "$UV_PLATFORM" \
+  "${PLATFORM_FLAGS[@]+"${PLATFORM_FLAGS[@]}"}" \
   --python 3.12 \
   "$WHEEL"
 

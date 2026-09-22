@@ -1,0 +1,133 @@
+name: Release Bundle
+
+# 出 daemon bundle 产物（Issue #36）：独立于 ci.yml/acceptance.yml，不挂在
+# 每个 PR 上——`scripts/release/build-daemon-bundle.sh` 单次要下载 python-
+# build-standalone 解释器 + 装整份依赖闭包，x86_64 那份还要从 sdist 源码编译
+# `cryptography` 的 Rust 扩展（见下），比常规 lint/test 慢得多，只在真的要出
+# 包时跑。
+#
+# 触发：workflow_dispatch（手动，验证/调试用）+ push 一个 `v*` tag（正式发布）。
+#
+# 为什么两个 job、两个原生 runner，而不是一个 arm64 host 交叉出两份产物：
+# `docs/release.md` §2.2 的实测结论——`cryptography==50.0.0`/`50.0.1`
+# （daemon 的精确 pin）在 PyPI 上只发布 macOS arm64 wheel，完全没有 x86_64
+# wheel；`uv pip install --python-platform x86_64-apple-darwin` 因此必然退化
+# 成从 sdist 源码构建（maturin/cargo），而 arm64 主机没有配 x86_64 的 Rust
+# 交叉编译 target，链接阶段失败——已实测复现，不是理论推测。降版本绕开这个
+# pin 又被 hermes-agent 自己的 `cryptography==50.0.0` exact pin 挡死（见
+# Issue #36 讨论）。唯一确认可行的路径是在原生架构的机器上直接编译：
+#   - x86_64 腿用 `macos-15-intel`（原生 x86_64 标准 runner，公开仓库免费）
+#     ——Issue #36 原文与 docs/release.md §2.2 写的是 `macos-13`，本分支
+#     实测发现它已于 2025-12 被 GitHub 完全退役（不是"排队慢"，是这个标签
+#     底下已经没有 runner 了：`macos-13` job 排队 20+ 分钟不会分配到任何
+#     runner，取消重跑到 `macos-15-intel` 上才真正跑起来，见本分支报告
+#     「实测记录」一节）。`macos-15-intel` 是 GitHub 给 macos-13 退役后
+#     指定的替代标签，同样是原生 x86_64、同样是标准 runner（不是要收费的
+#     `-large`/`-xlarge` larger-runner SKU）。
+#   - arm64 腿用 `macos-14`，原生 arm64（此前只在本地 arm64 开发机上验证过，
+#     这里是它第一次在 CI 上跑）。
+# `scripts/release/build-daemon-bundle.sh` 已经按「目标架构 == 主机架构则不传
+# --python-platform」改造（原生就该原生装，不借交叉安装的路径伪装），所以两个
+# job 跑的是同一份脚本、同一条命令，没有额外的分支逻辑。每个 job 开头都先打印
+# `uname -m` 实际验证 runner 架构，不只是信标签名字。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  daemon-bundle:
+    name: daemon bundle (${{ matrix.arch }} native on ${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    # sdist 源码构建 cryptography 的 Rust 扩展（x64 腿必经，见上）比装预编译
+    # wheel 慢得多；GitHub 托管 runner 的 job 默认超时是 360 分钟，这里显式收
+    # 窄到一个仍然宽裕、但出问题时不用等 6 小时才发现的数字。
+    timeout-minutes: 60
+    env:
+      UV_FROZEN: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.10"
+
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      # 实际验证 runner 架构，不只是信 `runs-on` 标签名字——本分支就是因为
+      # 标签名字（`macos-13`）已经名存实亡才踩了一次坑，见工作流顶部注释。
+      - name: Report runner architecture
+        run: |
+          uname -a
+          echo "uname -m: $(uname -m)"
+
+      # macos-15-intel/macos-14 的 GitHub 托管镜像按文档自带 Rust 工具链，这
+      # 一步只是兜底——镜像清单会变，`cryptography` 的 sdist 构建（x64 腿的
+      # 必经路径，见工作流顶部注释）离了 cargo/rustc 直接失败，不能悄悄跳过。
+      - name: Ensure Rust toolchain (cryptography sdist build needs cargo)
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            echo "cargo not found on PATH, installing via rustup"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          command -v cargo
+          cargo --version
+          rustc --version
+
+      # build-daemon-bundle.sh 第 3 步把 Hermes 源码树 `git archive` 进产物
+      # （不 pip 安装，Hermes 自己的 setup.py 拒绝非 editable 构建，见该脚本
+      # 注释）。它默认从 daemon/pyproject.toml 的 `[tool.uv.sources]`
+      # （本机路径 `/Users/nativeas/.hermes/hermes-agent`）读 checkout 位置，
+      # 该路径在 CI runner 上不存在——脚本已经支持 `HERMES_AGENT_PATH` 环境变量
+      # 覆盖（就是为这种情况留的口子），这里 clone 公开仓库、切到 daemon/
+      # pyproject.toml 锁定的那个 commit，指过去。
+      - name: Checkout pinned hermes-agent source tree
+        run: |
+          HERMES_COMMIT="$(grep -oE '[0-9a-f]{40}' daemon/pyproject.toml | sort -u | head -1)"
+          if [ -z "$HERMES_COMMIT" ]; then
+            echo "could not find pinned hermes-agent commit in daemon/pyproject.toml" >&2
+            exit 1
+          fi
+          echo "pinned commit: $HERMES_COMMIT"
+          git clone https://github.com/NousResearch/hermes-agent "$RUNNER_TEMP/hermes-agent"
+          git -C "$RUNNER_TEMP/hermes-agent" checkout "$HERMES_COMMIT"
+          echo "HERMES_AGENT_PATH=$RUNNER_TEMP/hermes-agent" >> "$GITHUB_ENV"
+
+      - name: Build daemon bundle (${{ matrix.arch }}, native)
+        run: scripts/release/build-daemon-bundle.sh ${{ matrix.arch }} build/release/daemon/${{ matrix.arch }}
+
+      # round-1 review fix: actions/upload-artifact@v4 does NOT preserve file
+      # permissions on upload ("All directories will have 755 and all files
+      # will have 644" — GitHub's own docs) and dereferences symlinks into
+      # copies. Two things in this bundle MUST stay executable — the
+      # `bin/jones-daemon` entry script (build-daemon-bundle.sh step 4,
+      # `chmod +x`) and `python/bin/python3.12` itself (the entry script's
+      # last line execs it) — plus python-build-standalone's interpreter
+      # symlinks (`bin/python3` -> `python3.12` etc.). Uploading the directory
+      # straight would hand G18's "wire this artifact into build-mac.sh"
+      # prerequisite a bundle that can't run. Tar it first (GitHub's own
+      # recommended workaround) so permissions/symlinks survive the round
+      # trip; downloading it back out means `tar -xzf` before feeding it to
+      # build-mac.sh (see docs/acceptance/v1.0/G18.md).
+      - name: Package bundle (tar preserves exec bits & symlinks)
+        run: tar -czf "$RUNNER_TEMP/daemon-bundle-${{ matrix.arch }}.tar.gz" -C build/release/daemon "${{ matrix.arch }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-bundle-${{ matrix.arch }}
+          path: ${{ runner.temp }}/daemon-bundle-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error

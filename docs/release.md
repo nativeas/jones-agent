@@ -103,6 +103,83 @@ x86_64 python-build-standalone 产物，只是不能在本机执行验证（没�
   不能不加验证地外推到真实 daemon。这是本分支交给 P（#24，G18 验收）和后续
   发布决策的一条关键信息，不应该被"反正 spike 说了两条路都行"带过去。
 
+### 2.3 #36 解除：CI 原生构建双架构（2026-09-22，方案 a 落地）
+
+上面 §2.2 的结论本身没有变——arm64 主机确实造不出 x86_64 产物，这不是
+"本机限制"，是"从源码构建 `cryptography` 需要在目标架构上跑 Rust 编译器"
+这个硬约束。但 #36 讨论里的方案 (a)（CI 用原生 Intel runner 直接出
+x86_64 包）已经在 GitHub Actions 上真实跑通，不是本地推演：
+
+- **工作流**：`.github/workflows/release-bundle.yml`（新增，独立于
+  `ci.yml`/`acceptance.yml`，不挂在每个 PR 上——单次构建含一次真实 Rust
+  编译，比常规 lint/test 慢得多）。触发：`workflow_dispatch` +
+  push 一个 `v*` tag。两个 job，矩阵化，都是**原生**编译（不是交叉）：
+  - `x64` 腿：`macos-15-intel` runner（原生 x86_64）。**注意**：Issue #36
+    原文与本节前面写的都是 `macos-13`——本分支验证过程中发现 `macos-13`
+    镜像已于 2025-12-04/08 被 GitHub 完全退役（不是排队慢，是这个标签下
+    已经没有 runner 可分配：排队 20+ 分钟、`started_at` 一直为空，取消后
+    换成 `macos-15-intel` 才真正起跑）。`macos-15-intel` 是 GitHub 给
+    macos-13 退役后指定的替代标签，同样原生 x86_64、同样是免费的标准
+    runner（不是要单独计费的 `-large`/`-xlarge` larger-runner SKU）。
+  - `arm64` 腿：`macos-14`，原生 arm64（此前只在本地开发机上验证过，这是
+    它第一次在 CI 上跑）。
+- **`scripts/release/build-daemon-bundle.sh` 的改动**：目标架构与主机架构
+  相同（原生构建）时不再传 `--python-platform`——那个参数是为了在**不**
+  匹配的宿主上伪装目标平台的 wheel tag（cross 用），原生构建下这个人为
+  伪装反而没必要，直接让 `uv` 用宿主自己的解释器/平台/工具链装。
+- **CI 上踩到、也修掉的两个真 bug**（第一次 CI 跑两个 job 都显示绿勾，但
+  实际是假阳性——产出的是一个只有裸解释器、没有任何第三方依赖的坏
+  bundle，日志里混进一行 `unbound variable` 错误没人注意到）：
+  1. macOS 系统 `/bin/bash` 停在 3.2（Apple 不发 GPLv3 版本），这个版本的
+     `set -u` 对**空数组**展开（`"${PLATFORM_FLAGS[@]}"`，原生分支下
+     `PLATFORM_FLAGS=()`）判 `unbound variable`，当场终止脚本——本地反复
+     实测复现，不是猜测。改成 bash-3.2 安全写法
+     `"${PLATFORM_FLAGS[@]+"${PLATFORM_FLAGS[@]}"}"`。
+  2. 脚本原有的 `trap 'rm -f "$REQS_FILE"' EXIT` 没有显式 `exit`，trap 里
+     最后一条命令（`rm -f`，必然成功）的退出码会覆盖脚本本该报的失败退出
+     码——上面那个崩溃因此被悄悄吞成了 `exit 0`，upload-artifact 正常跑、
+     job 显示成功。改成 `trap 'ec=$?; rm -f "$REQS_FILE"; exit $ec' EXIT`
+     保住真实退出码。这个 trap 缺陷比这次改动本身更老（只是之前从未被
+     触发过），修完之后任何一步真的失败（比如 Rust 编译真的挂了）现在会
+     如实让 job 变红，不会再被悄悄吞掉。
+- **真实跑通记录**（两个 bug 都修完之后的那次跑，不是第一次假阳性的那次）：
+  run [`35693372847`](https://github.com/nativeas/jones-agent/actions/runs/35693372847)。
+  - `arm64`（macos-14）：06:06:26–06:08:15，共 1:49；`uname -m` 实测
+    `arm64`；最终 bundle 354M（压缩后 artifact 124,764,102 字节）；日志里
+    看得到脚本自己的收尾消息 `built: .../build/release/daemon/arm64`，
+    证明真的跑到了最后一步（含 hermes-agent `git archive`、
+    `bin/jones-daemon` 入口脚本、`DEPENDENCY-REPORT.md`），不是中途假装
+    成功。
+  - `x64`（macos-15-intel）：06:06:27–06:12:16，共 5:49；`uname -m` 实测
+    `x86_64`（`uname -a` 也确认内核是 `RELEASE_X86_64`）；日志里明确可见
+    `Building cryptography==50.0.0` → `Built cryptography==50.0.0`
+    （06:08:23–06:11:10，实打实编译了 2:47，Rust 工具链是 runner 自带的
+    `cargo 1.98.0`/`rustc 1.98.0`，不是本分支另外装的）；最终 bundle
+    335M（压缩后 artifact 112,115,965 字节）。
+- **hermes-agent 源码树怎么来的**：`build-daemon-bundle.sh` 原本从
+  `daemon/pyproject.toml` 的 `[tool.uv.sources]`（本机绝对路径
+  `/Users/nativeas/.hermes/hermes-agent`）读 checkout 位置，CI runner 上
+  这条路径不存在——脚本已经支持的 `HERMES_AGENT_PATH` 环境变量覆盖正好是为
+  这种情况留的口子，工作流里 `git clone` 公开仓库
+  `NousResearch/hermes-agent`、切到 `daemon/pyproject.toml` 锁定的那个
+  commit（`ee4452991d17534aa561f31ee55596d082aa94e7`），指过去。
+- **这一步没做、留给后续的**：CI 只出「daemon bundle」这一层产物（两个
+  `daemon-bundle-<arch>` artifact），不是完整签名 `.dmg`——`scripts/
+  release/build-mac.sh` 后面 electron-builder 打包 + ad-hoc 签名那几步
+  没有接入这个工作流（Issue #36 原文只要求"CI 出 x86_64 daemon bundle 证
+  明可行"，没有要求完整发布管线上 CI）。真正出 `Jones-<version>-x64.dmg`
+  仍需要本地或后续另一个工作流跑 `build-mac.sh`，把 CI 产出的
+  `daemon-bundle-x64` 换掉本机现在造不出来的那一份、或者本身就在
+  `macos-15-intel` runner 上原生跑完整的 `build-mac.sh x64`（未验证，
+  `build-mac.sh` 目前假定单机跑完两条架构，没有按 runner 拆分过）。
+- **结论**：v1.0 macOS 双架构（G18）的构建阻塞（#36）解除，走的是方案
+  (a)，不需要方案 (b)（降版本，已被 hermes-agent 的 exact pin 挡死）或
+  方案 (c)（v1.0 只发 Apple Silicon）。剩下的是 G18 验收本身要求的「一台
+  真实 Intel Mac 上手工烟测」，见 `docs/acceptance/v1.0/G18.md`——那一步
+  本质上无法被 CI 的 macos-15-intel runner 代替（Issue #36 的教训就是
+  "runner 名字里有 intel 不代表能免验证"，这次是真机 x86_64，但完整应用
+  层的手工烟测是另一件事）。
+
 ## 3. 签名与公证（本机无 Developer ID Program 账号）
 
 - ad-hoc 签名（`--sign -`）已跑通（见 §2.1）；`spctl --assess` 必然 `rejected`
