@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import psutil
+
 from jones_daemon import paths
 from jones_daemon.capabilities import mcp_config
 from jones_daemon.kernel.acp_client import AcpClient, AcpError, AcpProtocolError
@@ -194,6 +196,141 @@ def _group_alive(pgid: int) -> bool:
         return True
     except ProcessLookupError:
         return False
+
+
+# Issue #41: `SessionService.stop()`'s own belt-and-suspenders guarantee that
+# G09 "无孤儿进程" holds from the USER's stop, not only from a later full
+# worker teardown (`_terminate`/`_reap_process_group` above, which only ever
+# reaches processes still in the worker's OWN process group). Controller
+# ruling R1/R3 (#41): the real-world failure this covers is real Hermes's own
+# `tools/environments/local.py` starting each shell command in its OWN new
+# session/pgid (so `_signal_worker_group`'s `killpg` above can never reach
+# it) — its cancel-driven cleanup thread is observed to (rarely, ~17% in the
+# issue's own repro) leave such a child alive, already reparented to init
+# (ppid=1) by the time anyone would go looking for it.
+_ORPHAN_CANCEL_GRACE_S = 3.0
+"""How long `stop()` gives Hermes's OWN cancel-driven reaping to finish
+before Jones's fallback steps in and starts signalling anything itself.
+Real Hermes's subprocess-kill poll (`tools/environments/base.py::_wait_
+for_process`) is adaptive, 5ms-200ms — this test suite's own real-model E2E
+test measured the SUCCESSFUL case finishing well under a second. 3s is
+roughly an order of magnitude of margin over that normal case (covers
+network/scheduler jitter without being a tight race), while staying short
+enough that the ~17% of stops that DO need this fallback aren't left
+waiting an excessive extra amount before Jones intervenes. Not tuned
+against the failure mode itself — that one hangs, not slowly finishes, so
+no grace period would make it self-resolve — only against how long a
+normal, successful Hermes-side cleanup takes."""
+
+_ORPHAN_TERM_GRACE_S = 5.0
+"""Between SIGTERM and SIGKILL for a still-alive orphan, polled the same
+`_GROUP_KILL_POLL_INTERVAL_S`-style way `_reap_process_group` above already
+does (not a flat sleep) so a process that dies quickly doesn't cost the
+whole budget. Same duration `_reap_process_group` itself uses for its own
+SIGTERM->SIGKILL escalation, for the same reason: give a real, well-behaved
+process (e.g. mid-write) a genuine chance to exit cleanly before forcing
+it."""
+
+_GROUP_KILL_POLL_INTERVAL_S = 0.05
+
+
+@dataclass(frozen=True)
+class OrphanSnapshotEntry:
+    """One descendant of a worker, captured at snapshot time. `create_time`
+    is what lets `_same_process_still_alive` below tell "this exact process
+    is still running" apart from "the OS already reused this pid for
+    something unrelated" (POSIX pids recycle) — the hard anti-PID-reuse
+    requirement from #41's controller ruling. Recorded once, at snapshot
+    time, never re-derived from a fresh `psutil.Process(pid)` later (that
+    would just re-ask "what's create_time NOW", defeating the whole point)."""
+
+    pid: int
+    create_time: float
+    cmdline: str
+
+
+def snapshot_worker_descendants(worker_pid: int) -> list[OrphanSnapshotEntry]:
+    """Issue #41: the FULL descendant tree rooted at the worker's own pid
+    (`psutil.Process.children(recursive=True)`), not the worker's process
+    GROUP (`_group_alive`/`_signal_worker_group` above) — deliberately not
+    interchangeable with those: Hermes starts each shell command in its own
+    new session specifically so it does NOT share the worker's pgid (see
+    this module's `SPAWN_ORPHAN_ON_SHUTDOWN`-style comment further up), so a
+    pgid-based signal can never reach it, only a real process-tree walk can.
+
+    Must be called BEFORE anything is allowed to happen that could let a
+    descendant detach from this tree — `children(recursive=True)` walks the
+    CURRENT ppid graph, so a descendant Hermes has already reparented away
+    (exactly #41's reported shape: ppid becomes 1, its own new session) is
+    invisible to a snapshot taken after that's already happened. Calling
+    this first, synchronously (plain `/proc` reads on Linux, a `sysctl` call
+    on macOS — no `await` in this function at all), before `session/cancel`
+    is even sent, is what makes the later kill decision correct regardless
+    of what Hermes's own cleanup thread does in the meantime, or even if the
+    worker process itself dies before the grace period (below) elapses —
+    identity for every entry here is proven by `create_time`, never by
+    re-deriving the ppid chain at kill time (which would fail for the exact
+    orphans this exists to catch: their ppid has legitimately become 1 by
+    then, that's the bug, not a reason to skip them).
+
+    Explicitly excludes the daemon's own pid and its parent's pid (hard
+    requirement, #41 review) — belt and suspenders: neither can normally
+    ever appear here (the daemon is the worker's PARENT, not a descendant of
+    it), but a `children(recursive=True)` walk over a live, attacker-
+    uninfluenced `/proc` snapshot has no other structural reason to exclude
+    them, so this is asserted explicitly rather than assumed. Also excludes
+    `pid <= 1` (never a real descendant; a defensive floor, not something
+    `children()` would ever actually return)."""
+    exclude_pids = {os.getpid(), os.getppid()}
+    try:
+        root = psutil.Process(worker_pid)
+        descendants = root.children(recursive=True)
+    except psutil.NoSuchProcess:
+        # Worker already gone by the time we tried to snapshot it — nothing
+        # we can prove was ever its descendant (see this function's
+        # docstring: identity here is only ever established AT snapshot
+        # time). Genuinely nothing to reap; the caller's snapshot-first
+        # ordering exists precisely to make this the rare case, not the
+        # normal one.
+        return []
+    entries: list[OrphanSnapshotEntry] = []
+    for proc in descendants:
+        if proc.pid <= 1 or proc.pid in exclude_pids:
+            continue
+        try:
+            entries.append(
+                OrphanSnapshotEntry(
+                    pid=proc.pid,
+                    create_time=proc.create_time(),
+                    cmdline=" ".join(proc.cmdline()) or proc.name(),
+                )
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            # Gone (or inaccessible/zombie) between `children()` listing it
+            # and us reading its details — nothing stable enough to prove
+            # identity against later, so nothing to track; not an error.
+            continue
+    return entries
+
+
+def _same_process_still_alive(entry: OrphanSnapshotEntry) -> bool:
+    """Anti-PID-reuse check (#41 hard requirement): true only if `entry.pid`
+    is still running AND its `create_time` still matches what was recorded
+    at snapshot time — a different process that happens to reuse the same
+    pid will always have a different `create_time`, so this can never
+    mistake an unrelated later process for the one we snapshotted."""
+    try:
+        proc = psutil.Process(entry.pid)
+        return proc.is_running() and proc.create_time() == entry.create_time
+    except psutil.NoSuchProcess:
+        return False
+
+
+def _signal_pid(pid: int, sig: int) -> None:
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass  # already gone — nothing left to signal
 
 
 def _prepare_hermes_home(
@@ -413,6 +550,93 @@ class WorkerManager:
         if worker is None:
             return
         await self._terminate(worker, reason=reason)
+
+    def snapshot_worker_descendants(self, worker_pid: int) -> list[OrphanSnapshotEntry]:
+        """Thin instance-method wrapper so `SessionService.stop()` only ever
+        talks to `self.worker_manager`, never reaches past it into this
+        module's free functions directly — see the free function's own
+        docstring for what this actually does and why call-order matters."""
+        return snapshot_worker_descendants(worker_pid)
+
+    async def reap_stop_orphans(
+        self,
+        snapshot: list[OrphanSnapshotEntry],
+        *,
+        session_id: str,
+        worker_pid: int,
+    ) -> list[dict[str, Any]]:
+        """Issue #41 fallback for `SessionService.stop()` — see `snapshot_
+        worker_descendants`'s docstring for why `snapshot` must already have
+        been captured by the caller BEFORE `session/cancel` was even sent,
+        not computed inside this method. This method owns everything AFTER
+        that: wait a grace period for Hermes's own cleanup to do its job,
+        then confirm (by `create_time`, never by re-deriving the ppid chain
+        — see `_same_process_still_alive`) which snapshotted entries are
+        still alive, TERM them, give them a short beat, then KILL whatever's
+        still standing. Returns what was actually reaped (empty if Hermes's
+        own cleanup already got everything, the overwhelmingly common case)
+        for the caller to log/report — this method logs its own summary
+        regardless so it's visible even when the caller doesn't inspect the
+        return value.
+
+        Never polls outside of an active stop() call (R6: no resident
+        background scan) — this coroutine runs exactly once per `stop()`
+        that had something to snapshot, does its bounded waiting, and ends;
+        nothing here re-arms itself.
+
+        `_ORPHAN_CANCEL_GRACE_S`/`_ORPHAN_TERM_GRACE_S` are read as plain
+        module globals below, NOT bound as this method's own default
+        parameter values — a default parameter value is captured once, at
+        function-definition (import) time, so a test monkeypatching the
+        module constant afterward (same pattern `test_workers_manager.py`
+        already uses for `_IDLE_SCAN_INTERVAL_S`) would silently have no
+        effect on it were it a default instead."""
+        if not snapshot:
+            return []
+        grace_period_s = _ORPHAN_CANCEL_GRACE_S
+        if grace_period_s > 0:
+            await asyncio.sleep(grace_period_s)
+        survivors = [e for e in snapshot if _same_process_still_alive(e)]
+        if not survivors:
+            return []
+        logger.warning(
+            "stop(): Hermes's own cleanup left descendant process(es) behind past the "
+            f"{grace_period_s:.1f}s grace period — Jones's own fallback is reaping them "
+            "(Issue #41)",
+            extra={
+                "detail": {
+                    "session_id": session_id, "worker_pid": worker_pid,
+                    "pids": [e.pid for e in survivors],
+                    "commands": [e.cmdline for e in survivors],
+                }
+            },
+        )
+        for entry in survivors:
+            _signal_pid(entry.pid, signal.SIGTERM)
+        deadline = time.monotonic() + _ORPHAN_TERM_GRACE_S
+        while time.monotonic() < deadline and any(
+            _same_process_still_alive(e) for e in survivors
+        ):
+            await asyncio.sleep(_GROUP_KILL_POLL_INTERVAL_S)
+        reaped: list[dict[str, Any]] = []
+        for entry in survivors:
+            escalated_to_sigkill = _same_process_still_alive(entry)
+            if escalated_to_sigkill:
+                _signal_pid(entry.pid, signal.SIGKILL)
+            reaped.append(
+                {"pid": entry.pid, "cmdline": entry.cmdline, "sigkill": escalated_to_sigkill}
+            )
+        logger.warning(
+            "stop(): reaped orphaned descendant process(es) Hermes's own cleanup missed "
+            "(Issue #41 fallback)",
+            extra={
+                "detail": {
+                    "session_id": session_id, "worker_pid": worker_pid,
+                    "count": len(reaped), "processes": reaped,
+                }
+            },
+        )
+        return reaped
 
     # -- internals ------------------------------------------------------------
 

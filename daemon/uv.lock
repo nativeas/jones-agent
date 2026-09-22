@@ -650,6 +650,7 @@ source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
     { name = "keyring" },
+    { name = "psutil" },
     { name = "pyyaml" },
 ]
 
@@ -668,6 +669,7 @@ worker = [
 requires-dist = [
     { name = "cryptography", specifier = ">=50.0.0" },
     { name = "keyring", specifier = ">=25.7.0" },
+    { name = "psutil", specifier = ">=7.2.2" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 

@@ -162,6 +162,28 @@ own entry below).
   agent process itself has no chance to reap its own child before dying) —
   `SPAWN_REAL_SUBPROCESS_TERMINAL` above instead proves the AGENT's own
   cancel-driven cleanup, a different half of G09.
+- "SPAWN_ORPHAN_INDEPENDENT_SESSION" prompt marker (pure addition, "normal"
+  mode only, same pattern as "USE_TOOL"/`SPAWN_ORPHAN_ON_SHUTDOWN`) — Issue
+  #41's exact repro shape, which `SPAWN_ORPHAN_ON_SHUTDOWN` above does NOT
+  cover: a real child OS process started with its OWN new session/pgid
+  (real Hermes's `tools/environments/local.py` does exactly this for every
+  shell command, precisely so a cancelled command's cleanup can target it
+  independently — source-verified, see `workers/manager.py::_signal_worker_
+  group`'s docstring) — so `killpg` on the WORKER's own pgid (W9's fix,
+  `_terminate`/`_reap_process_group` in that file) structurally cannot reach
+  it, only a real ppid-tree walk can (`WorkerManager.snapshot_worker_
+  descendants`, Issue #41's fallback). Stays a completely ordinary, directly
+  attached child of THIS agent process throughout (`ppid` never changes) —
+  unlike `SPAWN_ORPHAN_ON_SHUTDOWN`, this agent process itself is NOT torn
+  down here, standing in for the exact production shape `SessionService.
+  stop()` faces: the WORKER is still alive and answers `session/cancel`
+  completely normally (same as "normal" mode always does), but this one
+  specific child is deliberately never cleaned up by this agent on cancel or
+  anything else — simulating a Hermes whose own cancel-driven cleanup thread
+  missed it (Issue #41's own ~17% real-model repro rate), which is precisely
+  the gap `WorkerManager.reap_stop_orphans` exists to cover. Writes the
+  child's pid to `$HERMES_HOME/_orphan_independent_session.pid`, then
+  finishes the prompt normally (`stopReason: "end_turn"`).
 - "MANY_TOOL_CALLS:<n>" prompt marker (R-N5, controller ruling 2026-09-20,
   04-w5-interfaces.md §4.3 — Issue #22's Step-count budget test: "假 ACP
   agent 发 201 个 tool_call") — pure addition, same pattern as "USE_TOOL"/
@@ -447,6 +469,38 @@ def _handle_spawn_subprocess_terminal(session_id: str) -> None:
     )
 
 
+_SPAWN_ORPHAN_INDEPENDENT_SESSION_MARKER = "SPAWN_ORPHAN_INDEPENDENT_SESSION"
+_ORPHAN_INDEPENDENT_SESSION_PID_FILE_NAME = "_orphan_independent_session.pid"
+
+
+def _handle_spawn_orphan_independent_session() -> None:
+    """See module docstring's `SPAWN_ORPHAN_INDEPENDENT_SESSION` entry. A
+    plain, direct child of THIS agent process (`ppid` stays this agent's pid
+    for its whole life — nothing here ever detaches it), just started with
+    `start_new_session=True` so it's the leader of its OWN new session/pgid,
+    not this agent's — the one property that actually defeats `WorkerManager
+    ._terminate`'s `killpg`-based reap (W9) and is what Issue #41's fallback
+    (a real ppid-tree walk, not a pgid signal) exists to still catch."""
+    proc = subprocess.Popen(
+        ["sleep", "300"], start_new_session=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        Path(home, _ORPHAN_INDEPENDENT_SESSION_PID_FILE_NAME).write_text(
+            str(proc.pid), encoding="utf-8"
+        )
+    # Hold this prompt "in flight" a moment after the orphan exists —
+    # without this, `_respond` a few lines below (this handler returns right
+    # back into `_handle_prompt_request`) can finish the Turn before a test
+    # ever gets a chance to observe the pid file and call `stop()` while the
+    # Turn is still active (`SessionService.stop()` is a no-op once its own
+    # `_turn_tasks` entry is already `done()`). Short — this only needs to
+    # outlast one daemon-side stop() call, not simulate a real, long shell
+    # command finishing.
+    time.sleep(1.0)
+
+
 def _handle_normal_prompt(session_id: str, text: str) -> None:
     _send_update(
         session_id,
@@ -510,6 +564,8 @@ def _handle_normal_prompt(session_id: str, text: str) -> None:
         _handle_spawn_subprocess_terminal(session_id)
     if _SPAWN_ORPHAN_MARKER in text:
         _handle_spawn_orphan_on_shutdown()
+    if _SPAWN_ORPHAN_INDEPENDENT_SESSION_MARKER in text:
+        _handle_spawn_orphan_independent_session()
     many_match = _MANY_TOOL_CALLS_MARKER.search(text)
     if many_match:
         _handle_many_tool_calls_prompt(session_id, int(many_match.group(1)))

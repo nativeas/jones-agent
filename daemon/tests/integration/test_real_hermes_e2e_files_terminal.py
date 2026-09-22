@@ -1,18 +1,21 @@
 """Real-Hermes end-to-end check for Issue #13/#14 (FR07 file five-piece +
 FR08 terminal), gated the same way `test_real_hermes_e2e.py` is
-(`JONES_E2E=1` and `ANTHROPIC_API_KEY` both present — see that file's module
+(`JONES_E2E=1` and one configured vendor key present — see that file's module
 docstring for the full rationale, unchanged here).
 
-**Not run by this branch's own CI/local verification** — no `ANTHROPIC_API_KEY`
-was available in this sandbox, and this branch does not source one from
-`~/.hermes/.env`/`~/.hermes/auth.json` (present on this machine, but the
-task instructions for this branch explicitly say not to read the user's own
-config/credentials, and using a personal key without being asked to would
-also spend the user's own quota). This file is written and reviewed for
-correctness against the source evidence in `docs/design/00-foundation.md`
-§8/§9 and the installed `hermes-agent` checkout, but the assertions inside
-it are unverified against a real model in this environment — see the PR
-report's "没做什么" section. A reviewer with a key can run it directly:
+`test_real_hermes_terminal_stop_leaves_no_orphan_process` (Issue #41): run 8
+consecutive times against a real DeepSeek worker (`~/.hermes/.env`'s
+`DEEPSEEK_API_KEY`, user-authorized for this branch) — see this PR's report
+for the captured per-run output. It now verifies "Jones's own G09 fallback
+(`SessionService.stop()`'s Issue #41 reaping) actually reaps it", NOT
+"Hermes's own cancel-driven cleanup is clean" — that half remains genuinely
+flaky against a real model (Issue #41's own repro: ~17%, a child left behind
+in its own session/pgid, unreachable by `WorkerManager`'s pgid-based
+`killpg`), and is exactly the gap this issue's fallback exists to cover
+rather than depend on. The test drives the real, user-visible `SessionService
+.stop()` (not `WorkerManager`/`AcpClient.cancel()` directly, unlike this
+file's other test) — that's the one path Issue #41's controller ruling (R3)
+wires the fallback into.
 
     JONES_E2E=1 ANTHROPIC_API_KEY=... uv run pytest -q \\
         tests/integration/test_real_hermes_e2e_files_terminal.py
@@ -28,12 +31,20 @@ docs/design/03-w4-interfaces.md §3 names ("核对 Hermes 用哪个工具遍历�
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
+from typing import Any
 
 import pytest
 
+from jones_daemon.context import DaemonContext
+from jones_daemon.context import ProviderResolver as ProviderResolverProtocol
+from jones_daemon.projects.bootstrap import bootstrap_projects_and_agents
+from jones_daemon.projects.service import ProjectService
+from jones_daemon.sessions.service import DEFAULT_AGENT_ID, SessionService
+from jones_daemon.store import apply_pending, connect, run_in_db_thread
 from jones_daemon.workers import manager as manager_module
 from jones_daemon.workers.manager import WorkerManager
 
@@ -125,6 +136,88 @@ async def _make_manager(tmp_path, *, startup_timeout_s: float = 30.0) -> WorkerM
     return manager
 
 
+class _FakeServer:
+    """Minimal `ctx.server` double — same shape `tests/test_cap_terminal_
+    stop_cancel.py`'s own copy uses, duplicated here rather than imported
+    (this integration test file has no dependency on the unit test tree, by
+    design — same reasoning `_make_manager` above already applies to
+    `WorkerManager`'s on_update/on_permission callbacks)."""
+
+    def __init__(self) -> None:
+        self.broadcasts: list[tuple[str, str, Any]] = []
+
+    async def broadcast(self, session_id: str, method: str, params: Any) -> None:
+        self.broadcasts.append((session_id, method, params))
+
+
+class _StubProviderResolver(ProviderResolverProtocol):
+    """`SessionService.__init__` requires one; the real provider Key/config
+    for the worker itself is wired by `_with_model_config` below (appending
+    straight to `config.yaml`, the same mechanism this file's other test
+    already uses) — this stub is never actually consulted for that, `_run_
+    turn`'s own resolve-then-discard pre-flight check (module docstring)
+    just needs something that doesn't raise."""
+
+    def resolve(self, model_pref: dict[str, Any] | None) -> Any:
+        return {"provider": "anthropic", "model": "claude-test", "env": {}, "hermes_config": {}}
+
+    def list_models(self, provider: str | None) -> list[dict[str, Any]]:
+        return []
+
+
+class _NullConfigResolver:
+    def settings(self, project_id: str | None) -> dict[str, Any]:
+        return {}
+
+    def permissions(self, project_id: str | None) -> dict[str, Any]:
+        return {}
+
+    def mcp_servers(self, project_id: str | None) -> list[dict[str, Any]]:
+        return []
+
+
+async def _make_real_service(tmp_path, monkeypatch) -> SessionService:
+    """A full `SessionService`, NOT `WorkerManager` alone (unlike `_make_
+    manager` above) — Issue #41's fallback (`WorkerManager.reap_stop_
+    orphans`) is wired into `SessionService.stop()`, the real user-visible
+    path, so proving it against a real worker needs to go through `stop()`
+    itself, not `AcpClient.cancel()` called directly on a bare `Worker`.
+    `worker_cmd` is left at `SessionService`'s own default (real Hermes,
+    `sys.executable -m acp_adapter.entry`) — no fake-agent override.
+
+    `JONES_HOME` MUST be pinned to `tmp_path` here (unlike `_make_manager`
+    above, which never touches it because a bare `WorkerManager` is handed
+    its `user_root` directly as a constructor arg) — `SessionService.
+    __init__` instead reads it off `ctx.paths.user_root()`
+    (`paths.py::user_root()`'s own docstring: "honoring the JONES_HOME
+    override"), which falls back to the REAL `~/.jones` when unset. Found
+    the hard way while validating this test for R5: every worker this
+    service spawns landed under the ACTUAL user's `~/.jones/runtime/
+    workers/<session_id>/`, not `tmp_path` — real disk pollution (tirith
+    binaries and all) in the user's real Jones home, cleaned up by hand
+    once caught. `monkeypatch.setenv` here is what the fake-agent-backed
+    harnesses elsewhere in this test suite (`tests/test_cap_terminal_stop_
+    cancel.py::_make_service` et al.) already do for exactly this reason."""
+    monkeypatch.setenv("JONES_HOME", str(tmp_path))
+
+    def _open() -> Any:
+        conn = connect(tmp_path / "jones.db")
+        apply_pending(conn)
+        bootstrap_projects_and_agents(conn)
+        return conn
+
+    conn = await run_in_db_thread(_open)
+    from jones_daemon import paths
+
+    ctx = DaemonContext(
+        db=conn, paths=paths, server=_FakeServer(),
+        providers=_StubProviderResolver(), config=_NullConfigResolver(),
+    )
+    service = SessionService(ctx)
+    await service.worker_manager.start()
+    return service
+
+
 async def test_real_hermes_five_piece_file_tools_and_directory_listing(tmp_path):
     real_prepare = manager_module._prepare_hermes_home
     manager_module._prepare_hermes_home = _with_model_config
@@ -186,69 +279,86 @@ async def test_real_hermes_five_piece_file_tools_and_directory_listing(tmp_path)
         await manager.stop()
 
 
-async def test_real_hermes_terminal_stop_leaves_no_orphan_process(tmp_path):
-    """G09: a real, long-running child process started by the `terminal`
-    tool must be gone shortly after `session/cancel` — the actual proof
-    `tests/test_cap_terminal_stop_cancel.py` (fake-agent level) cannot
-    provide by itself. The command writes its OWN pid to a file (so this
-    test can verify liveness without needing to parse Hermes's own output
-    format) then sleeps far longer than this test's own timeout."""
+async def test_real_hermes_terminal_stop_leaves_no_orphan_process(tmp_path, monkeypatch):
+    """G09 / Issue #41 — see this file's module docstring for the full
+    "what this verifies now vs. before" story. A real, long-running child
+    process started by the `terminal` tool must be gone shortly after the
+    user-visible `SessionService.stop()` — regardless of whether Hermes's
+    own cancel-driven cleanup managed it, because Jones's own fallback
+    (`WorkerManager.reap_stop_orphans`) must catch it either way. The
+    command writes its OWN pid to a file (so this test can verify liveness
+    without needing to parse Hermes's own output format) then sleeps far
+    longer than this test's own timeout."""
     real_prepare = manager_module._prepare_hermes_home
     manager_module._prepare_hermes_home = _with_model_config
-    manager = await _make_manager(tmp_path)
+    service = await _make_real_service(tmp_path, monkeypatch)
     try:
         project = tmp_path / "project"
         project.mkdir()
+        project_row = await run_in_db_thread(ProjectService(service.ctx.db).create, str(project))
+        session_row = await service.create(
+            project_id=project_row["id"], agent_id=DEFAULT_AGENT_ID, mode="auto",
+            title="issue-41-real-e2e",
+        )
+        session_id = session_row["id"]
         pid_file = project / "child.pid"
-        worker = await manager.ensure_started("e2e-terminal-g09", cwd=str(project))
 
-        prompt_task = None
-        import asyncio
+        await service.send(
+            session_id,
+            "Use the terminal tool to run exactly this command right now, in a single "
+            f"call: `echo $$ > {pid_file} && sleep 60`. Do not explain, do not ask "
+            "about timeouts or anything else, just call the tool immediately.",
+        )
 
-        async def _run_prompt():
-            return await worker.client.prompt(
-                worker.acp_session_id,
-                "Use the terminal tool to run exactly this command (a single call, do "
-                f"not explain): `echo $$ > {pid_file} && sleep 60`",
-            )
+        async def _answer_any_pending_permission() -> None:
+            # This command's shell syntax (`>` redirection, `&&`) makes
+            # `permissions/review.py::classify()` return `risk="high"`
+            # ("该命令无法静态分析，请人工确认") — real, measured behavior,
+            # not a guess: `_decide_terminal_like_permission`'s `mode="auto"`
+            # fast path only ever applies to `risk.level=="low"`, so this
+            # command always reaches a real `permission.requested`
+            # regardless of session mode. Answered here the same way a real
+            # user clicking "allow" would.
+            for entry in await service.permission_pending(session_id):
+                await service.permission_decide(entry["request_id"], "allow")
 
-        prompt_task = asyncio.create_task(_run_prompt())
-
-        # Wait for the child to actually start and record its own pid. 20s
-        # wasn't enough here (Issue #40 investigation, reproduced against a
-        # real DeepSeek worker): Hermes's local terminal backend
-        # auto-installs `tirith` (`tools/tirith_security.py`) into
-        # `$HERMES_HOME/bin/tirith` synchronously on its FIRST use per
-        # `HERMES_HOME` — measured ~11-20s download+verify against GitHub's
-        # release CDN, network-variance dependent — and this suite's own
-        # `_prepare_hermes_home` deliberately gives every worker a fresh,
-        # empty `HERMES_HOME` (isolation, see that function's docstring), so
-        # this cost is paid on every run here, not a one-off warm-cache
-        # effect (see the PR report for the follow-up this points at: a
-        # shared, pre-warmed `TIRITH_BIN` would remove the download from this
-        # critical path entirely, out of scope for this fix). 60s covers
-        # self-check (~15s) + the model's own tool-call latency (~3s) + a
-        # slow tirith install with real margin; the actual G09 assertion
-        # below (process gone within 10s of cancel) is untouched.
-        deadline = time.monotonic() + 60.0
+        # Wait for the child to actually start and record its own pid.
+        # Budget composed of measured real-model costs (Issue #40/#41
+        # investigations, reproduced against real DeepSeek workers):
+        # ~15s worker self-check, ~11-20s tirith auto-install on this
+        # HERMES_HOME's first terminal use (`tools/tirith_security.py`,
+        # this suite's own `_prepare_hermes_home` gives every worker a
+        # fresh, empty `HERMES_HOME` so this is paid every run, not a one-
+        # off warm-cache effect), and — new in this real-`SessionService`
+        # E2E test, not present in the raw-`WorkerManager` version this
+        # replaced — real review-gate latency: DeepSeek was observed to
+        # spend a real 20-30s of its OWN deliberation (visible as a long
+        # run of `message.delta` chunks) before actually emitting the tool
+        # call this command's `permission.requested` depends on, even
+        # though the prompt explicitly asks for no explanation. 120s is
+        # comfortable margin over the sum of all of that.
+        deadline = time.monotonic() + 120.0
         while time.monotonic() < deadline and not pid_file.exists():
+            await _answer_any_pending_permission()
             await asyncio.sleep(0.1)
         assert pid_file.exists(), "terminal command never started (pid file missing)"
         child_pid = int(pid_file.read_text().strip())
 
-        # Confirm it's actually alive before cancelling — a false "no
-        # orphan" pass because the process never started would be worthless.
+        # Confirm it's actually alive before stopping — a false "no orphan"
+        # pass because the process never started would be worthless.
         os.kill(child_pid, 0)  # raises ProcessLookupError if already gone
 
-        await worker.client.cancel(worker.acp_session_id)
+        result = await service.stop(session_id)
+        assert result["stopped"] is True
 
-        # Real Hermes's own reaping is adaptive-poll (5ms up to 200ms, see
-        # `tools/environments/base.py::_wait_for_process`, source-verified —
-        # cited in the PR report) — a few seconds of slack covers process-
-        # group SIGTERM->SIGKILL escalation comfortably without being a
-        # tight timing assertion.
+        # `SessionService.stop()`'s Issue #41 fallback runs BACKGROUNDED
+        # (see its own docstring): its own ~3s cancel grace
+        # (`_ORPHAN_CANCEL_GRACE_S`) plus up to ~5s SIGTERM->SIGKILL
+        # escalation (`_ORPHAN_TERM_GRACE_S`) is the ceiling regardless of
+        # what Hermes's own concurrent cleanup does — generous margin below,
+        # not a tight timing assertion.
         gone = False
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
             try:
                 os.kill(child_pid, 0)
@@ -257,14 +367,9 @@ async def test_real_hermes_terminal_stop_leaves_no_orphan_process(tmp_path):
                 break
             await asyncio.sleep(0.1)
         assert gone, (
-            f"child pid {child_pid} is still alive 10s after cancel — orphan process (G09)"
+            f"child pid {child_pid} is still alive 30s after stop() — Issue #41's "
+            "fallback did not reap it (G09)"
         )
-
-        prompt_task.cancel()
-        try:
-            await prompt_task
-        except (asyncio.CancelledError, Exception):
-            pass
     finally:
         manager_module._prepare_hermes_home = real_prepare
-        await manager.stop()
+        await service.shutdown()

@@ -964,6 +964,20 @@ class SessionService:
                 step_seq=ctx_turn.step_seq or None,
             )
         worker = self.worker_manager.get(session_id)
+        # Issue #41 controller ruling (R1/R3): Jones's own belt-and-suspenders
+        # guarantee that G09 "停止后无孤儿进程" holds from THIS user-visible
+        # stop, not only from a later full worker teardown. Snapshotted here,
+        # BEFORE `session/cancel` is even sent below — see `WorkerManager.
+        # snapshot_worker_descendants`'s docstring for why "before anything
+        # else happens" is load-bearing, not merely tidy: a descendant
+        # Hermes's own cleanup (or the worker crashing outright) has already
+        # detached from the worker's process tree by the time anything later
+        # looked would be invisible to that later look. Synchronous, cheap
+        # (no `await`) — nothing about this ordering is left to asyncio's own
+        # scheduling.
+        orphan_snapshot = self.worker_manager.snapshot_worker_descendants(
+            worker.process.pid
+        ) if worker is not None else []
         if worker is not None and worker.client is not None and worker.acp_session_id is not None:
             try:
                 # A notification, not a hard kill: PRD 9.3 "用户终止" requires the
@@ -1002,6 +1016,24 @@ class SessionService:
         # this, `stop()` during a pending approval never produces `run.terminated`
         # (see this PR report's "第 1 轮修复记录").
         self._resolve_pending_permissions(session_id=session_id, reason="stopped by user")
+        if orphan_snapshot:
+            # Backgrounded, not awaited here: the overwhelmingly common case
+            # (Hermes's own cleanup already got everything, so `orphan_
+            # snapshot` from a session with nothing running is `[]`) must
+            # cost this RPC nothing, and the rare case that DOES need this
+            # fallback still takes several seconds (its own grace period,
+            # see `WorkerManager.reap_stop_orphans`) that a user clicking
+            # "stop" shouldn't have to wait on before getting `{"stopped":
+            # true}` back. Tracked the same way this class's own background
+            # Step-payload writes are (`_background_tasks`, awaited with a
+            # bound in `shutdown()`) — not fire-and-forget.
+            task = asyncio.create_task(
+                self.worker_manager.reap_stop_orphans(
+                    orphan_snapshot, session_id=session_id, worker_pid=worker.process.pid
+                )
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
         return {"stopped": True}
 
     async def delete_guard(self, session_id: str, fn: Any, *args: Any, **kwargs: Any) -> Any:

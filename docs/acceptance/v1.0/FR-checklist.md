@@ -128,7 +128,23 @@ FR01-FR16（P0，v1 必须有）的验收口径原文、对应测试/手工记�
   （`test_tool_call_start_update_to_broadcast_latency_is_well_under_200ms`、
   `test_tool_call_update_to_broadcast_latency_is_well_under_200ms`）。
 - 中途可中断、子进程被回收：见 G09（`daemon/tests/acceptance/
-  test_g09_clean_termination.py`）。
+  test_g09_clean_termination.py`）。Issue #41（原 #40 的第三层未收口项）：
+  "无孤儿进程"不再单纯依赖 Hermes 自身的 cancel 驱动回收（该半程真实模型下约
+  17% 概率遗留孤儿，根因是 Hermes 给每条 shell 命令单独起了新
+  session/pgid，`WorkerManager` 的 pgid 级回收够不到）——`SessionService.
+  stop()` 现在自带兜底（`WorkerManager.reap_stop_orphans`/
+  `snapshot_worker_descendants`，`daemon/src/jones_daemon/workers/
+  manager.py`）：取 worker 完整子孙进程快照（`psutil`，不依赖进程组，发
+  `session/cancel` **之前**就拿，否则已经脱离 worker ppid 链路的孤儿在快照
+  时就看不见了）→ 发 `session/cancel` → 宽限期给 Hermes 自己收 → 快照里仍
+  存活的（按 pid+create_time 反查，防 pid 复用）先 SIGTERM 再 SIGKILL。假
+  ACP agent 级
+  证明（可失败）：`daemon/tests/test_cap_orphan_reaper.py`。真实模型验证：
+  `test_real_hermes_e2e_files_terminal.py::
+  test_real_hermes_terminal_stop_leaves_no_orphan_process` 改为走真实
+  `SessionService.stop()`（不再是裸 `WorkerManager`/`AcpClient.cancel()`），
+  验的是"Jones 自己的兜底能兜住"，不是"Hermes 自己干净"；对
+  `~/.hermes/.env` 的 DeepSeek Key 连跑 8 次，结果见该 PR 报告。
 - 高危命令标红（`rm`/`sudo`/`curl | sh` 等）：`daemon/tests/
   test_cap_terminal_danger.py`（`test_sudo_is_high_risk`、
   `test_curl_pipe_sh_is_high_risk` 等一整组）。
