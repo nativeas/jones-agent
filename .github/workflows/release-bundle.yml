@@ -109,9 +109,25 @@ jobs:
       - name: Build daemon bundle (${{ matrix.arch }}, native)
         run: scripts/release/build-daemon-bundle.sh ${{ matrix.arch }} build/release/daemon/${{ matrix.arch }}
 
+      # round-1 review fix: actions/upload-artifact@v4 does NOT preserve file
+      # permissions on upload ("All directories will have 755 and all files
+      # will have 644" — GitHub's own docs) and dereferences symlinks into
+      # copies. Two things in this bundle MUST stay executable — the
+      # `bin/jones-daemon` entry script (build-daemon-bundle.sh step 4,
+      # `chmod +x`) and `python/bin/python3.12` itself (the entry script's
+      # last line execs it) — plus python-build-standalone's interpreter
+      # symlinks (`bin/python3` -> `python3.12` etc.). Uploading the directory
+      # straight would hand G18's "wire this artifact into build-mac.sh"
+      # prerequisite a bundle that can't run. Tar it first (GitHub's own
+      # recommended workaround) so permissions/symlinks survive the round
+      # trip; downloading it back out means `tar -xzf` before feeding it to
+      # build-mac.sh (see docs/acceptance/v1.0/G18.md).
+      - name: Package bundle (tar preserves exec bits & symlinks)
+        run: tar -czf "$RUNNER_TEMP/daemon-bundle-${{ matrix.arch }}.tar.gz" -C build/release/daemon "${{ matrix.arch }}"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: daemon-bundle-${{ matrix.arch }}
-          path: build/release/daemon/${{ matrix.arch }}
+          path: ${{ runner.temp }}/daemon-bundle-${{ matrix.arch }}.tar.gz
           if-no-files-found: error

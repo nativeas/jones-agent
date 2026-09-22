@@ -48,6 +48,22 @@ esac
 if [ "$(uname -m)" = "$HOST_ARCH_FOR" ]; then
   IS_NATIVE=1
   PLATFORM_FLAGS=()
+  # round-1 review fix: `--python-platform <triple>` was the only place this
+  # pipeline declared a target macOS MINIMUM VERSION — uv uses a fixed,
+  # host-independent default for a given triple there, overridable via
+  # MACOSX_DEPLOYMENT_TARGET. Dropping it for native builds (above) dropped
+  # that pin too, so without this, the product's actual floor (macOS 13+,
+  # docs/PRD.md "v1.0: macOS 13+"/README.md/docs/acceptance/v1.0/G18.md) just
+  # follows whatever macOS version the BUILD HOST happens to run — on the CI
+  # x64 leg that's macos-15-intel (macOS 15), not 13. This matters concretely
+  # for `cryptography`, which has no macOS x86_64 wheel for the pinned
+  # version and is compiled from sdist here (Rust/cargo) — its compiled `.so`
+  # would otherwise inherit whatever minimum the host's toolchain defaults to.
+  # Exporting this explicitly also makes the build reproducible across runner
+  # image upgrades instead of silently drifting with them. Respects an
+  # existing override (e.g. a future v1.1 raising the floor) rather than
+  # forcing 13.0 unconditionally.
+  export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
 else
   IS_NATIVE=0
   PLATFORM_FLAGS=(--python-platform "$UV_PLATFORM")
