@@ -53,6 +53,16 @@ _JONES_GATE_SRC = Path(__file__).resolve().parent.parent / "kernel" / "plugin" /
 _TOOLS_SNAPSHOT_FILE_NAME = "jones_tools.json"
 _TOOLS_SNAPSHOT_POLL_INTERVAL_S = 0.05
 
+# `_wait_for_tools_snapshot` needs its OWN timeout, strictly less than
+# `self._startup_timeout_s`, so its fail-closed rejection carries a specific,
+# actionable reason instead of the bare, empty-message `TimeoutError()` that
+# results when it's only ever cancelled from OUTSIDE by `_spawn_and_check`'s
+# outer `asyncio.wait_for` — see that method's docstring for the production
+# symptom this was fixed for. Same reasoning as `_PROBE_BUDGET_S` below: the
+# reserve just has to comfortably outlast this method's own cleanup so its
+# `WorkerStartupError` propagates before the outer cutoff would instead.
+_TOOLS_SNAPSHOT_TIMEOUT_RESERVE_S = 1.0
+
 # PRD 9.2 "空闲超时（默认 10 min）回收".
 DEFAULT_IDLE_TIMEOUT_S = 600.0
 _IDLE_SCAN_INTERVAL_S = 30.0
@@ -587,11 +597,23 @@ class WorkerManager:
         """PRIMARY self-check criterion (Issue #38 ruling 1) — see
         `_startup_self_check`'s docstring, including why this only ever
         resolves once the concurrent `_probe_second_layer` has actually sent
-        its prompt. Polls for `<HERMES_HOME>/jones_tools.json` to appear; no
-        timeout of its own, since this always runs under `_spawn_and_check`'s
-        `asyncio.wait_for(..., self._startup_timeout_s)`, which cancels this
-        loop (turned into `WorkerStartupError` there) the same fail-closed way
-        a stuck `initialize()`/`new_session()` already does.
+        its prompt. Polls for `<HERMES_HOME>/jones_tools.json` to appear.
+
+        Bounded to its OWN budget (`self._startup_timeout_s` minus
+        `_TOOLS_SNAPSHOT_TIMEOUT_RESERVE_S`), not merely the OUTER
+        `asyncio.wait_for(..., self._startup_timeout_s)` in `_spawn_and_check`
+        that used to be the only thing bounding this loop. Relying solely on
+        that outer wait_for produced a fail-closed rejection with an EMPTY
+        reason in practice: cancelling this coroutine from outside raises a
+        bare `TimeoutError()` (no args), so the final `WorkerStartupError`
+        message (`_spawn_and_check`'s `f"worker startup self-check failed:
+        {exc}"`) came out as `worker startup self-check failed: ` — a real
+        user-facing error card with no clue what went wrong. This method now
+        owns its own timeout and raises a `WorkerStartupError` with a
+        specific, actionable reason instead — strictly less than the outer
+        bound so it always fires (and its message survives) before that blunt
+        outer cutoff would instead; same reasoning as `_PROBE_BUDGET_S`
+        above.
 
         `_prepare_hermes_home` already deleted any stale snapshot left by a
         PREVIOUS worker generation for this same `hermes_home` before this
@@ -599,8 +621,24 @@ class WorkerManager:
         file from an old generation can't produce a false pass here.
         """
         snapshot_path = worker.hermes_home / _TOOLS_SNAPSHOT_FILE_NAME
-        while not snapshot_path.exists():
-            await asyncio.sleep(_TOOLS_SNAPSHOT_POLL_INTERVAL_S)
+        budget_s = max(0.1, self._startup_timeout_s - _TOOLS_SNAPSHOT_TIMEOUT_RESERVE_S)
+        t0 = time.monotonic()
+
+        async def _poll() -> None:
+            while not snapshot_path.exists():
+                await asyncio.sleep(_TOOLS_SNAPSHOT_POLL_INTERVAL_S)
+
+        try:
+            await asyncio.wait_for(_poll(), timeout=budget_s)
+        except TimeoutError as exc:
+            elapsed = time.monotonic() - t0
+            raise WorkerStartupError(
+                f"timed out after {elapsed:.1f}s waiting for {snapshot_path} to "
+                "appear — jones_gate's on_session_start hook never wrote it, which "
+                "means the plugin likely never loaded (HERMES_SAFE_MODE? the plugin "
+                "directory failed to write under HERMES_HOME? the worker crashed "
+                "before handling its first prompt?)"
+            ) from exc
 
     async def _probe_second_layer(self, worker: Worker) -> None:
         """Optional SECOND self-check layer (Issue #38 ruling 2) — see

@@ -110,7 +110,7 @@ async def test_startup_self_check_rejects_a_worker_whose_plugin_never_loaded_at_
     manager = _make_manager(tmp_path, startup_timeout_s=1.0)
     await manager.start()
     try:
-        with pytest.raises(WorkerStartupError, match="self-check failed"):
+        with pytest.raises(WorkerStartupError, match="on_session_start hook never wrote it"):
             await manager.ensure_started("s1", cwd="/tmp")
         assert manager.get("s1") is None
     finally:
@@ -130,7 +130,7 @@ async def test_startup_self_check_rejects_a_worker_with_unverified_probe_and_no_
     manager = _make_manager(tmp_path, startup_timeout_s=1.0)
     await manager.start()
     try:
-        with pytest.raises(WorkerStartupError, match="self-check failed"):
+        with pytest.raises(WorkerStartupError, match="on_session_start hook never wrote it"):
             await manager.ensure_started("s1", cwd="/tmp")
         assert manager.get("s1") is None
     finally:
@@ -150,7 +150,7 @@ async def test_startup_self_check_rejects_a_worker_whose_tools_snapshot_never_ap
     manager = _make_manager(tmp_path, startup_timeout_s=1.0)
     await manager.start()
     try:
-        with pytest.raises(WorkerStartupError, match="self-check failed"):
+        with pytest.raises(WorkerStartupError, match="on_session_start hook never wrote it"):
             await manager.ensure_started("s1", cwd="/tmp")
         assert manager.get("s1") is None
     finally:

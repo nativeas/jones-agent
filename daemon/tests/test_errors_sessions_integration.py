@@ -25,8 +25,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from jones_daemon.context import DaemonContext, NullConfigResolver
 from jones_daemon.context import ProviderResolver as ProviderResolverProtocol
 from jones_daemon.errors.classify import ErrorKind
@@ -1091,28 +1089,6 @@ async def test_retry_unknown_turn_id_is_not_found(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Issue #39 (filed independently, confirmed by its own author to reproduce "
-        "on unmodified code — 'main 现在因此红'): sessions/service.py::stop() only "
-        "pins the termination intent and sends ACP cancel when "
-        "worker_manager.get(session_id) is already non-None, but `send()` marks the "
-        "Turn active in `_active_turns` well BEFORE `_run_turn` ever calls "
-        "`ensure_started()` — a stop() that lands while the worker is still spawning "
-        "silently no-ops (returns {'stopped': True} anyway) and the queued Turn runs "
-        "to completion uncancelled. This was always a real race, just narrow enough "
-        "with the OLD single-round-trip self-check to pass here by luck most of the "
-        "time. Issue #38's fail-closed self-check (this branch) necessarily takes "
-        "one more real IPC round trip than before (`_wait_for_tools_snapshot` polls "
-        "a file the worker must itself write) — source-verified NOT to be a tunable "
-        "poll-interval artifact (still reproduces 4/5 runs even at a 5ms interval, "
-        "see the w7/38 PR report) — which widens this pre-existing window enough to "
-        "hit it deterministically instead of intermittently. Fixing stop()'s own "
-        "race is issue #39's dedicated scope (a sibling worktree already exists for "
-        "it); out of bounds for this branch. Remove this xfail once #39 lands."
-    ),
-    strict=False,
-)
 async def test_user_stop_suspends_the_queue_instead_of_auto_advancing(tmp_path, monkeypatch):
     service = await _make_service(tmp_path, monkeypatch)
     await service.worker_manager.start()
