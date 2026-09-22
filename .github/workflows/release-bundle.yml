@@ -16,13 +16,20 @@ name: Release Bundle
 # 交叉编译 target，链接阶段失败——已实测复现，不是理论推测。降版本绕开这个
 # pin 又被 hermes-agent 自己的 `cryptography==50.0.0` exact pin 挡死（见
 # Issue #36 讨论）。唯一确认可行的路径是在原生架构的机器上直接编译：
-#   - macos-13 runner 是原生 x86_64（GitHub 托管镜像自带 Rust 工具链），
-#     用来原生构建 x64 bundle；
-#   - macos-14 runner 是原生 arm64，同样原生构建 arm64 bundle（此前只在本地
-#     arm64 开发机上验证过，这里是它第一次在 CI 上跑）。
+#   - x86_64 腿用 `macos-15-intel`（原生 x86_64 标准 runner，公开仓库免费）
+#     ——Issue #36 原文与 docs/release.md §2.2 写的是 `macos-13`，本分支
+#     实测发现它已于 2025-12 被 GitHub 完全退役（不是"排队慢"，是这个标签
+#     底下已经没有 runner 了：`macos-13` job 排队 20+ 分钟不会分配到任何
+#     runner，取消重跑到 `macos-15-intel` 上才真正跑起来，见本分支报告
+#     「实测记录」一节）。`macos-15-intel` 是 GitHub 给 macos-13 退役后
+#     指定的替代标签，同样是原生 x86_64、同样是标准 runner（不是要收费的
+#     `-large`/`-xlarge` larger-runner SKU）。
+#   - arm64 腿用 `macos-14`，原生 arm64（此前只在本地 arm64 开发机上验证过，
+#     这里是它第一次在 CI 上跑）。
 # `scripts/release/build-daemon-bundle.sh` 已经按「目标架构 == 主机架构则不传
 # --python-platform」改造（原生就该原生装，不借交叉安装的路径伪装），所以两个
-# job 跑的是同一份脚本、同一条命令，没有额外的分支逻辑。
+# job 跑的是同一份脚本、同一条命令，没有额外的分支逻辑。每个 job 开头都先打印
+# `uname -m` 实际验证 runner 架构，不只是信标签名字。
 
 on:
   workflow_dispatch:
@@ -51,7 +58,7 @@ jobs:
       matrix:
         include:
           - arch: x64
-            runner: macos-13
+            runner: macos-15-intel
           - arch: arm64
             runner: macos-14
     runs-on: ${{ matrix.runner }}
@@ -72,9 +79,16 @@ jobs:
       - name: Install Python 3.12
         run: uv python install 3.12
 
-      # macos-13/macos-14 的 GitHub 托管镜像按文档自带 Rust 工具链，这一步只是
-      # 兜底——镜像清单会变，`cryptography` 的 sdist 构建（x64 腿的必经路径，
-      # 见工作流顶部注释）离了 cargo/rustc 直接失败，不能悄悄跳过。
+      # 实际验证 runner 架构，不只是信 `runs-on` 标签名字——本分支就是因为
+      # 标签名字（`macos-13`）已经名存实亡才踩了一次坑，见工作流顶部注释。
+      - name: Report runner architecture
+        run: |
+          uname -a
+          echo "uname -m: $(uname -m)"
+
+      # macos-15-intel/macos-14 的 GitHub 托管镜像按文档自带 Rust 工具链，这
+      # 一步只是兜底——镜像清单会变，`cryptography` 的 sdist 构建（x64 腿的
+      # 必经路径，见工作流顶部注释）离了 cargo/rustc 直接失败，不能悄悄跳过。
       - name: Ensure Rust toolchain (cryptography sdist build needs cargo)
         run: |
           if ! command -v cargo >/dev/null 2>&1; then
