@@ -159,6 +159,31 @@ async def test_capability_list_no_drift_when_a_hidden_tool_loaded_anyway(ctx):
     assert by_name["terminal"]["enabled"] is False
 
 
+async def test_capability_list_treats_null_tools_same_as_a_missing_snapshot(ctx):
+    """Round-1 review finding #4: `_tools_snapshot.py`'s `on_session_start` hook
+    now always writes `jones_tools.json` once `jones_gate` loaded (Issue #38's
+    fail-closed startup gate only checks the file's existence), but writes
+    `tools: null` when the tool list itself couldn't be computed (an unrelated
+    Hermes-side failure) — `capability.list` must degrade exactly like the file
+    never existed at all, not crash or report an empty/drifted tool set."""
+    from jones_daemon.permissions import gate_config
+
+    await run_in_db_thread(_insert_session, ctx.db, "s1", mode="task")
+    hermes_home = gate_config.hermes_home_for(ctx.paths.user_root(), "s1")
+    hermes_home.mkdir(parents=True)
+    (hermes_home / "jones_tools.json").write_text(
+        json.dumps({
+            "session_id": "s1", "tools": None,
+            "tools_unavailable_reason": "ImportError: model_tools",
+            "mcp_servers": None,
+        }),
+        encoding="utf-8",
+    )
+    result = await run_in_db_thread(_build_result, ctx, "s1")
+    assert result["actual_available"] is False
+    assert result["drift"] == []
+
+
 async def test_capability_list_reads_real_jones_tools_json_and_reports_real_drift(ctx):
     """The direction R-H1 keeps: a tool expected ENABLED (in the Agent's
     whitelist) that the worker never actually loaded at all."""

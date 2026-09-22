@@ -46,6 +46,23 @@ _GATE_BLOCK_MARKER = "jones_gate startup self-check: this tool is reserved and n
 
 _JONES_GATE_SRC = Path(__file__).resolve().parent.parent / "kernel" / "plugin" / "jones_gate"
 
+# Kept in sync by hand with kernel/plugin/jones_gate/_tools_snapshot.py's `_FILE_NAME`
+# (same reason PROBE_TOOL_NAME/`_GATE_BLOCK_MARKER` are duplicated, not imported,
+# above — that package ships into the worker's own Python environment). Issue #38
+# primary self-check criterion — see `_wait_for_tools_snapshot`'s docstring.
+_TOOLS_SNAPSHOT_FILE_NAME = "jones_tools.json"
+_TOOLS_SNAPSHOT_POLL_INTERVAL_S = 0.05
+
+# `_wait_for_tools_snapshot` needs its OWN timeout, strictly less than
+# `self._startup_timeout_s`, so its fail-closed rejection carries a specific,
+# actionable reason instead of the bare, empty-message `TimeoutError()` that
+# results when it's only ever cancelled from OUTSIDE by `_spawn_and_check`'s
+# outer `asyncio.wait_for` — see that method's docstring for the production
+# symptom this was fixed for. Same reasoning as `_PROBE_BUDGET_S` below: the
+# reserve just has to comfortably outlast this method's own cleanup so its
+# `WorkerStartupError` propagates before the outer cutoff would instead.
+_TOOLS_SNAPSHOT_TIMEOUT_RESERVE_S = 1.0
+
 # PRD 9.2 "空闲超时（默认 10 min）回收".
 DEFAULT_IDLE_TIMEOUT_S = 600.0
 _IDLE_SCAN_INTERVAL_S = 30.0
@@ -55,6 +72,18 @@ _IDLE_SCAN_INTERVAL_S = 30.0
 # answers `initialize`), not the performance bar itself; see the report for measured
 # numbers against the fake test agent.
 DEFAULT_STARTUP_TIMEOUT_S = 20.0
+
+# Round-1 review findings #1/#6: the diagnostic-only second-layer probe (below)
+# used to share `DEFAULT_STARTUP_TIMEOUT_S` with the OUTER `asyncio.wait_for`
+# wrapping the whole self-check in `_spawn_and_check` — identical durations
+# meant the probe's own inner timeout could never fire first (the outer's
+# deadline was always registered earlier), so delivering an already-proven-safe
+# worker sat waiting for a real model to finish an entire Turn (measured: 9-12s
+# beyond the primary tools-snapshot check passing against a real DeepSeek
+# worker, occasionally exceeding `DEFAULT_STARTUP_TIMEOUT_S` outright and
+# rejecting a worker for no reason but a slow diagnostic). This budget is
+# deliberately its own, separate, much smaller constant.
+_PROBE_BUDGET_S = 3.0
 
 _PROBE_PROMPT = (
     "[jones-daemon automated startup self-check — not a real user request] "
@@ -453,33 +482,259 @@ class WorkerManager:
         return _collect
 
     async def _startup_self_check(self, worker: Worker) -> None:
-        """§8.1: prove `jones_gate` is actually loaded before this worker is handed
-        to a real session. Sends a directive prompt asking the model to call the
-        reserved, always-blocked probe tool, then inspects the `session/update`
-        events collected during that prompt for a blocked (never a completed) call
-        to it. See the PR report for this mechanism's real-Hermes reliability
-        caveat — it is fully deterministic against the fake test agent used in
-        every non-`JONES_E2E` test.
+        """§8.1 fail-closed startup self-check — restructured per Issue #38's
+        controller ruling into two layers, because the original sole criterion
+        (the probe prompt, now `_probe_second_layer` below) turned out to depend
+        on a model *choosing* to cooperate: 100% reproducible failure against a
+        real DeepSeek worker, which never calls the probe tool no matter how the
+        prompt is worded, even though `jones_gate` was loaded correctly the whole
+        time. A fail-closed invariant can't rest on that.
+
+        1. PRIMARY, fail-closed (`_wait_for_tools_snapshot`): poll for
+           `<HERMES_HOME>/jones_tools.json`, written by `jones_gate`'s own
+           `on_session_start` hook. The file's mere existence is proof the
+           plugin loaded, produced by the plugin itself with zero MODEL
+           participation. This alone decides whether the worker is delivered;
+           still catches the `HERMES_SAFE_MODE`-style "plugin silently never
+           loaded at all" case this self-check exists for, since that hook
+           then never runs either.
+        2. SECOND layer (`_probe_second_layer`): the original probe mechanism,
+           kept to additionally verify `jones_gate`'s *block* semantics are
+           actually enforcing (not just "loaded"). An uncooperative model (or
+           any other outcome short of the reserved probe tool actually
+           running) is diagnostic-only and never blocks delivery — but a
+           verdict of "completed" (the tool ran instead of being blocked) is
+           POSITIVE evidence the gate isn't enforcing despite being loaded,
+           and still fail-closed rejects this worker (round-1 review findings
+           #2/#5 — see `_probe_second_layer`'s own docstring; this is the one
+           way this "optional" layer can still raise `WorkerStartupError`).
+
+        **Round-1 review findings #1/#3/#6/#7 — this method itself no longer
+        only calls out to the two layers above and returns; it now also (a)
+        bounds how long the second layer's diagnostic prompt can delay
+        delivery, independent of the model actually finishing its Turn, and
+        (b) confirms the worker process is still alive before ever handing it
+        back — see the inline comments below this docstring for both; kept
+        out of this docstring itself so the mechanics stay next to the code
+        they describe instead of drifting out of sync with it again.**
+
+        **Why these two run CONCURRENTLY, not sequentially (correction to
+        00-foundation.md §8.1's original text and this Issue's own "顺带确认"
+        note — both wrong about this one specific hook, verified against the
+        installed hermes-agent==0.21.2 checkout)**: `on_session_start` does
+        NOT fire at `session/new`/`AIAgent` construction. Source: `agent/
+        conversation_loop.py`'s `invoke_hook("on_session_start", ...)` call
+        sits inside the FIRST TURN's system-prompt-build step — i.e. it only
+        fires as a side effect of the daemon actually sending a
+        `session/prompt`, before the model is called but strictly after a
+        prompt was sent. A real run against DeepSeek confirmed this
+        empirically: sequentially awaiting the snapshot BEFORE sending the
+        probe prompt hangs forever (`jones_tools.json` never appears, because
+        nothing ever triggers the hook) — see the PR report. Sending A prompt
+        is therefore a REQUIRED trigger for the primary check, not merely
+        nice-to-have for the optional second layer — but this is still zero
+        MODEL participation (ruling 1's actual requirement): the daemon
+        itself unconditionally sends this one prompt regardless of what any
+        model does with it, so a model refusing to call the probe tool still
+        can't stop `jones_tools.json` from appearing. `_probe_second_layer`
+        therefore runs as a background task, started before the primary wait
+        and always awaited afterward (never fire-and-forget) — it must finish
+        before this method returns, because `_spawn_and_check` swaps `worker.
+        session_update_handler` from the startup collector to the real,
+        production handler the moment this method returns; a still-in-flight
+        probe response arriving after that swap would be misrouted to
+        `SessionService` instead of collected here.
         """
         assert worker.client is not None and worker.acp_session_id is not None  # noqa: S101
-        await worker.client.prompt(worker.acp_session_id, _PROBE_PROMPT)
+        probe_task = asyncio.create_task(self._probe_second_layer(worker))
+        try:
+            await self._wait_for_tools_snapshot(worker)
+        except BaseException:
+            # Primary failed (fail-closed timeout) or this whole self-check is
+            # being cancelled out from under us (the OUTER `wait_for` in
+            # `_spawn_and_check` timing out) — this worker is being rejected/
+            # torn down regardless of what the probe would show, so don't
+            # leave its prompt running against a worker we're about to kill.
+            probe_task.cancel()
+            with contextlib.suppress(BaseException):
+                await probe_task
+            raise
+        # Primary passed: `jones_gate` is proven loaded with zero model
+        # participation. `probe_task` is still awaited here (round-1 review
+        # finding #1's second option, not full decoupling — see its own
+        # docstring for why: `AcpClient.prompt()` has no client-side deadline,
+        # and a REAL second `session/prompt` for this same ACP session must
+        # never be sent while this one is still in flight, which is exactly
+        # what `_spawn_and_check` swapping `worker.session_update_handler` to
+        # the production handler before this straggling prompt's `session/
+        # update`s stop arriving would risk) — but `_probe_second_layer` now
+        # bounds ITSELF to `_PROBE_BUDGET_S`, not `self._startup_timeout_s`,
+        # so this can only add a small, fixed delay, never the whole Turn.
+        # May raise `WorkerStartupError` itself (round-1 review findings #2/#5
+        # — a "completed" verdict, below).
+        await probe_task
+        # Round-1 review findings #3/#7: `_probe_second_layer` deliberately
+        # treats a dead ACP connection as "probe couldn't run" (diagnostic, not
+        # fatal — see its own docstring), since a worker merely slow to answer
+        # the OPTIONAL probe must never block delivery. But a worker whose
+        # PROCESS has actually died during this self-check — even after
+        # writing a valid tools snapshot first — must never be delivered or
+        # registered. `process.wait()` normally resolves instantly here (the
+        # same OS notification that closed stdout, which is what unblocked
+        # `probe_task` above with an `AcpProtocolError`, already fired); the
+        # short bound below only covers the rare race where the child-exit
+        # notification hasn't landed in this event loop iteration yet.
+        if worker.process.returncode is None:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(worker.process.wait(), timeout=0.5)
+        if worker.process.returncode is not None:
+            raise WorkerStartupError(
+                "worker process exited unexpectedly during startup self-check "
+                f"(returncode={worker.process.returncode})"
+            )
+
+    async def _wait_for_tools_snapshot(self, worker: Worker) -> None:
+        """PRIMARY self-check criterion (Issue #38 ruling 1) — see
+        `_startup_self_check`'s docstring, including why this only ever
+        resolves once the concurrent `_probe_second_layer` has actually sent
+        its prompt. Polls for `<HERMES_HOME>/jones_tools.json` to appear.
+
+        Bounded to its OWN budget (`self._startup_timeout_s` minus
+        `_TOOLS_SNAPSHOT_TIMEOUT_RESERVE_S`), not merely the OUTER
+        `asyncio.wait_for(..., self._startup_timeout_s)` in `_spawn_and_check`
+        that used to be the only thing bounding this loop. Relying solely on
+        that outer wait_for produced a fail-closed rejection with an EMPTY
+        reason in practice: cancelling this coroutine from outside raises a
+        bare `TimeoutError()` (no args), so the final `WorkerStartupError`
+        message (`_spawn_and_check`'s `f"worker startup self-check failed:
+        {exc}"`) came out as `worker startup self-check failed: ` — a real
+        user-facing error card with no clue what went wrong. This method now
+        owns its own timeout and raises a `WorkerStartupError` with a
+        specific, actionable reason instead — strictly less than the outer
+        bound so it always fires (and its message survives) before that blunt
+        outer cutoff would instead; same reasoning as `_PROBE_BUDGET_S`
+        above.
+
+        `_prepare_hermes_home` already deleted any stale snapshot left by a
+        PREVIOUS worker generation for this same `hermes_home` before this
+        worker was even spawned (see that function's comment), so a leftover
+        file from an old generation can't produce a false pass here.
+        """
+        snapshot_path = worker.hermes_home / _TOOLS_SNAPSHOT_FILE_NAME
+        budget_s = max(0.1, self._startup_timeout_s - _TOOLS_SNAPSHOT_TIMEOUT_RESERVE_S)
+        t0 = time.monotonic()
+
+        async def _poll() -> None:
+            while not snapshot_path.exists():
+                await asyncio.sleep(_TOOLS_SNAPSHOT_POLL_INTERVAL_S)
+
+        try:
+            await asyncio.wait_for(_poll(), timeout=budget_s)
+        except TimeoutError as exc:
+            elapsed = time.monotonic() - t0
+            raise WorkerStartupError(
+                f"timed out after {elapsed:.1f}s waiting for {snapshot_path} to "
+                "appear — jones_gate's on_session_start hook never wrote it, which "
+                "means the plugin likely never loaded (HERMES_SAFE_MODE? the plugin "
+                "directory failed to write under HERMES_HOME? the worker crashed "
+                "before handling its first prompt?)"
+            ) from exc
+
+    async def _probe_second_layer(self, worker: Worker) -> None:
+        """Optional SECOND self-check layer (Issue #38 ruling 2) — see
+        `_startup_self_check`'s docstring, including why THIS is what actually
+        triggers the primary layer's file to ever appear. Sends the same
+        directive prompt the old sole self-check used, asking the model to
+        call the reserved, always-blocked probe tool, and evaluates what the
+        `session/update` events collected during that prompt show.
+
+        Bounded to `_PROBE_BUDGET_S` (round-1 review findings #1/#6), NOT
+        `self._startup_timeout_s` — a separate, much smaller, independent
+        budget, so this one extra, optional prompt can never make delivering
+        an already-proven-safe worker wait for an entire model Turn (measured:
+        9-12s beyond the primary check passing, against a real DeepSeek
+        worker). On that budget expiring, this sends a real `session/cancel`
+        (round-1 review finding #6: the old code shared ITS inner timeout's
+        duration with, and registered it after, the OUTER `wait_for` around
+        the whole self-check in `_spawn_and_check` — so the inner one could
+        never fire first, and even if it somehow had, it only abandoned the
+        local await without ever telling the worker subprocess to actually
+        stop the Turn) — then still evaluates whatever verdict the `session/
+        update` events observed SO FAR show, since those are collected in
+        real time as they arrive (`_collect_startup_update`), independent of
+        whether `prompt()` itself ever resolves: a model that calls the
+        reserved tool typically does so near the start of its Turn (the
+        directive prompt asks for nothing else), well inside this budget,
+        even when it goes on to generate filler text for much longer
+        afterward.
+
+        Raises `WorkerStartupError` — the one way this "optional" layer still
+        fail-closed rejects a worker the primary layer already passed — only
+        for a "completed" verdict (round-1 review findings #2/#5): the
+        reserved probe tool actually RUNNING instead of being blocked is
+        positive, vendor-agnostic evidence `jones_gate`'s block semantics
+        aren't enforcing even though the plugin loaded (00-foundation.md
+        §8.1's actual reason this second layer exists at all — "断言收到的是
+        插件产生的拒绝结果而不是工具直接执行的结果"). Every other outcome
+        (blocked, failed-but-unverified, no call observed at all, the
+        connection itself failing) stays diagnostic-only — logged, never
+        raised — since none of those is evidence the gate is broken, only
+        that this one extra prompt was inconclusive.
+        """
+        assert worker.client is not None and worker.acp_session_id is not None  # noqa: S101
+        detail: dict[str, Any] = {"session_id": worker.session_id}
+        try:
+            await asyncio.wait_for(
+                worker.client.prompt(worker.acp_session_id, _PROBE_PROMPT),
+                timeout=_PROBE_BUDGET_S,
+            )
+        except TimeoutError:
+            with contextlib.suppress(AcpProtocolError):
+                await worker.client.cancel(worker.acp_session_id)
+            logger.info(
+                "startup self-check second-layer probe did not finish within its "
+                f"own {_PROBE_BUDGET_S:.1f}s budget (independent of the overall "
+                "startup timeout) — sent session/cancel and evaluating whatever "
+                "session/update events it produced so far",
+                extra={"detail": detail},
+            )
+        except (AcpError, AcpProtocolError) as exc:
+            logger.info(
+                "startup self-check second-layer probe could not run (error on this "
+                "one extra, optional prompt) — primary tools-snapshot check already "
+                "passed, delivering this worker regardless",
+                extra={"detail": {**detail, "error": str(exc)}},
+            )
+            return
         verdicts = {v for v in (_probe_event_verdict(u) for u in worker.startup_updates) if v}
         if "completed" in verdicts:
             raise WorkerStartupError(
                 f"{PROBE_TOOL_NAME} ran to completion instead of being blocked — "
                 "jones_gate is not enforcing (HERMES_SAFE_MODE? plugin failed to load?)"
             )
-        if "blocked" not in verdicts:
-            detail = (
-                f" — {PROBE_TOOL_NAME} failed, but without jones_gate's own block "
-                "marker; most likely Hermes reporting 'unknown tool' because the "
-                "plugin (and therefore the probe tool registration) never loaded"
-                if "failed_unverified" in verdicts
-                else ""
+        if "blocked" in verdicts:
+            logger.info(
+                "startup self-check second-layer probe confirmed jones_gate's block "
+                "semantics are enforcing",
+                extra={"detail": detail},
             )
-            raise WorkerStartupError(
-                f"no verified-blocked {PROBE_TOOL_NAME} tool_call observed during "
-                f"self-check — cannot confirm jones_gate is loaded{detail}"
+        elif "failed_unverified" in verdicts:
+            logger.warning(
+                f"startup self-check second-layer probe: {PROBE_TOOL_NAME} failed but "
+                "without jones_gate's own block marker — inconclusive (primary "
+                "tools-snapshot check already passed; delivering this worker "
+                "regardless)",
+                extra={"detail": detail},
+            )
+        else:
+            # No probe tool_call event observed at all — the model simply
+            # didn't cooperate (Issue #38: reproducibly true for DeepSeek).
+            # Per the controller's ruling this must never block delivery.
+            logger.info(
+                f"startup self-check second-layer probe: model did not call "
+                f"{PROBE_TOOL_NAME} (non-cooperative model — primary tools-snapshot "
+                "check already passed, delivering this worker regardless)",
+                extra={"detail": detail},
             )
 
     async def _terminate(self, worker: Worker, *, reason: str) -> None:

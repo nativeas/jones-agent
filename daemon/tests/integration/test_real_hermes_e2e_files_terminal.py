@@ -28,6 +28,7 @@ docs/design/03-w4-interfaces.md §3 names ("核对 Hermes 用哪个工具遍历�
 
 from __future__ import annotations
 
+import json
 import os
 import time
 
@@ -44,16 +45,57 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# Captured at import time, BEFORE any test monkeypatches `manager_module.
+# _prepare_hermes_home` — bugfix, real-Hermes verification (this file was
+# never actually run against a real model before now, per its own module
+# docstring): `_with_model_config` used to look up `manager_module.
+# _prepare_hermes_home` dynamically from inside its own body instead, which —
+# once a test patches that name TO `_with_model_config` itself — resolves to
+# itself and recurses infinitely. `test_real_hermes_e2e.py`'s equivalent
+# closure (`real_prepare` captured as a local before patching) doesn't have
+# this bug; this module-level version needs the same one-time capture.
+_REAL_PREPARE_HERMES_HOME = manager_module._prepare_hermes_home
+
+
 def _with_model_config(hermes_home, **kwargs):
     """Same monkeypatch `test_real_hermes_e2e.py` uses — `_prepare_hermes_home`
     doesn't yet wire a real provider Key into a worker's `config.yaml` (see
     that file's own docstring); this appends the anthropic block
-    01-w2-interfaces.md §3.1 documents."""
-    real_prepare = manager_module._prepare_hermes_home
-    real_prepare(hermes_home, **kwargs)
+    01-w2-interfaces.md §3.1 documents.
+
+    Second, previously-undiscovered gap found while first actually running
+    this file against a real model (Issue #38 fixed the self-check that used
+    to block every real-Hermes E2E run before it got this far — see the PR
+    report): `WorkerManager` alone never writes `<HERMES_HOME>/jones_gate.json`
+    either (that's `permissions/gate_config.py::build`, called from
+    `SessionService.send()`, which none of these `WorkerManager`-only E2E
+    tests ever go through — same "documented gap this test works around"
+    shape as the model-config block above, just not yet documented). Without
+    it, `kernel/plugin/jones_gate/_config.py::load()` returns `FAIL_CLOSED`
+    and `_decide()` blocks EVERY tool call, not just the startup probe (PRD
+    5.5's fail-closed default) — confirmed against a real DeepSeek worker:
+    the model correctly reported a tool failure result back to the user
+    ("a safety gate... failing closed") rather than silently doing nothing,
+    it just never got to actually write a file. A minimal, permissive config
+    (`mode: "task"`, everything else empty/unrestricted) is enough for these
+    tests, which only care whether the TOOLS themselves work end-to-end —
+    FR05's actual gate behavior has its own dedicated coverage elsewhere in
+    this test suite."""
+    _REAL_PREPARE_HERMES_HOME(hermes_home, **kwargs)
     config_path = hermes_home / "config.yaml"
     with config_path.open("a", encoding="utf-8") as fh:
         fh.write(_provider_gate.model_config_block())
+    gate_config = {
+        "mode": "task",
+        "user_root": str(hermes_home),
+        "project_permissions_path": None,
+        "rules": [],
+        "rules_degraded": False,
+        "tool_allowlist": [],
+    }
+    (hermes_home / "jones_gate.json").write_text(
+        json.dumps(gate_config), encoding="utf-8"
+    )
 
 
 async def _make_manager(tmp_path, *, startup_timeout_s: float = 30.0) -> WorkerManager:

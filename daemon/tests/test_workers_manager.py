@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -94,10 +95,99 @@ async def test_worker_subprocess_env_never_carries_yolo_or_safe_mode(tmp_path, m
     assert env["HERMES_HOME"] == str(tmp_path / "hermes_home")
 
 
-async def test_startup_self_check_rejects_a_worker_whose_probe_completes(tmp_path, monkeypatch):
-    # Simulates jones_gate having silently failed to load (HERMES_SAFE_MODE) —
-    # the probe tool ran to completion instead of being blocked.
+async def test_startup_self_check_rejects_a_worker_whose_plugin_never_loaded_at_all(
+    tmp_path, monkeypatch
+):
+    """Issue #38 ruling 1/3: a `HERMES_SAFE_MODE`-style "plugin skipped loading
+    entirely" must still be caught, fail-closed, by the PRIMARY (tools-snapshot)
+    self-check layer — `probe_completes` mode simulates exactly that (jones_gate
+    never loaded, so neither its block hook nor its `on_session_start` snapshot
+    write ran; see `fake_acp_agent.py`'s module docstring), and never writes
+    `jones_tools.json`. The self-check must time out waiting for that file and
+    refuse to deliver this worker, regardless of what the now-optional probe
+    layer would have shown."""
     monkeypatch.setenv("FAKE_ACP_MODE", "probe_completes")
+    manager = _make_manager(tmp_path, startup_timeout_s=1.0)
+    await manager.start()
+    try:
+        with pytest.raises(WorkerStartupError, match="on_session_start hook never wrote it"):
+            await manager.ensure_started("s1", cwd="/tmp")
+        assert manager.get("s1") is None
+    finally:
+        await manager.stop()
+
+
+async def test_startup_self_check_rejects_a_worker_with_unverified_probe_and_no_snapshot(
+    tmp_path, monkeypatch
+):
+    """Same PRIMARY-layer refusal as above, via `probe_fails_unverified` mode —
+    another "plugin never loaded" simulation (Hermes fails the probe call as an
+    unknown tool because it was never registered) that also never writes
+    `jones_tools.json`. Confirms the primary layer's fail-closed timeout is
+    what's actually rejecting the worker, independent of which probe outcome
+    accompanies the missing snapshot."""
+    monkeypatch.setenv("FAKE_ACP_MODE", "probe_fails_unverified")
+    manager = _make_manager(tmp_path, startup_timeout_s=1.0)
+    await manager.start()
+    try:
+        with pytest.raises(WorkerStartupError, match="on_session_start hook never wrote it"):
+            await manager.ensure_started("s1", cwd="/tmp")
+        assert manager.get("s1") is None
+    finally:
+        await manager.stop()
+
+
+async def test_startup_self_check_rejects_a_worker_whose_tools_snapshot_never_appears(
+    tmp_path, monkeypatch
+):
+    """Issue #38 ruling 1/3, isolated: the PRIMARY layer alone must fail-closed
+    when `jones_tools.json` never appears, even when the optional probe layer
+    would otherwise look completely fine (`no_tools_snapshot` mode blocks the
+    probe correctly, same as "normal" — it just never writes the snapshot
+    file). Proves the tools-snapshot check, not the probe, is what's doing the
+    rejecting here."""
+    monkeypatch.setenv("FAKE_ACP_MODE", "no_tools_snapshot")
+    manager = _make_manager(tmp_path, startup_timeout_s=1.0)
+    await manager.start()
+    try:
+        with pytest.raises(WorkerStartupError, match="on_session_start hook never wrote it"):
+            await manager.ensure_started("s1", cwd="/tmp")
+        assert manager.get("s1") is None
+    finally:
+        await manager.stop()
+
+
+async def test_startup_self_check_delivers_a_worker_even_when_the_model_never_calls_the_probe(
+    tmp_path, monkeypatch
+):
+    """Issue #38 ruling 2 — the central scenario the whole fix is about: a
+    model that doesn't cooperate with the optional second-layer probe (here,
+    `no_probe_call` mode: no tool_call event at all for it) must NOT block
+    delivery once the PRIMARY layer has already proved `jones_gate` loaded
+    (`jones_tools.json` is written normally in this mode). Real DeepSeek
+    reproduces exactly this "no probe tool_call ever observed" shape 100% of
+    the time (see the PR report) — this is the regression test for that."""
+    monkeypatch.setenv("FAKE_ACP_MODE", "no_probe_call")
+    manager = _make_manager(tmp_path)
+    await manager.start()
+    try:
+        worker = await manager.ensure_started("s1", cwd="/tmp")
+        assert worker.acp_session_id == "fake-session-1"
+    finally:
+        await manager.stop()
+
+
+async def test_startup_self_check_rejects_a_worker_whose_probe_ran_to_completion(
+    tmp_path, monkeypatch
+):
+    """Round-1 review findings #2/#5: the primary tools-snapshot layer passing
+    is necessary but not sufficient. `gate_not_enforcing` mode writes
+    `jones_tools.json` normally (jones_gate genuinely loaded) but still
+    reports the reserved probe tool running to *completion* instead of being
+    blocked — positive, vendor-agnostic evidence the gate isn't enforcing.
+    That must still fail-closed reject this worker, even though it's the
+    "optional" second layer that catches it."""
+    monkeypatch.setenv("FAKE_ACP_MODE", "gate_not_enforcing")
     manager = _make_manager(tmp_path)
     await manager.start()
     try:
@@ -108,35 +198,52 @@ async def test_startup_self_check_rejects_a_worker_whose_probe_completes(tmp_pat
         await manager.stop()
 
 
-async def test_startup_self_check_rejects_a_failed_probe_without_the_gate_marker(
+async def test_startup_self_check_rejects_a_worker_whose_process_dies_mid_check(
     tmp_path, monkeypatch
 ):
-    """Round-1 review fix: a `status: failed` probe event isn't by itself proof
-    jones_gate did the blocking — it's exactly what a *missing* plugin (probe
-    tool never registered at all, so Hermes fails the call as unknown) looks
-    like too. The self-check must refuse to deliver this worker, the same as
-    `probe_completes`, not treat "some failure happened" as good enough."""
-    monkeypatch.setenv("FAKE_ACP_MODE", "probe_fails_unverified")
+    """Round-1 review findings #3/#7: a worker whose process dies during the
+    self-check window — after already having written `jones_tools.json`, so
+    the primary layer alone would have "passed" — must never be delivered or
+    registered. `_probe_second_layer` deliberately treats the resulting dead
+    connection as merely "probe couldn't run" (diagnostic); something else in
+    `_startup_self_check` must still catch it."""
+    monkeypatch.setenv("FAKE_ACP_MODE", "dies_after_snapshot")
     manager = _make_manager(tmp_path)
     await manager.start()
     try:
-        with pytest.raises(WorkerStartupError, match="verified-blocked"):
+        with pytest.raises(WorkerStartupError, match="exited unexpectedly"):
             await manager.ensure_started("s1", cwd="/tmp")
         assert manager.get("s1") is None
     finally:
         await manager.stop()
 
 
-async def test_startup_self_check_rejects_a_worker_that_never_calls_the_probe(
+async def test_startup_self_check_delivers_a_worker_promptly_despite_a_slow_probe_turn(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setenv("FAKE_ACP_MODE", "no_probe_call")
-    manager = _make_manager(tmp_path, startup_timeout_s=1.0)
+    """Round-1 review findings #1/#6: once the primary tools-snapshot layer
+    has passed, delivering this worker must NOT wait for the diagnostic-only
+    probe's entire model Turn — bounded instead to its own small
+    `_PROBE_BUDGET_S` budget, independent of `startup_timeout_s`, with an
+    explicit `session/cancel` sent when that budget is exceeded (not just
+    abandoned — `slow_probe_response` mode holds its response open until
+    either that cancel arrives or a 10s safety net elapses, so a passing test
+    here is proof the cancel was actually sent, not just that some unrelated
+    timeout fired first)."""
+    from jones_daemon.workers.manager import _PROBE_BUDGET_S
+
+    monkeypatch.setenv("FAKE_ACP_MODE", "slow_probe_response")
+    manager = _make_manager(tmp_path, startup_timeout_s=20.0)
     await manager.start()
     try:
-        with pytest.raises(WorkerStartupError):
-            await manager.ensure_started("s1", cwd="/tmp")
-        assert manager.get("s1") is None
+        t0 = time.monotonic()
+        worker = await manager.ensure_started("s1", cwd="/tmp")
+        elapsed = time.monotonic() - t0
+        assert worker.acp_session_id == "fake-session-1"
+        # Well under the 10s safety net the fake agent falls back to if no
+        # cancel ever arrives, and under `startup_timeout_s` — proves this
+        # didn't just ride out the OUTER fail-closed timeout instead.
+        assert elapsed < _PROBE_BUDGET_S + 5.0
     finally:
         await manager.stop()
 
