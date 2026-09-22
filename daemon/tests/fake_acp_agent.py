@@ -241,17 +241,25 @@ _NEW_SESSION_CALLS_FILE_NAME = "_new_session_calls.json"
 _new_session_call_count = [0]  # boxed for the closure below, same pattern as `_next_id`
 
 
-def _record_new_session_call() -> None:
+def _record_new_session_call() -> int:
     """See module docstring's `_new_session_calls.json` entry. Best-effort, same
-    spirit as `_write_tools_snapshot` — must never crash this agent."""
+    spirit as `_write_tools_snapshot` — must never crash this agent. Returns the
+    running count so the caller can mint a session id that actually varies call
+    to call (round-2 review finding #3: a constant `"fake-session-1"` for every
+    call made `test_ensure_started_gets_a_fresh_session_for_production_use`
+    unable to tell "got a new session" apart from "got handed the self-check's
+    OWN session back" — the call-count assertion still passed with the
+    production-session hand-off line deleted entirely)."""
     _new_session_call_count[0] += 1
+    count = _new_session_call_count[0]
     home = os.environ.get("HERMES_HOME")
     if not home:
-        return
+        return count
     target = Path(home) / _NEW_SESSION_CALLS_FILE_NAME
     tmp = Path(home) / f"{_NEW_SESSION_CALLS_FILE_NAME}.tmp"
-    tmp.write_text(json.dumps({"count": _new_session_call_count[0]}), encoding="utf-8")
+    tmp.write_text(json.dumps({"count": count}), encoding="utf-8")
     tmp.replace(target)
+    return count
 
 
 _stdout_lock = threading.Lock()
@@ -629,8 +637,12 @@ def _dispatch_loop() -> None:
                     continue  # never respond — exercises the daemon's handshake timeout
                 _respond(req_id, {"protocolVersion": 1, "agentCapabilities": {}})
             elif method == "session/new":
-                _record_new_session_call()
-                result = {"sessionId": "fake-session-1"}
+                call_count = _record_new_session_call()
+                # A per-call-incrementing id (not a constant) so a test can
+                # actually distinguish "the self-check's own session" from
+                # "the fresh session `ensure_started()` hands to a caller" —
+                # see `_record_new_session_call`'s docstring.
+                result = {"sessionId": f"fake-session-{call_count}"}
                 if MODE == "session_new_non_default_mode":
                     result["modes"] = {"currentModeId": "accept_edits"}
                 _respond(req_id, result)

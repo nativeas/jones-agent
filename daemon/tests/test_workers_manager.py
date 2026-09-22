@@ -68,7 +68,11 @@ async def test_ensure_started_passes_self_check_and_isolates_hermes_home(tmp_pat
     await manager.start()
     try:
         worker = await manager.ensure_started("s1", cwd="/tmp")
-        assert worker.acp_session_id == "fake-session-1"
+        # "-2", not "-1": `ensure_started()` always requests a SECOND, fresh
+        # session for production use after the self-check's own session (the
+        # first `session/new` call) — see
+        # `test_ensure_started_gets_a_fresh_session_for_production_use` below.
+        assert worker.acp_session_id == "fake-session-2"
         # Round-2 review: moved under `runtime/` (PRD 10.2's `runtime/` entry
         # already documents "worker 注册表") instead of a new undocumented
         # top-level `workers/` sibling — see `paths.worker_home_dir`.
@@ -101,7 +105,17 @@ async def test_ensure_started_gets_a_fresh_session_for_production_use(tmp_path, 
     for the session actually returned as `worker.acp_session_id` — using the
     fake agent's `_new_session_calls.json` side channel (`fake_acp_agent.py`'s
     module docstring) since the fake agent has no notion of Hermes's
-    interrupted-prompt reattachment to assert on directly."""
+    interrupted-prompt reattachment to assert on directly.
+
+    Round-2 review finding #3: a call-count assertion alone doesn't prove the
+    SECOND session is the one actually handed to the caller — the fake agent
+    used to return the same constant `"fake-session-1"` for every `session/
+    new` call, so deleting the real production-session hand-off line
+    (`worker.acp_session_id = production_session["sessionId"]`) and keeping
+    only the extra `client.new_session(cwd)` call still passed this test
+    (verified: `1 passed` with that line removed). The fake agent's session
+    ids now increment per call (`fake-session-1`, `fake-session-2`, ...), so
+    asserting the id itself proves the hand-off, not just the call count."""
     monkeypatch.setenv("FAKE_ACP_MODE", "normal")
     manager = _make_manager(tmp_path)
     await manager.start()
@@ -114,6 +128,11 @@ async def test_ensure_started_gets_a_fresh_session_for_production_use(tmp_path, 
         assert json.loads(calls_file.read_text())["count"] == 2, (
             "ensure_started() must request a fresh session after the self-check's "
             "probe session, not hand out the probe's own session for production use"
+        )
+        assert worker.acp_session_id == "fake-session-2", (
+            "worker.acp_session_id must be the SECOND session/new call's result — "
+            "a passing call-count assertion alone can't tell 'requested a new "
+            "session' apart from 'requested one and threw its result away'"
         )
     finally:
         await manager.stop()
@@ -255,7 +274,9 @@ async def test_startup_self_check_delivers_a_worker_even_when_the_model_never_ca
     await manager.start()
     try:
         worker = await manager.ensure_started("s1", cwd="/tmp")
-        assert worker.acp_session_id == "fake-session-1"
+        # "-2": the self-check's own session ("-1") is never handed to the
+        # caller — see test_ensure_started_gets_a_fresh_session_for_production_use.
+        assert worker.acp_session_id == "fake-session-2"
     finally:
         await manager.stop()
 
@@ -322,7 +343,9 @@ async def test_startup_self_check_delivers_a_worker_promptly_despite_a_slow_prob
         t0 = time.monotonic()
         worker = await manager.ensure_started("s1", cwd="/tmp")
         elapsed = time.monotonic() - t0
-        assert worker.acp_session_id == "fake-session-1"
+        # "-2": the self-check's own session ("-1") is never handed to the
+        # caller — see test_ensure_started_gets_a_fresh_session_for_production_use.
+        assert worker.acp_session_id == "fake-session-2"
         # Well under the 10s safety net the fake agent falls back to if no
         # cancel ever arrives, and under `startup_timeout_s` — proves this
         # didn't just ride out the OUTER fail-closed timeout instead.

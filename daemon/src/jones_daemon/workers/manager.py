@@ -107,6 +107,20 @@ class Worker:
     session_id: str
     process: asyncio.subprocess.Process
     hermes_home: Path
+    # Recorded once, at spawn time (`_spawn_and_check`), where `start_new_
+    # session=True` makes it == `process.pid` — never re-derived later via
+    # `os.getpgid(process.pid)` at teardown time, which round-2 review found
+    # broken two ways: it throws `ProcessLookupError` the instant the LEADER
+    # is reaped even while other group members are still alive (POSIX:
+    # `getpgid` resolves one PROCESS's pgid, not "is this pgid still in
+    # use" — source-verified on macOS, see `_group_alive`'s docstring), and
+    # it was only ever consulted after the worker's OWN `process.wait()`
+    # already returned, so a worker that exited on its own (crash, or dying
+    # between `_watch_exit` observing it and any of this running) skipped
+    # group cleanup entirely. `None` only on Windows (no real process groups
+    # there, v1.0 is macOS-only per PRD 11 G18) or if spawning somehow never
+    # reached the point where this gets set.
+    pgid: int | None = None
     client: AcpClient | None = None
     acp_session_id: str | None = None
     busy: bool = False
@@ -149,30 +163,37 @@ def _worker_env(hermes_home: Path, extra_env: dict[str, str] | None = None) -> d
     return env
 
 
-def _signal_worker_group(process: asyncio.subprocess.Process, sig: int) -> None:
+def _signal_worker_group(pgid: int, sig: int) -> None:
     """G09 "无孤儿进程" (Issue #40 investigation): signal the worker's WHOLE
-    process group — spawned with `start_new_session=True` above specifically
-    so this is possible — not just its own PID. `Process.terminate()`/
+    process group — spawned with `start_new_session=True` specifically so
+    this is possible, `pgid` recorded on `Worker` at spawn time rather than
+    re-derived here (see `Worker.pgid`'s docstring for why re-deriving it via
+    `os.getpgid` at teardown time was broken). `Process.terminate()`/
     `.kill()` alone only ever reached the worker itself; any descendant still
     alive at that moment (Hermes's own terminal-tool child, mid-`killpg` in
     its OWN background thread when the daemon decides to tear the worker down
-    at the same time) was never guaranteed to go with it. `os.getpgid` on a
-    pid whose leader already exited but whose group still has live members
-    keeps working (POSIX: the pgid stays valid as long as any member is
-    alive) — this is what makes the SIGKILL escalation below still reach
-    stragglers even if the worker itself died first. Windows never gets here
-    with a real group (v1.0 is macOS-only, PRD 11 G18; `start_new_session`
-    isn't set there) so this falls back to the single-PID call `Process.
-    terminate`/`.kill()` already provided.
+    at the same time) was never guaranteed to go with it.
     """
-    if sys.platform == "win32":
-        (process.terminate if sig == signal.SIGTERM else process.kill)()
-        return
     try:
-        pgid = os.getpgid(process.pid)
         os.killpg(pgid, sig)
     except ProcessLookupError:
         pass  # already gone — nothing left to signal
+
+
+def _group_alive(pgid: int) -> bool:
+    """Whether process group `pgid` still has ANY live member. `os.killpg(
+    pgid, 0)` sends no real signal (0 performs only the existence/permission
+    check POSIX defines for `kill`/`killpg`) — a safe, side-effect-free poll.
+    Deliberately not `os.getpgid(some_specific_pid)`: that resolves ONE
+    process's pgid and throws `ProcessLookupError` the moment THAT process is
+    reaped, even while other members of the same group are still running —
+    verified broken on macOS (round-2 review finding #4; see the PR report's
+    round-2 section for the repro script)."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
 
 
 def _prepare_hermes_home(
@@ -461,6 +482,13 @@ class WorkerManager:
             raise WorkerStartupError(f"failed to spawn worker process: {exc}") from exc
 
         worker = Worker(session_id=session_id, process=process, hermes_home=hermes_home)
+        if sys.platform != "win32":
+            # `start_new_session=True` above makes the worker the leader of
+            # its own brand-new process group, so pgid == pid — known for
+            # certain right here, before the worker has had any chance to
+            # exit. See `Worker.pgid`'s docstring for why this must never be
+            # re-derived later via `os.getpgid`.
+            worker.pgid = process.pid
 
         def _route_update(params: dict[str, Any]) -> Awaitable[None]:
             return worker.session_update_handler(params)
@@ -806,16 +834,67 @@ class WorkerManager:
     async def _terminate(self, worker: Worker, *, reason: str) -> None:
         if worker.client is not None:
             await worker.client.close()
-        if worker.process.returncode is None:
-            _signal_worker_group(worker.process, signal.SIGTERM)
-            try:
-                await asyncio.wait_for(worker.process.wait(), timeout=5.0)
-            except TimeoutError:
-                _signal_worker_group(worker.process, signal.SIGKILL)
-                await worker.process.wait()
+        await self._reap_process_group(worker.pgid, fallback_process=worker.process)
         logger.info(
             "worker stopped", extra={"detail": {"session_id": worker.session_id, "reason": reason}}
         )
+
+    async def _reap_process_group(
+        self,
+        pgid: int | None,
+        *,
+        fallback_process: asyncio.subprocess.Process | None = None,
+    ) -> None:
+        """G09 "无孤儿进程" (round-2 review findings #2/#4): TERM the worker's
+        whole process group and poll `_group_alive` — not `fallback_process.
+        wait()` — to decide whether to escalate to SIGKILL. Two gaps the
+        round-1 version (gated on `fallback_process.returncode is None`,
+        escalating only on ITS OWN wait timing out) missed, both reproduced
+        against this branch's code:
+
+        1. The worker itself already exited (crashed, or raced with this
+           call) before this runs — `fallback_process.returncode is None`
+           being false used to skip signalling the group ENTIRELY, leaving
+           any descendant that outlived the worker orphaned. `pgid` is
+           recorded at spawn time on `Worker` (see its docstring) so this
+           still works with no live worker process to ask.
+        2. The worker complies with SIGTERM and exits well inside the grace
+           window, but some OTHER group member (e.g. Hermes's own
+           terminal-tool child, mid-`killpg` in its own background thread)
+           ignores it — `fallback_process.wait()` resolving early used to
+           mean the SIGKILL escalation below was never reached at all.
+           Polling the GROUP's own liveness instead of one particular
+           member's exit catches this.
+
+        `pgid is None` (Windows, or a worker that never got one recorded)
+        falls back to the single-PID `Process.terminate()`/`.kill()` calls
+        this file always used before process groups existed here at all.
+        """
+        if pgid is None:
+            if fallback_process is not None and fallback_process.returncode is None:
+                fallback_process.terminate()
+                try:
+                    await asyncio.wait_for(fallback_process.wait(), timeout=5.0)
+                except TimeoutError:
+                    fallback_process.kill()
+                    await fallback_process.wait()
+            return
+
+        if not _group_alive(pgid):
+            return
+        _signal_worker_group(pgid, signal.SIGTERM)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and _group_alive(pgid):
+            await asyncio.sleep(0.05)
+        if _group_alive(pgid):
+            _signal_worker_group(pgid, signal.SIGKILL)
+        if fallback_process is not None and fallback_process.returncode is None:
+            # Best-effort reap of the worker's own process now that its group
+            # is confirmed gone (or SIGKILL was just sent, which can't be
+            # blocked) — avoids leaving its `Process` object's exit future
+            # unresolved; never the thing that decides whether to escalate.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(fallback_process.wait(), timeout=1.0)
 
     async def _watch_exit(self, worker: Worker) -> None:
         returncode = await worker.process.wait()
@@ -826,6 +905,11 @@ class WorkerManager:
             "worker process exited unexpectedly",
             extra={"detail": {"session_id": worker.session_id, "returncode": returncode}},
         )
+        # G09 (round-2 review finding #2, case 1): the worker dying on its
+        # own (crash/SIGKILL from elsewhere) is exactly the path `_terminate`
+        # never runs for — reap any descendant it leaves behind in its own
+        # process group here too, not only on an intentional stop_worker().
+        await self._reap_process_group(worker.pgid)
         try:
             await self._on_worker_crash(worker.session_id, returncode)
         except Exception:  # noqa: BLE001 - a crash handler must never crash the reaper itself
