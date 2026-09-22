@@ -250,6 +250,10 @@ HTTP 两种 transport 真实接入，需 `JONES_E2E=1` 且 `ANTHROPIC_API_KEY`�
   "retryLastMessage() resends the most recent user message (PRD 9.3 错误终止
   卡片 "重试")"`、`"dismissTermination() removes only the named card ..."`。
 - 永不白屏：N16（`apps/desktop/tests/acceptance/test_n16_no_white_screen.test.ts`）。
+- 预算终止（单 Run 最大 Step 数 200 / 最大时长 7200s，PRD 11.2，原 #37 缺口）：
+  `daemon/tests/test_errors_sessions_integration.py::
+  test_step_count_budget_terminates_the_run_with_a_budget_card` 及同组时长
+  上限用例（真实 201 次 tool_call / 注入时钟超时两条路径）。
 
 **状态：通过**
 
@@ -312,5 +316,15 @@ P1（FR17-20）不在 v1 发布门禁范围内，不在本表；FR18 长期记�
 
 已知、已跟踪、不在本次验收范围内新开的缺口：
 - **#36**（P0，发布阻塞）：x86_64 daemon 构建失败，阻塞 G18。
-- **#37**（P0）：PRD 11.2 单 Run 最大 Step 数（200）/ 最大时长（2h）无触发点
-  ——影响 G17 的"11.2 全部指标通过"，本轮验收未新开重复 Issue，见该 Issue。
+- **#40**（P1，OPEN，不阻塞发布）：两条 `JONES_E2E=1` 门控的真实模型 E2E
+  连续跑时互相干扰，CI/`make check-daemon` 不受影响；未修复，只是确认不
+  影响 v1.0 发布状态。
+
+已解决（曾是缺口，现已合并，保留记录）：
+- ~~#37~~：PRD 11.2 单 Run 最大 Step 数（200）/ 最大时长（2h）无触发点——已随
+  #22 落地（`max_steps_per_run`/`max_run_duration_s`，见
+  `daemon/src/jones_daemon/sessions/service.py`），FR14 状态不变。
+- ~~#38~~：worker 启动自检依赖 Anthropic 专属探针工具，非 Anthropic 厂商起
+  不来——已修复（启动自检主判据改为 `jones_tools.json` 文件存在性）。
+- ~~#39~~：用户在 worker 就绪前按停止，意图不落、ACP cancel 不发——已修复
+  （`stop()` 无条件钉 `termination_intent` + `_active_turns` 早窗口收口）。
