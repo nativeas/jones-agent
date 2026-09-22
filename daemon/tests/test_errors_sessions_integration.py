@@ -1257,6 +1257,62 @@ async def test_active_turns_is_populated_before_send_returns(tmp_path, monkeypat
         await service.shutdown()
 
 
+async def test_active_turns_is_popped_when_an_early_db_write_raises(tmp_path, monkeypatch):
+    """Issue #39 follow-up (review round 2, findings #1/#3 merged — see
+    `_run_turn`'s own comment on the `try:` right after `run_id = ctx_turn.
+    run_id`). Before this round, the `try` owning `finally: await self.
+    _advance_queue(...)` started right before `get_session` — AFTER
+    `create_run`/`set_queue_suspended_reason`/the prompt-snapshot write/
+    `mark_busy`/the `turn.started` broadcast. Since round 1 moved `self.
+    _active_turns[session_id] = ctx_turn` into `_start_turn` (synchronous,
+    before any of those awaits — see that method's comment), an exception
+    raised by any of them left that entry in `_active_turns` forever: nothing
+    else ever pops it, so the session would read as "has a Turn running" to
+    `send()`/`retry()`/`queue_resume()`/`delete_guard` for good, and `stop()`
+    would find nothing in `_turn_tasks` to act on and answer `{"stopped":
+    False}`.
+
+    `queries.create_run` raising is a real, direct repro of exactly the
+    scenario the review named ("DB 写失败") — no delay/mock trickery needed:
+    `_start_turn` (both before and after this round's fix) registers `_active_
+    turns[session_id]` synchronously before this task's coroutine gets its
+    first chance to run at all, so the exception is guaranteed to land inside
+    the window this fix closes."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+
+    boom = RuntimeError("simulated create_run failure")
+
+    def _raising_create_run(*args: Any, **kwargs: Any) -> Any:
+        raise boom
+
+    monkeypatch.setattr(service_module.queries, "create_run", _raising_create_run)
+
+    try:
+        session_id = await _new_session(service, title="s1")
+        first = await service.send(session_id, "hello there")
+        assert first["queued"] is False
+        # Same guarantee `test_active_turns_is_populated_before_send_returns`
+        # relies on: `_start_turn` populates both dicts synchronously, so this
+        # is already true the instant `send()` returns.
+        assert session_id in service._active_turns
+        task = service._turn_tasks[session_id]
+
+        try:
+            await task
+            raise AssertionError("expected the injected create_run failure to propagate")
+        except RuntimeError as exc:
+            assert exc is boom
+
+        # The regression: on unmodified round-1 code this stays populated
+        # forever (nothing but this Turn's own `finally` ever pops it, and
+        # that `finally` used to sit entirely after the now-raising
+        # `create_run` call).
+        assert session_id not in service._active_turns
+    finally:
+        await service.shutdown()
+
+
 async def test_error_termination_suspends_the_queue_instead_of_auto_advancing(
     tmp_path, monkeypatch
 ):

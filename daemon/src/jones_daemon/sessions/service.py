@@ -1528,63 +1528,93 @@ class SessionService:
         # function, written when it built `run_id`/`ctx_turn` itself, needs
         # no further changes.
         run_id = ctx_turn.run_id
-        await run_in_db_thread(
-            queries.create_run, self.ctx.db, run_id=run_id, turn_id=turn_id, session_id=session_id
-        )
-        # R-N9 (controller ruling, round-6, 2026-09-20; PRD 9.3): a Turn about
-        # to run is, by definition, not a suspended queue — clears whatever
-        # `_terminate_run` last persisted here (see that method's own
-        # comment), regardless of which of the three paths that can start a
-        # Turn got here (send()'s immediate-run branch, `retry()`,
-        # `queue_resume()`, or `_advance_queue`'s own auto-continue — all of
-        # them end up in this one function). Covers "send 一条新消息" as an
-        # implicit resume without this branch needing to touch `send()`
-        # itself (out of this round's authorized touch set).
-        await run_in_db_thread(queries.set_queue_suspended_reason, self.ctx.db, session_id, None)
-        # FR06 回放, 02-w3-interfaces.md §2: `runs.prompt_snapshot_ref` — ACP
-        # doesn't expose the fully assembled prompt actually sent to the model
-        # (00-foundation.md §7), so this records, honestly, only what's available
-        # at Run-start: the user's own message plus enough identifiers to look up
-        # the rest (Agent/mode) — not a fabricated "here's the system prompt".
-        # Best-effort: a failure to write this must not abort the Turn itself
-        # (fail loud via the log, not fail the whole Run over a replay nicety).
+        # Issue #39 follow-up (review round 2, findings #1/#3 merged):
+        # this `try:` used to start right before `get_session` below (old
+        # `run_id = ctx_turn.run_id` through the `turn.started` broadcast
+        # sat OUTSIDE any try in this function, covered only by whatever
+        # `_start_turn`'s `_cleanup` done-callback does — which is just
+        # `_turn_tasks.pop`, not `_active_turns.pop`/`_advance_queue`). Since
+        # round 1 moved `_active_turns[session_id] = ctx_turn` into
+        # `_start_turn`, synchronously before this task is even created,
+        # that gap became a real "registered but not in try" window: a DB
+        # exception from `create_run`/`set_queue_suspended_reason`/
+        # `set_prompt_snapshot_ref`, or a `task.cancel()` landing on any of
+        # this function's first few `await`s, used to leave `self.
+        # _active_turns[session_id]` populated forever — nothing else pops
+        # it (only `_advance_queue`, called from the `finally` below, does)
+        # — so the session reads as "has a Turn running" to `send()`/
+        # `retry()`/`queue_resume()`/`delete_guard`'s `in self._active_turns`
+        # checks, `stop()` finds nothing in `_turn_tasks` to cancel and
+        # answers `{"stopped": False}`, and `session.delete`/`export` stay
+        # INVALID_STATE, permanently. Moving `try:` up here — the first line
+        # after `run_id` is aliased — puts every one of those awaits inside
+        # the same `try/finally` as the rest of the Turn, so `finally:
+        # await self._advance_queue(session_id)` now always runs and always
+        # pops `_active_turns[session_id]`, whichever of those awaits an
+        # exception or a cancellation lands on.
         try:
-            snapshot_ref = await asyncio.to_thread(
-                replay_store.write_prompt_snapshot,
-                self.ctx.paths.user_root(),
-                run_id,
-                {
-                    "note": (
-                        "Hermes ACP does not expose the fully assembled prompt sent to "
-                        "the model (docs/design/00-foundation.md §7); recording what is "
-                        "available."
-                    ),
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "run_id": run_id,
-                    "user_message": text,
-                    "captured_at": queries.iso_now(),
-                },
-            )
             await run_in_db_thread(
-                queries.set_prompt_snapshot_ref, self.ctx.db, run_id, snapshot_ref
+                queries.create_run,
+                self.ctx.db,
+                run_id=run_id,
+                turn_id=turn_id,
+                session_id=session_id,
             )
-        except OSError:
-            logger.error(
-                "failed to write prompt snapshot for a Run",
-                exc_info=True,
-                extra={"detail": {"run_id": run_id}},
+            # R-N9 (controller ruling, round-6, 2026-09-20; PRD 9.3): a Turn about
+            # to run is, by definition, not a suspended queue — clears whatever
+            # `_terminate_run` last persisted here (see that method's own
+            # comment), regardless of which of the three paths that can start a
+            # Turn got here (send()'s immediate-run branch, `retry()`,
+            # `queue_resume()`, or `_advance_queue`'s own auto-continue — all of
+            # them end up in this one function). Covers "send 一条新消息" as an
+            # implicit resume without this branch needing to touch `send()`
+            # itself (out of this round's authorized touch set).
+            await run_in_db_thread(
+                queries.set_queue_suspended_reason, self.ctx.db, session_id, None
             )
-        self.worker_manager.mark_busy(session_id, True)
-        # RPC v0 §4.2's `turn.started {session_id, turn_id, run_id}` — the only
-        # signal the front end has that a queued Turn actually started running
-        # (the queue-auto-advance path never calls `send()`, so it has nothing
-        # else to watch for this).
-        await self.ctx.server.broadcast(
-            session_id, "turn.started",
-            {"session_id": session_id, "turn_id": turn_id, "run_id": run_id},
-        )
-        try:
+            # FR06 回放, 02-w3-interfaces.md §2: `runs.prompt_snapshot_ref` — ACP
+            # doesn't expose the fully assembled prompt actually sent to the model
+            # (00-foundation.md §7), so this records, honestly, only what's available
+            # at Run-start: the user's own message plus enough identifiers to look up
+            # the rest (Agent/mode) — not a fabricated "here's the system prompt".
+            # Best-effort: a failure to write this must not abort the Turn itself
+            # (fail loud via the log, not fail the whole Run over a replay nicety).
+            try:
+                snapshot_ref = await asyncio.to_thread(
+                    replay_store.write_prompt_snapshot,
+                    self.ctx.paths.user_root(),
+                    run_id,
+                    {
+                        "note": (
+                            "Hermes ACP does not expose the fully assembled prompt sent to "
+                            "the model (docs/design/00-foundation.md §7); recording what is "
+                            "available."
+                        ),
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "run_id": run_id,
+                        "user_message": text,
+                        "captured_at": queries.iso_now(),
+                    },
+                )
+                await run_in_db_thread(
+                    queries.set_prompt_snapshot_ref, self.ctx.db, run_id, snapshot_ref
+                )
+            except OSError:
+                logger.error(
+                    "failed to write prompt snapshot for a Run",
+                    exc_info=True,
+                    extra={"detail": {"run_id": run_id}},
+                )
+            self.worker_manager.mark_busy(session_id, True)
+            # RPC v0 §4.2's `turn.started {session_id, turn_id, run_id}` — the only
+            # signal the front end has that a queued Turn actually started running
+            # (the queue-auto-advance path never calls `send()`, so it has nothing
+            # else to watch for this).
+            await self.ctx.server.broadcast(
+                session_id, "turn.started",
+                {"session_id": session_id, "turn_id": turn_id, "run_id": run_id},
+            )
             try:
                 session = await run_in_db_thread(queries.get_session, self.ctx.db, session_id)
                 cwd = await self._cwd_for_project(session["project_id"])
