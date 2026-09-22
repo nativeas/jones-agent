@@ -393,14 +393,16 @@ class _TurnContext:
     step_diffs: dict[str, dict[str, Any]] = field(default_factory=dict)
     # R-N5 (controller ruling, 2026-09-20; PRD 11.2/9.3's "触顶 11.2 的单 Run
     # Step 数/时长上限" -> 预算终止): `started_at`/`max_steps_per_run`/
-    # `max_run_duration_s` all start at a placeholder `_run_turn` overwrites
+    # `max_run_duration_s` all start at a placeholder `_start_turn` overwrites
     # immediately -- right as it constructs this dataclass, satisfying "`_run_
-    # turn` 记录开始时刻" (see that method's own comment). Deliberately NOT a
-    # `field(default_factory=time.monotonic)` for `started_at`: a default
+    # turn` 记录开始时刻" (see that method's own comment; moved into `_start_
+    # turn` by Issue #39 follow-up, review round 1 -- `_run_turn` no longer
+    # constructs this dataclass itself, see its own comment). Deliberately
+    # NOT a `field(default_factory=time.monotonic)` for `started_at`: a default
     # factory is resolved to a plain function reference once, at this class's
     # own module-import moment -- a test wanting a fake clock would silently
     # keep hitting whatever real callable got captured at import time, never
-    # a later substitution. `_run_turn`'s own `ctx_turn.started_at = self.
+    # a later substitution. `_start_turn`'s own `ctx_turn.started_at = self.
     # _clock()` line reads `SessionService._clock` fresh at call time instead
     # -- R-N8 (round-6) replaced this field's original rationale here (a
     # `monkeypatch.setattr(service_module.time, "monotonic", ...)` a
@@ -936,24 +938,33 @@ class SessionService:
         task = self._turn_tasks.get(session_id)
         if task is None or task.done():
             return {"stopped": False}
+        # Issue #39 (controller ruling, 2026-09-21): pin the termination
+        # intent unconditionally — as soon as there's an active Turn to pin
+        # it on — not only when a worker happens to already be up. A user's
+        # stop is an intent about the TURN, not about whether its worker has
+        # finished `ensure_started()` yet. R-N11's "pin before cancel"
+        # ordering (below) only ever closed ONE race (`_finalize_turn_
+        # success` racing this same field's own write) — gating the PIN
+        # itself on `worker is not None and worker.client is not None and
+        # worker.acp_session_id is not None` left an earlier one open:
+        # `send()` immediately followed by `stop()`, before `_run_turn`'s own
+        # `ensure_started()` call has even returned, means all three of those
+        # are still `None`/unset here — nothing got pinned, no cancel got
+        # sent, the worker then finishes starting moments later, and
+        # `_run_turn` prompts the agent as if `stop()` had never been called
+        # — while `stop()` already told the caller `{"stopped": True}`
+        # (exactly Issue #39's "意图不落、cancel 不发、agent 照跑完").
+        ctx_turn = self._active_turns.get(session_id)
+        if ctx_turn is not None:
+            user_stop_reason = "stopped by user"
+            ctx_turn.termination_intent = _TerminationIntent(
+                kind="user",
+                reason=user_stop_reason,
+                card=classify.build_user_card(user_stop_reason),
+                step_seq=ctx_turn.step_seq or None,
+            )
         worker = self.worker_manager.get(session_id)
         if worker is not None and worker.client is not None and worker.acp_session_id is not None:
-            # R-N11 (controller ruling, round-7, 2026-09-20): pin the
-            # termination intent BEFORE sending the cancel notification below
-            # — see `_TurnContext.termination_intent`'s own comment for why.
-            # R-N20 (controller ruling, round-9, 2026-09-20): the pinned
-            # value is now the full `_TerminationIntent` record (reason/card/
-            # step_seq included), not just the kind — see that dataclass's
-            # own comment.
-            ctx_turn = self._active_turns.get(session_id)
-            if ctx_turn is not None:
-                user_stop_reason = "stopped by user"
-                ctx_turn.termination_intent = _TerminationIntent(
-                    kind="user",
-                    reason=user_stop_reason,
-                    card=classify.build_user_card(user_stop_reason),
-                    step_seq=ctx_turn.step_seq or None,
-                )
             try:
                 # A notification, not a hard kill: PRD 9.3 "用户终止" requires the
                 # in-flight tool call to finish cleanly. `cancel()` sets Hermes's
@@ -976,6 +987,13 @@ class SessionService:
                     "session/cancel notification failed (worker likely already gone)",
                     extra={"detail": {"session_id": session_id, "error": str(exc)}},
                 )
+        # else: no worker to cancel yet (still inside `ensure_started()`, or
+        # never started) — nothing lost. The intent pinned above is enough:
+        # `_run_turn` checks `ctx_turn.termination_intent` itself, right after
+        # its own `ensure_started()` call returns and before it ever calls
+        # `prompt()` (Issue #39's fix, part 3) — the worker IS ready by then,
+        # so that check sends the cancel this branch couldn't and goes
+        # straight to `_terminate_run`, never prompting the agent at all.
         # If this Turn's in-flight tool call is sitting on a pending
         # `session/request_permission` (no one has answered it yet — the user
         # just clicked "stop" instead of allow/deny), `cancel()` alone can't
@@ -1461,7 +1479,38 @@ class SessionService:
     # -- turn execution ---------------------------------------------------------------
 
     def _start_turn(self, session_id: str, turn_id: str, text: str) -> None:
-        task = asyncio.create_task(self._run_turn(session_id, turn_id, text))
+        # Issue #39 follow-up (review round 1, findings #1/#3): construct and
+        # register this Turn's `_TurnContext` in `_active_turns` HERE,
+        # synchronously — in the same tick as `_turn_tasks` below, not
+        # several `await`s into `_run_turn` (the old code built + registered
+        # it only after `create_run`, `set_queue_suspended_reason`, and the
+        # prompt-snapshot write had all already run — each a real `await`
+        # onto a DB-thread/file round trip). `_start_turn` is a plain `def`;
+        # it never yields control before returning, so a `stop()` racing in
+        # right after `send()`/`_advance_queue`/`queue_resume` schedules this
+        # Turn can never observe `_turn_tasks` populated while `_active_
+        # turns` still isn't — `stop()` (see that method's own comment) will
+        # either early-return (task not yet in `_turn_tasks`) or find
+        # `ctx_turn` already here, no window in between. This closes the
+        # EARLIER half of Issue #39's race; `stop()`'s own fix plus the
+        # intent check below close the LATER half (inside `ensure_started()`
+        # itself). `new_ulid()` is safe to call unawaited here — pure stdlib
+        # arithmetic over `os.urandom`, no I/O (`kernel/ids.py`).
+        run_id = new_ulid()
+        ctx_turn = _TurnContext(turn_id=turn_id, run_id=run_id, session_id=session_id)
+        # R-N5 (controller ruling, 2026-09-20): "`_run_turn` 记录开始时刻" —
+        # moved here (review round 1) along with the rest of this construction
+        # — still the first thing done for this Turn, before anything else
+        # gets a chance to run, so the 时长上限 clock still starts from when
+        # the Turn actually begins. See `_TurnContext.started_at`'s own
+        # comment for why this is a plain call, not that field's default;
+        # `self._clock()` (R-N8, round-6) rather than a bare `time.monotonic()`
+        # call — the same clock `_check_run_durations` compares against,
+        # injectable by tests without monkeypatching the real `time` module
+        # (see `__init__`'s comment on `self._clock`).
+        ctx_turn.started_at = self._clock()
+        self._active_turns[session_id] = ctx_turn
+        task = asyncio.create_task(self._run_turn(session_id, turn_id, text, ctx_turn))
         self._turn_tasks[session_id] = task
 
         def _cleanup(_t: asyncio.Task[None]) -> None:
@@ -1470,78 +1519,102 @@ class SessionService:
 
         task.add_done_callback(_cleanup)
 
-    async def _run_turn(self, session_id: str, turn_id: str, text: str) -> None:
-        run_id = new_ulid()
-        await run_in_db_thread(
-            queries.create_run, self.ctx.db, run_id=run_id, turn_id=turn_id, session_id=session_id
-        )
-        # R-N9 (controller ruling, round-6, 2026-09-20; PRD 9.3): a Turn about
-        # to run is, by definition, not a suspended queue — clears whatever
-        # `_terminate_run` last persisted here (see that method's own
-        # comment), regardless of which of the three paths that can start a
-        # Turn got here (send()'s immediate-run branch, `retry()`,
-        # `queue_resume()`, or `_advance_queue`'s own auto-continue — all of
-        # them end up in this one function). Covers "send 一条新消息" as an
-        # implicit resume without this branch needing to touch `send()`
-        # itself (out of this round's authorized touch set).
-        await run_in_db_thread(queries.set_queue_suspended_reason, self.ctx.db, session_id, None)
-        # FR06 回放, 02-w3-interfaces.md §2: `runs.prompt_snapshot_ref` — ACP
-        # doesn't expose the fully assembled prompt actually sent to the model
-        # (00-foundation.md §7), so this records, honestly, only what's available
-        # at Run-start: the user's own message plus enough identifiers to look up
-        # the rest (Agent/mode) — not a fabricated "here's the system prompt".
-        # Best-effort: a failure to write this must not abort the Turn itself
-        # (fail loud via the log, not fail the whole Run over a replay nicety).
+    async def _run_turn(
+        self, session_id: str, turn_id: str, text: str, ctx_turn: _TurnContext
+    ) -> None:
+        # `ctx_turn` (and its `run_id`) is already constructed and already
+        # registered in `_active_turns` by `_start_turn` above (Issue #39
+        # follow-up, review round 1) — aliased locally so the rest of this
+        # function, written when it built `run_id`/`ctx_turn` itself, needs
+        # no further changes.
+        run_id = ctx_turn.run_id
+        # Issue #39 follow-up (review round 2, findings #1/#3 merged):
+        # this `try:` used to start right before `get_session` below (old
+        # `run_id = ctx_turn.run_id` through the `turn.started` broadcast
+        # sat OUTSIDE any try in this function, covered only by whatever
+        # `_start_turn`'s `_cleanup` done-callback does — which is just
+        # `_turn_tasks.pop`, not `_active_turns.pop`/`_advance_queue`). Since
+        # round 1 moved `_active_turns[session_id] = ctx_turn` into
+        # `_start_turn`, synchronously before this task is even created,
+        # that gap became a real "registered but not in try" window: a DB
+        # exception from `create_run`/`set_queue_suspended_reason`/
+        # `set_prompt_snapshot_ref`, or a `task.cancel()` landing on any of
+        # this function's first few `await`s, used to leave `self.
+        # _active_turns[session_id]` populated forever — nothing else pops
+        # it (only `_advance_queue`, called from the `finally` below, does)
+        # — so the session reads as "has a Turn running" to `send()`/
+        # `retry()`/`queue_resume()`/`delete_guard`'s `in self._active_turns`
+        # checks, `stop()` finds nothing in `_turn_tasks` to cancel and
+        # answers `{"stopped": False}`, and `session.delete`/`export` stay
+        # INVALID_STATE, permanently. Moving `try:` up here — the first line
+        # after `run_id` is aliased — puts every one of those awaits inside
+        # the same `try/finally` as the rest of the Turn, so `finally:
+        # await self._advance_queue(session_id)` now always runs and always
+        # pops `_active_turns[session_id]`, whichever of those awaits an
+        # exception or a cancellation lands on.
         try:
-            snapshot_ref = await asyncio.to_thread(
-                replay_store.write_prompt_snapshot,
-                self.ctx.paths.user_root(),
-                run_id,
-                {
-                    "note": (
-                        "Hermes ACP does not expose the fully assembled prompt sent to "
-                        "the model (docs/design/00-foundation.md §7); recording what is "
-                        "available."
-                    ),
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "run_id": run_id,
-                    "user_message": text,
-                    "captured_at": queries.iso_now(),
-                },
-            )
             await run_in_db_thread(
-                queries.set_prompt_snapshot_ref, self.ctx.db, run_id, snapshot_ref
+                queries.create_run,
+                self.ctx.db,
+                run_id=run_id,
+                turn_id=turn_id,
+                session_id=session_id,
             )
-        except OSError:
-            logger.error(
-                "failed to write prompt snapshot for a Run",
-                exc_info=True,
-                extra={"detail": {"run_id": run_id}},
+            # R-N9 (controller ruling, round-6, 2026-09-20; PRD 9.3): a Turn about
+            # to run is, by definition, not a suspended queue — clears whatever
+            # `_terminate_run` last persisted here (see that method's own
+            # comment), regardless of which of the three paths that can start a
+            # Turn got here (send()'s immediate-run branch, `retry()`,
+            # `queue_resume()`, or `_advance_queue`'s own auto-continue — all of
+            # them end up in this one function). Covers "send 一条新消息" as an
+            # implicit resume without this branch needing to touch `send()`
+            # itself (out of this round's authorized touch set).
+            await run_in_db_thread(
+                queries.set_queue_suspended_reason, self.ctx.db, session_id, None
             )
-        ctx_turn = _TurnContext(turn_id=turn_id, run_id=run_id, session_id=session_id)
-        # R-N5 (controller ruling, 2026-09-20): "`_run_turn` 记录开始时刻" —
-        # set explicitly here (see `_TurnContext.started_at`'s own comment for
-        # why this is a plain call, not that field's default) rather than at
-        # the settings-resolution point a few lines below, so the 时长上限
-        # clock starts from when the Turn actually begins, not from whenever
-        # the Session/settings DB round trip happens to finish. `self._clock()`
-        # (R-N8, round-6) rather than a bare `time.monotonic()` call — the same
-        # clock `_check_run_durations` compares against, injectable by tests
-        # without monkeypatching the real `time` module (see `__init__`'s
-        # comment on `self._clock`).
-        ctx_turn.started_at = self._clock()
-        self._active_turns[session_id] = ctx_turn
-        self.worker_manager.mark_busy(session_id, True)
-        # RPC v0 §4.2's `turn.started {session_id, turn_id, run_id}` — the only
-        # signal the front end has that a queued Turn actually started running
-        # (the queue-auto-advance path never calls `send()`, so it has nothing
-        # else to watch for this).
-        await self.ctx.server.broadcast(
-            session_id, "turn.started",
-            {"session_id": session_id, "turn_id": turn_id, "run_id": run_id},
-        )
-        try:
+            # FR06 回放, 02-w3-interfaces.md §2: `runs.prompt_snapshot_ref` — ACP
+            # doesn't expose the fully assembled prompt actually sent to the model
+            # (00-foundation.md §7), so this records, honestly, only what's available
+            # at Run-start: the user's own message plus enough identifiers to look up
+            # the rest (Agent/mode) — not a fabricated "here's the system prompt".
+            # Best-effort: a failure to write this must not abort the Turn itself
+            # (fail loud via the log, not fail the whole Run over a replay nicety).
+            try:
+                snapshot_ref = await asyncio.to_thread(
+                    replay_store.write_prompt_snapshot,
+                    self.ctx.paths.user_root(),
+                    run_id,
+                    {
+                        "note": (
+                            "Hermes ACP does not expose the fully assembled prompt sent to "
+                            "the model (docs/design/00-foundation.md §7); recording what is "
+                            "available."
+                        ),
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "run_id": run_id,
+                        "user_message": text,
+                        "captured_at": queries.iso_now(),
+                    },
+                )
+                await run_in_db_thread(
+                    queries.set_prompt_snapshot_ref, self.ctx.db, run_id, snapshot_ref
+                )
+            except OSError:
+                logger.error(
+                    "failed to write prompt snapshot for a Run",
+                    exc_info=True,
+                    extra={"detail": {"run_id": run_id}},
+                )
+            self.worker_manager.mark_busy(session_id, True)
+            # RPC v0 §4.2's `turn.started {session_id, turn_id, run_id}` — the only
+            # signal the front end has that a queued Turn actually started running
+            # (the queue-auto-advance path never calls `send()`, so it has nothing
+            # else to watch for this).
+            await self.ctx.server.broadcast(
+                session_id, "turn.started",
+                {"session_id": session_id, "turn_id": turn_id, "run_id": run_id},
+            )
             try:
                 session = await run_in_db_thread(queries.get_session, self.ctx.db, session_id)
                 cwd = await self._cwd_for_project(session["project_id"])
@@ -1649,6 +1722,52 @@ class SessionService:
                     )
                     return
                 assert worker.client is not None and worker.acp_session_id is not None  # noqa: S101
+                # Issue #39 (controller ruling, 2026-09-21; amended review
+                # round 1, finding #2): `stop()` may have pinned `ctx_turn.
+                # termination_intent` while THIS Turn's worker was still
+                # inside `ensure_started()` above (see that method's own
+                # comment — it pins unconditionally now, not only when a
+                # worker already exists) — by the time control reaches here
+                # the worker IS ready, but the user's stop already happened
+                # and must not be silently lost by prompting the agent as if
+                # nothing happened. Check once, right here, before ever
+                # calling `prompt()`: a pinned intent means some active-
+                # termination path already claimed this Turn — go straight to
+                # `_terminate_run`, never call `prompt()`.
+                #
+                # Deliberately NOT sending a compensating `cancel()` here
+                # (the original round-1 fix did, "the one `stop()` itself
+                # couldn't because the worker wasn't ready"): reaching this
+                # branch means `prompt()` for THIS Turn has never been
+                # called — `ensure_started()` just returned, and a Session
+                # only ever has one active Turn at a time — so there is no
+                # in-flight ACP request on `worker.acp_session_id` to cancel.
+                # Real-Hermes review round 1, finding #2 found `cancel()`
+                # against an idle ACP session is NOT a no-op there: Hermes's
+                # `request_hard_interrupt` sets a sticky `_interrupt_
+                # requested` flag that nothing clears at the START of the
+                # next `prompt()` (only at a Turn's own end) — so this
+                # compensating cancel silently poisoned the NEXT real Turn on
+                # the same worker/session (the one the user sends after
+                # clicking "继续"), which came back `stopReason="end_turn"`
+                # with no model call and no usage, its reply replaced by
+                # Hermes's own "Stopped waiting for another Hermes process on
+                # this session" text — recorded by `_finalize_turn_success`
+                # as a normal SUCCESSFUL Turn. Silently dropping a user
+                # message is worse than the race Issue #39 set out to fix.
+                if ctx_turn.termination_intent is not None:
+                    # This `kind`/`reason` pair is only the honest fallback
+                    # for the (never actually reachable here) case `ctx_turn.
+                    # termination_intent` became `None` again by the time
+                    # `_terminate_run` runs — the check above already
+                    # confirmed it's set, so `_terminate_run` always adopts
+                    # that pinned record wholesale instead (R-N20).
+                    await self._terminate_run(
+                        ctx_turn,
+                        kind=ctx_turn.termination_intent.kind,
+                        reason=ctx_turn.termination_intent.reason,
+                    )
+                    return
                 try:
                     response = await worker.client.prompt(worker.acp_session_id, text)
                 except (AcpError, AcpProtocolError) as exc:

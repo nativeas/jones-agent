@@ -101,7 +101,15 @@ async def _open_turn(service: SessionService):
     )
     session_id = row["id"]
     await service.send(session_id, "SLEEP_MS:2000 hold this turn open")
-    await _wait_until(lambda: session_id in service._active_turns)
+    # Issue #39 follow-up (review round 1): `_active_turns[session_id]` is
+    # now populated synchronously by `_start_turn`, before `_run_turn` even
+    # calls `create_run` — so it alone no longer implies the `runs` row this
+    # helper's real `run_id`/`turn_id` need (the `steps` FK below) actually
+    # exists yet. Wait for the worker instead: `ensure_started()` only
+    # returns after `create_run` has already completed (`_run_turn`'s own
+    # sequencing, unchanged by that follow-up), so worker-readiness remains
+    # a safe proxy for "the Run row exists".
+    await _wait_until(lambda: service.worker_manager.get(session_id) is not None)
     return service._active_turns[session_id]
 
 
