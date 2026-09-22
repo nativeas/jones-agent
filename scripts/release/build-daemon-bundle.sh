@@ -26,10 +26,32 @@ OUT_ARG="${2:?usage: build-daemon-bundle.sh <arm64|x64> <output-dir>}"
 mkdir -p "$(dirname "$OUT_ARG")"
 OUT="$(cd "$(dirname "$OUT_ARG")" && pwd)/$(basename "$OUT_ARG")"
 case "$ARCH" in
-  arm64) UV_PLATFORM="aarch64-apple-darwin" ;;
-  x64) UV_PLATFORM="x86_64-apple-darwin" ;;
+  arm64) UV_PLATFORM="aarch64-apple-darwin"; HOST_ARCH_FOR="arm64" ;;
+  x64) UV_PLATFORM="x86_64-apple-darwin"; HOST_ARCH_FOR="x86_64" ;;
   *) echo "unknown arch: $ARCH (want arm64 or x64)" >&2; exit 1 ;;
 esac
+
+# Native vs cross build (Issue #36): when the requested $ARCH matches the host
+# machine's own architecture (`uname -m`), this is a NATIVE build — the host
+# already has real x86_64/arm64 wheels and, for anything without a wheel, a
+# real matching Rust target to compile against. `--python-platform` exists
+# only to fake a foreign target platform's wheel tags without a local
+# interpreter of that architecture (see the comment on the install calls
+# below) — passing it on a native build is not just unnecessary, it's
+# actively wrong: it makes `uv` request wheel tags for a platform that then
+# happens to equal the host, but for anything that falls back to a source
+# build (`cryptography` on x86_64, see docs/release.md §2.2), the resulting
+# build still runs on THIS host's real toolchain — there is nothing to
+# "cross" about it. So on a native build, both `uv pip install` calls below
+# omit `--python-platform` entirely and let `uv` resolve against the host's
+# own interpreter/platform, exactly as "native install" implies.
+if [ "$(uname -m)" = "$HOST_ARCH_FOR" ]; then
+  IS_NATIVE=1
+  PLATFORM_FLAGS=()
+else
+  IS_NATIVE=0
+  PLATFORM_FLAGS=(--python-platform "$UV_PLATFORM")
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -80,33 +102,42 @@ rm -rf dist
 UV_FROZEN=1 uv build --wheel >/dev/null
 WHEEL="$(ls dist/jones_daemon-*.whl)"
 
-# `--python-platform`/`--python <version>` (not a path): a pure resolve+
-# download of prebuilt wheels for the TARGET architecture, needing no local
-# interpreter of that architecture (spike 02 §1's whole point about
-# python-build-standalone: no target-arch code execution required) — this is
-# what makes producing the x64 bundle on this arm64 host possible AT ALL,
-# but only for dependencies that actually publish an x64 wheel for the
-# pinned version. **Known real failure on this host (see docs/release.md
-# §2.2, docs/design/00-foundation.md §3.1's addendum)**: `cryptography==50.0.0`
-# (daemon's exact-pinned dependency) ships zero macOS x86_64 wheels on PyPI
-# for this version — `uv` silently falls back to building it from source
-# (maturin/cargo), which then fails to cross-compile on an arm64 host with no
-# x86_64 Rust target installed. This is a real gap, not a benign warning; the
-# command below is left to fail loudly (not caught/retried) so that failure
-# is never silently swallowed into a broken bundle.
+# CROSS build only (`--python-platform`/`--python <version>`, not a path): a
+# pure resolve+download of prebuilt wheels for the TARGET architecture,
+# needing no local interpreter of that architecture (spike 02 §1's whole
+# point about python-build-standalone: no target-arch code execution
+# required) — this is what makes producing an x64 bundle on an arm64 host
+# possible AT ALL, but only for dependencies that actually publish a wheel
+# for the pinned version and target platform. **Known real failure doing
+# this cross (see docs/release.md §2.2, docs/design/00-foundation.md §3.1's
+# addendum)**: `cryptography==50.0.0` (daemon's exact-pinned dependency)
+# ships zero macOS x86_64 wheels on PyPI for this version — `uv` silently
+# falls back to building it from source (maturin/cargo), which then fails to
+# cross-compile on an arm64 host with no x86_64 Rust target installed. This
+# is a real gap, not a benign warning.
+#
+# NATIVE build (Issue #36, `$IS_NATIVE=1` above — a native Intel/Apple
+# Silicon runner building its own architecture): `$PLATFORM_FLAGS` is empty,
+# so these calls resolve/install against the host's own real interpreter
+# platform — including building `cryptography` from sdist with the host's
+# own real Rust toolchain when no wheel exists, which is an ordinary native
+# compile, not a cross-compile, and is expected to succeed.
+#
+# Either way the command is left to fail loudly (not caught/retried) so a
+# failure is never silently swallowed into a broken bundle.
 # Third-party deps first, hash-checked against uv.lock (-r "$REQS_FILE" now
 # carries hashes — see the export step above); the local wheel is a separate
 # call below since it has no hash to check against and pip's hash-checking
 # mode requires all-or-nothing within one invocation.
 uv pip install \
   --target "$SITE_PACKAGES" \
-  --python-platform "$UV_PLATFORM" \
+  "${PLATFORM_FLAGS[@]}" \
   --python 3.12 \
   -r "$REQS_FILE"
 
 uv pip install \
   --target "$SITE_PACKAGES" \
-  --python-platform "$UV_PLATFORM" \
+  "${PLATFORM_FLAGS[@]}" \
   --python 3.12 \
   "$WHEEL"
 
