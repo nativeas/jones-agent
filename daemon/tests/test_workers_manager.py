@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -176,35 +177,73 @@ async def test_startup_self_check_delivers_a_worker_even_when_the_model_never_ca
         await manager.stop()
 
 
-async def test_probe_second_layer_never_raises_on_a_completed_verdict(tmp_path, monkeypatch):
-    """Unit-level check on `_probe_second_layer` directly (Issue #38 ruling 2):
-    even the worst probe outcome — the reserved tool running to *completion*
-    instead of being blocked — must only log, never raise, since this layer
-    is diagnostic-only once the primary tools-snapshot check has already
-    passed."""
-    from jones_daemon.workers.manager import Worker
-
-    monkeypatch.setenv("FAKE_ACP_MODE", "normal")
+async def test_startup_self_check_rejects_a_worker_whose_probe_ran_to_completion(
+    tmp_path, monkeypatch
+):
+    """Round-1 review findings #2/#5: the primary tools-snapshot layer passing
+    is necessary but not sufficient. `gate_not_enforcing` mode writes
+    `jones_tools.json` normally (jones_gate genuinely loaded) but still
+    reports the reserved probe tool running to *completion* instead of being
+    blocked — positive, vendor-agnostic evidence the gate isn't enforcing.
+    That must still fail-closed reject this worker, even though it's the
+    "optional" second layer that catches it."""
+    monkeypatch.setenv("FAKE_ACP_MODE", "gate_not_enforcing")
     manager = _make_manager(tmp_path)
     await manager.start()
     try:
+        with pytest.raises(WorkerStartupError, match="ran to completion"):
+            await manager.ensure_started("s1", cwd="/tmp")
+        assert manager.get("s1") is None
+    finally:
+        await manager.stop()
+
+
+async def test_startup_self_check_rejects_a_worker_whose_process_dies_mid_check(
+    tmp_path, monkeypatch
+):
+    """Round-1 review findings #3/#7: a worker whose process dies during the
+    self-check window — after already having written `jones_tools.json`, so
+    the primary layer alone would have "passed" — must never be delivered or
+    registered. `_probe_second_layer` deliberately treats the resulting dead
+    connection as merely "probe couldn't run" (diagnostic); something else in
+    `_startup_self_check` must still catch it."""
+    monkeypatch.setenv("FAKE_ACP_MODE", "dies_after_snapshot")
+    manager = _make_manager(tmp_path)
+    await manager.start()
+    try:
+        with pytest.raises(WorkerStartupError, match="exited unexpectedly"):
+            await manager.ensure_started("s1", cwd="/tmp")
+        assert manager.get("s1") is None
+    finally:
+        await manager.stop()
+
+
+async def test_startup_self_check_delivers_a_worker_promptly_despite_a_slow_probe_turn(
+    tmp_path, monkeypatch
+):
+    """Round-1 review findings #1/#6: once the primary tools-snapshot layer
+    has passed, delivering this worker must NOT wait for the diagnostic-only
+    probe's entire model Turn — bounded instead to its own small
+    `_PROBE_BUDGET_S` budget, independent of `startup_timeout_s`, with an
+    explicit `session/cancel` sent when that budget is exceeded (not just
+    abandoned — `slow_probe_response` mode holds its response open until
+    either that cancel arrives or a 10s safety net elapses, so a passing test
+    here is proof the cancel was actually sent, not just that some unrelated
+    timeout fired first)."""
+    from jones_daemon.workers.manager import _PROBE_BUDGET_S
+
+    monkeypatch.setenv("FAKE_ACP_MODE", "slow_probe_response")
+    manager = _make_manager(tmp_path, startup_timeout_s=20.0)
+    await manager.start()
+    try:
+        t0 = time.monotonic()
         worker = await manager.ensure_started("s1", cwd="/tmp")
-        assert isinstance(worker, Worker)
-        # Fabricate a "completed" probe verdict, as `_probe_event_verdict`
-        # would read it off a real `session/update` — exercises
-        # `_probe_second_layer` in isolation, without a second real prompt
-        # round-trip against the fake agent.
-        worker.startup_updates = [
-            {
-                "update": {
-                    "sessionUpdate": "tool_call_update",
-                    "title": "jones.__probe__",
-                    "status": "completed",
-                    "rawOutput": {"blocked": False},
-                }
-            }
-        ]
-        await manager._probe_second_layer(worker)  # must not raise
+        elapsed = time.monotonic() - t0
+        assert worker.acp_session_id == "fake-session-1"
+        # Well under the 10s safety net the fake agent falls back to if no
+        # cancel ever arrives, and under `startup_timeout_s` — proves this
+        # didn't just ride out the OUTER fail-closed timeout instead.
+        assert elapsed < _PROBE_BUDGET_S + 5.0
     finally:
         await manager.stop()
 

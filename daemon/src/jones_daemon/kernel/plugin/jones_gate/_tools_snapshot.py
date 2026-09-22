@@ -42,13 +42,30 @@ computation instead of trying to reach the agent object:
     real `check_fn` results (HA/computer_use/... availability) for this exact
     worker environment.
 
-Best-effort by design: if `model_tools`/`tools.mcp_tool_discovery` aren't
-importable (the daemon's own test suite drives this package against a FAKE ACP
-agent that never loads real Hermes plugins at all — see `docs/DEV.md`'s
-`hermes-agent` optional-dependency note), this hook simply doesn't write the
-file. `capabilities/registry.py::reconcile()` treats a missing `jones_tools.
-json` as "actual assembly not yet known" (not as "zero tools", and not as an
-error) — see that function's docstring.
+## The file's write is NOT best-effort — the *tool list inside it* is (round-1
+## review finding #4)
+
+`workers/manager.py::_wait_for_tools_snapshot` (Issue #38 ruling 1) fail-closed
+gates worker delivery purely on this file's EXISTENCE — proof this hook ran at
+all, i.e. that `jones_gate` loaded. That's a different claim from "the tool
+list this hook wanted to report is known", and conflating the two used to mean
+any unrelated Hermes-side failure (`model_tools`'s import breaking, a
+`check_fn` raising, a `get_tool_definitions` signature change) silently
+produced the exact same symptom as `jones_gate` never having loaded at all —
+every session on the machine refusing to start, with a startup-self-check
+error message pointing at the wrong cause. So: once `HERMES_HOME` is known,
+this hook always writes the file — `tools` is `null` (with
+`tools_unavailable_reason` explaining why) only when `model_tools`/`tools.
+mcp_tool_discovery` aren't importable or `get_tool_definitions` itself raises
+(the daemon's own test suite drives this package against a FAKE ACP agent that
+never loads real Hermes plugins at all — see `docs/DEV.md`'s `hermes-agent`
+optional-dependency note). `capabilities/methods.py::_read_jones_tools`'s
+existing `isinstance(raw_tools, list)` guard already treats a `null` `tools`
+field exactly like a missing file (falls back to `actual_tools = None`), so
+`capabilities/registry.py::reconcile()` still reports "actual assembly not yet
+known" — see that function's docstring — unchanged by this. Only a missing
+`HERMES_HOME`, or the write itself failing (disk full, permissions), skips
+writing the file at all now.
 
 ## `skip_tool_search_assembly=True` (review round-2 finding #6)
 
@@ -142,7 +159,12 @@ def _registered_mcp_server_names() -> list[str]:
         return []
 
 
-def _compute_tool_names(mcp_names: list[str]) -> list[str] | None:
+def _compute_tool_names(mcp_names: list[str]) -> tuple[list[str] | None, str | None]:
+    """Returns `(names, unavailable_reason)` — exactly one is non-`None`. Round-1
+    review finding #4: the reason travels with the result (instead of being
+    discarded the way a bare `except: return None` used to) so the payload can
+    say *why* the tool list is missing rather than looking identical to
+    `jones_gate` never having loaded at all — see module docstring."""
     enabled_toolsets = list(
         dict.fromkeys(["hermes-acp", *(f"mcp-{name}" for name in mcp_names if name)])
     )
@@ -159,15 +181,15 @@ def _compute_tool_names(mcp_names: list[str]) -> list[str] | None:
             # MCP server is configured, defeating this hook's entire purpose.
             skip_tool_search_assembly=True,
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
 
     names = {
         t.get("function", {}).get("name")
         for t in (tools or [])
         if isinstance(t, dict) and isinstance(t.get("function"), dict)
     }
-    return sorted(n for n in names if isinstance(n, str) and n)
+    return sorted(n for n in names if isinstance(n, str) and n), None
 
 
 def _mcp_discovery_complete() -> bool:
@@ -214,12 +236,15 @@ def on_session_start(session_id: str = "", **_kwargs: Any) -> None:
         # computed post-join).
         discovery_complete = _mcp_discovery_complete()
         mcp_names = _registered_mcp_server_names()
-        names = _compute_tool_names(mcp_names)
-        if names is None:
-            return
+        names, unavailable_reason = _compute_tool_names(mcp_names)
         payload = {
             "session_id": session_id,
+            # round-1 review finding #4: `tools` is `null` (never a raised
+            # exception, never a skipped write) when it couldn't be computed —
+            # see module docstring's "The file's write is NOT best-effort"
+            # section for why this file must still be written in that case.
             "tools": names,
+            "tools_unavailable_reason": unavailable_reason,
             "mcp_servers": mcp_names,
             "mcp_discovery_complete": discovery_complete,
             "written_at": time.time(),

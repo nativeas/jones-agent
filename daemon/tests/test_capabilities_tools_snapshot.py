@@ -164,11 +164,22 @@ def test_on_session_start_is_a_noop_without_hermes_home(
     assert not (tmp_path / "jones_tools.json").exists()
 
 
-def test_on_session_start_is_a_noop_when_model_tools_is_unimportable(tmp_path, monkeypatch):
+def test_on_session_start_still_writes_the_file_when_model_tools_is_unimportable(
+    tmp_path, monkeypatch
+):
+    """Round-1 review finding #4: `workers/manager.py::_wait_for_tools_snapshot`
+    (Issue #38's PRIMARY, fail-closed startup gate) only checks this file's
+    EXISTENCE as proof `jones_gate` loaded — an unrelated Hermes-side failure
+    computing the tool list must not look identical to the plugin never having
+    loaded at all. The file must still appear, with `tools: null` and a reason,
+    not be skipped."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setitem(sys.modules, "model_tools", None)  # forces ImportError on import
     _tools_snapshot.on_session_start(session_id="s1")  # must not raise
-    assert not (tmp_path / "jones_tools.json").exists()
+    written = json.loads((tmp_path / "jones_tools.json").read_text(encoding="utf-8"))
+    assert written["session_id"] == "s1"
+    assert written["tools"] is None
+    assert written["tools_unavailable_reason"]
 
 
 def test_on_session_start_never_raises_on_unexpected_kwargs(

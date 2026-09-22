@@ -63,6 +63,18 @@ _IDLE_SCAN_INTERVAL_S = 30.0
 # numbers against the fake test agent.
 DEFAULT_STARTUP_TIMEOUT_S = 20.0
 
+# Round-1 review findings #1/#6: the diagnostic-only second-layer probe (below)
+# used to share `DEFAULT_STARTUP_TIMEOUT_S` with the OUTER `asyncio.wait_for`
+# wrapping the whole self-check in `_spawn_and_check` — identical durations
+# meant the probe's own inner timeout could never fire first (the outer's
+# deadline was always registered earlier), so delivering an already-proven-safe
+# worker sat waiting for a real model to finish an entire Turn (measured: 9-12s
+# beyond the primary tools-snapshot check passing against a real DeepSeek
+# worker, occasionally exceeding `DEFAULT_STARTUP_TIMEOUT_S` outright and
+# rejecting a worker for no reason but a slow diagnostic). This budget is
+# deliberately its own, separate, much smaller constant.
+_PROBE_BUDGET_S = 3.0
+
 _PROBE_PROMPT = (
     "[jones-daemon automated startup self-check — not a real user request] "
     f"Call the tool named exactly `{PROBE_TOOL_NAME}` right now, with no arguments, "
@@ -476,13 +488,25 @@ class WorkerManager:
            still catches the `HERMES_SAFE_MODE`-style "plugin silently never
            loaded at all" case this self-check exists for, since that hook
            then never runs either.
-        2. SECOND, optional layer (`_probe_second_layer`): the original probe
-           mechanism, kept only to additionally verify `jones_gate`'s *block*
-           semantics are actually enforcing (not just "loaded"). Diagnostic
-           only — logs what it observes and never raises, so an uncooperative
-           model (or any other outcome of this one extra, non-essential
-           prompt) can never block delivering a worker the primary layer
-           already proved safe.
+        2. SECOND layer (`_probe_second_layer`): the original probe mechanism,
+           kept to additionally verify `jones_gate`'s *block* semantics are
+           actually enforcing (not just "loaded"). An uncooperative model (or
+           any other outcome short of the reserved probe tool actually
+           running) is diagnostic-only and never blocks delivery — but a
+           verdict of "completed" (the tool ran instead of being blocked) is
+           POSITIVE evidence the gate isn't enforcing despite being loaded,
+           and still fail-closed rejects this worker (round-1 review findings
+           #2/#5 — see `_probe_second_layer`'s own docstring; this is the one
+           way this "optional" layer can still raise `WorkerStartupError`).
+
+        **Round-1 review findings #1/#3/#6/#7 — this method itself no longer
+        only calls out to the two layers above and returns; it now also (a)
+        bounds how long the second layer's diagnostic prompt can delay
+        delivery, independent of the model actually finishing its Turn, and
+        (b) confirms the worker process is still alive before ever handing it
+        back — see the inline comments below this docstring for both; kept
+        out of this docstring itself so the mechanics stay next to the code
+        they describe instead of drifting out of sync with it again.**
 
         **Why these two run CONCURRENTLY, not sequentially (correction to
         00-foundation.md §8.1's original text and this Issue's own "顺带确认"
@@ -515,12 +539,49 @@ class WorkerManager:
         probe_task = asyncio.create_task(self._probe_second_layer(worker))
         try:
             await self._wait_for_tools_snapshot(worker)
-        finally:
-            # `_probe_second_layer` never raises (see its own docstring) and is
-            # internally bounded by `self._startup_timeout_s` regardless of how
-            # the primary wait above concluded — awaiting it here can't add an
-            # unbounded delay even on the fail-closed (timeout) path.
-            await probe_task
+        except BaseException:
+            # Primary failed (fail-closed timeout) or this whole self-check is
+            # being cancelled out from under us (the OUTER `wait_for` in
+            # `_spawn_and_check` timing out) — this worker is being rejected/
+            # torn down regardless of what the probe would show, so don't
+            # leave its prompt running against a worker we're about to kill.
+            probe_task.cancel()
+            with contextlib.suppress(BaseException):
+                await probe_task
+            raise
+        # Primary passed: `jones_gate` is proven loaded with zero model
+        # participation. `probe_task` is still awaited here (round-1 review
+        # finding #1's second option, not full decoupling — see its own
+        # docstring for why: `AcpClient.prompt()` has no client-side deadline,
+        # and a REAL second `session/prompt` for this same ACP session must
+        # never be sent while this one is still in flight, which is exactly
+        # what `_spawn_and_check` swapping `worker.session_update_handler` to
+        # the production handler before this straggling prompt's `session/
+        # update`s stop arriving would risk) — but `_probe_second_layer` now
+        # bounds ITSELF to `_PROBE_BUDGET_S`, not `self._startup_timeout_s`,
+        # so this can only add a small, fixed delay, never the whole Turn.
+        # May raise `WorkerStartupError` itself (round-1 review findings #2/#5
+        # — a "completed" verdict, below).
+        await probe_task
+        # Round-1 review findings #3/#7: `_probe_second_layer` deliberately
+        # treats a dead ACP connection as "probe couldn't run" (diagnostic, not
+        # fatal — see its own docstring), since a worker merely slow to answer
+        # the OPTIONAL probe must never block delivery. But a worker whose
+        # PROCESS has actually died during this self-check — even after
+        # writing a valid tools snapshot first — must never be delivered or
+        # registered. `process.wait()` normally resolves instantly here (the
+        # same OS notification that closed stdout, which is what unblocked
+        # `probe_task` above with an `AcpProtocolError`, already fired); the
+        # short bound below only covers the rare race where the child-exit
+        # notification hasn't landed in this event loop iteration yet.
+        if worker.process.returncode is None:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(worker.process.wait(), timeout=0.5)
+        if worker.process.returncode is not None:
+            raise WorkerStartupError(
+                "worker process exited unexpectedly during startup self-check "
+                f"(returncode={worker.process.returncode})"
+            )
 
     async def _wait_for_tools_snapshot(self, worker: Worker) -> None:
         """PRIMARY self-check criterion (Issue #38 ruling 1) — see
@@ -546,24 +607,60 @@ class WorkerManager:
         `_startup_self_check`'s docstring, including why THIS is what actually
         triggers the primary layer's file to ever appear. Sends the same
         directive prompt the old sole self-check used, asking the model to
-        call the reserved, always-blocked probe tool, and logs what the
-        `session/update` events collected during that prompt show — but never
-        raises `WorkerStartupError` and never blocks longer than
-        `self._startup_timeout_s` (its own inner `asyncio.wait_for`, since
-        `AcpClient.prompt()` itself has no client-side deadline — "an agent
-        turn can legitimately run for a long time" — and this method is always
-        awaited to completion by `_startup_self_check`, so an unbounded prompt
-        here would make the self-check's own fail-closed timeout unbounded
-        too on the failure path).
+        call the reserved, always-blocked probe tool, and evaluates what the
+        `session/update` events collected during that prompt show.
+
+        Bounded to `_PROBE_BUDGET_S` (round-1 review findings #1/#6), NOT
+        `self._startup_timeout_s` — a separate, much smaller, independent
+        budget, so this one extra, optional prompt can never make delivering
+        an already-proven-safe worker wait for an entire model Turn (measured:
+        9-12s beyond the primary check passing, against a real DeepSeek
+        worker). On that budget expiring, this sends a real `session/cancel`
+        (round-1 review finding #6: the old code shared ITS inner timeout's
+        duration with, and registered it after, the OUTER `wait_for` around
+        the whole self-check in `_spawn_and_check` — so the inner one could
+        never fire first, and even if it somehow had, it only abandoned the
+        local await without ever telling the worker subprocess to actually
+        stop the Turn) — then still evaluates whatever verdict the `session/
+        update` events observed SO FAR show, since those are collected in
+        real time as they arrive (`_collect_startup_update`), independent of
+        whether `prompt()` itself ever resolves: a model that calls the
+        reserved tool typically does so near the start of its Turn (the
+        directive prompt asks for nothing else), well inside this budget,
+        even when it goes on to generate filler text for much longer
+        afterward.
+
+        Raises `WorkerStartupError` — the one way this "optional" layer still
+        fail-closed rejects a worker the primary layer already passed — only
+        for a "completed" verdict (round-1 review findings #2/#5): the
+        reserved probe tool actually RUNNING instead of being blocked is
+        positive, vendor-agnostic evidence `jones_gate`'s block semantics
+        aren't enforcing even though the plugin loaded (00-foundation.md
+        §8.1's actual reason this second layer exists at all — "断言收到的是
+        插件产生的拒绝结果而不是工具直接执行的结果"). Every other outcome
+        (blocked, failed-but-unverified, no call observed at all, the
+        connection itself failing) stays diagnostic-only — logged, never
+        raised — since none of those is evidence the gate is broken, only
+        that this one extra prompt was inconclusive.
         """
         assert worker.client is not None and worker.acp_session_id is not None  # noqa: S101
         detail: dict[str, Any] = {"session_id": worker.session_id}
         try:
             await asyncio.wait_for(
                 worker.client.prompt(worker.acp_session_id, _PROBE_PROMPT),
-                timeout=self._startup_timeout_s,
+                timeout=_PROBE_BUDGET_S,
             )
-        except (TimeoutError, AcpError, AcpProtocolError) as exc:
+        except TimeoutError:
+            with contextlib.suppress(AcpProtocolError):
+                await worker.client.cancel(worker.acp_session_id)
+            logger.info(
+                "startup self-check second-layer probe did not finish within its "
+                f"own {_PROBE_BUDGET_S:.1f}s budget (independent of the overall "
+                "startup timeout) — sent session/cancel and evaluating whatever "
+                "session/update events it produced so far",
+                extra={"detail": detail},
+            )
+        except (AcpError, AcpProtocolError) as exc:
             logger.info(
                 "startup self-check second-layer probe could not run (error on this "
                 "one extra, optional prompt) — primary tools-snapshot check already "
@@ -572,20 +669,15 @@ class WorkerManager:
             )
             return
         verdicts = {v for v in (_probe_event_verdict(u) for u in worker.startup_updates) if v}
+        if "completed" in verdicts:
+            raise WorkerStartupError(
+                f"{PROBE_TOOL_NAME} ran to completion instead of being blocked — "
+                "jones_gate is not enforcing (HERMES_SAFE_MODE? plugin failed to load?)"
+            )
         if "blocked" in verdicts:
             logger.info(
                 "startup self-check second-layer probe confirmed jones_gate's block "
                 "semantics are enforcing",
-                extra={"detail": detail},
-            )
-        elif "completed" in verdicts:
-            logger.warning(
-                f"startup self-check second-layer probe observed {PROBE_TOOL_NAME} run "
-                "to completion instead of being blocked — jones_gate's block semantics "
-                "may not be enforcing even though it's loaded (primary tools-snapshot "
-                "check already passed; delivering this worker regardless — this "
-                "second layer is diagnostic-only, per Issue #38 ruling, never a "
-                "delivery gate)",
                 extra={"detail": detail},
             )
         elif "failed_unverified" in verdicts:

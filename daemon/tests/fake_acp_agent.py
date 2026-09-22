@@ -78,6 +78,25 @@ own entry below).
   called the probe tool) — Issue #38 ruling 2's central scenario: the
   self-check must still deliver this worker, only logging that the optional
   second layer got no cooperation.
+- "gate_not_enforcing" (round-1 review findings #2/#5): writes `jones_tools.
+  json` normally (jones_gate genuinely loaded, unlike "probe_completes"
+  above) but STILL reports the probe tool call as *completed* instead of
+  blocked — simulates the plugin having loaded but its `pre_tool_call` block
+  hook not actually enforcing. Positive, vendor-agnostic evidence
+  `_probe_second_layer` must still fail-closed reject on, even though the
+  primary tools-snapshot layer already passed.
+- "dies_after_snapshot" (round-1 review findings #3/#7): writes `jones_tools.
+  json` on the first prompt (the probe prompt) exactly like "normal", then
+  immediately hard-exits (`os._exit(1)`) without responding to it at all or
+  emitting any tool_call event — simulates a worker process dying during the
+  self-check window, after having already proven the plugin loaded.
+- "slow_probe_response" (round-1 review findings #1/#6): writes `jones_tools.
+  json` immediately, then holds the probe prompt's response until either a
+  `session/cancel` notification arrives for this session or a long
+  safety-net timeout elapses (whichever first), never emitting any probe
+  tool_call event — simulates a real model that's simply slow to finish its
+  Turn, exercising `_probe_second_layer`'s own bounded budget and the
+  `session/cancel` it must send once that budget expires.
 - "hang_init": never responds to `initialize` — exercises the daemon's
   handshake timeout.
 - "crash_on_prompt": behaves like "normal" through the startup self-check
@@ -231,6 +250,23 @@ def _send_update(session_id: str, update: dict) -> None:
     _notify("session/update", {"sessionId": session_id, "update": update})
 
 
+_SLOW_PROBE_HOLD_S = 10.0  # safety net only — cut short by session/cancel in practice
+
+
+def _handle_slow_probe_prompt(session_id: str) -> None:
+    """`"slow_probe_response"` mode — see module docstring. Blocks this prompt's
+    own thread (same pattern as `_handle_spawn_subprocess_terminal`) until
+    `session/cancel` arrives for THIS session, or `_SLOW_PROBE_HOLD_S` elapses
+    as a safety net so a daemon bug that never sends cancel can't hang this
+    fake agent forever. Never emits a probe tool_call event either way —
+    indistinguishable, from the daemon's side, from "no probe call" once cut
+    off."""
+    ev = threading.Event()
+    _cancel_events[session_id] = ev
+    ev.wait(_SLOW_PROBE_HOLD_S)
+    _cancel_events.pop(session_id, None)
+
+
 def _handle_probe_prompt(session_id: str) -> None:
     tool_call_id = "probe-1"
     if MODE == "no_probe_call":
@@ -240,7 +276,7 @@ def _handle_probe_prompt(session_id: str) -> None:
         {"sessionUpdate": "tool_call", "toolCallId": tool_call_id, "title": PROBE_TOOL_NAME,
          "status": "pending", "rawInput": {}},
     )
-    final_status = "completed" if MODE == "probe_completes" else "failed"
+    final_status = "completed" if MODE in ("probe_completes", "gate_not_enforcing") else "failed"
     if final_status == "failed":
         raw_output = (
             {"error": "unknown tool: jones.__probe__"}
@@ -479,10 +515,18 @@ def _handle_prompt_request(req_id, params: dict) -> None:
     # relative ordering (early in Turn processing, before anything else this
     # agent does for the prompt).
     _maybe_write_tools_snapshot(session_id)
+    if MODE == "dies_after_snapshot":
+        # round-1 review findings #3/#7 — see module docstring: dies right
+        # after proving the plugin loaded, before responding to anything,
+        # unconditionally (this is always the FIRST prompt, i.e. the probe).
+        os._exit(1)
     prompt_blocks = params.get("prompt") or []
     text = "".join(b.get("text", "") for b in prompt_blocks if isinstance(b, dict))
     if PROBE_TOOL_NAME in text:
-        _handle_probe_prompt(session_id)
+        if MODE == "slow_probe_response":
+            _handle_slow_probe_prompt(session_id)
+        else:
+            _handle_probe_prompt(session_id)
     elif MODE == "crash_on_prompt":
         os._exit(7)
     elif _TOOL_EXCEPTION_MARKER in text:
