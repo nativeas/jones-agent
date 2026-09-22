@@ -52,6 +52,31 @@ per surviving finding:
   only the full TERM-grace-then-KILL escalation can end it) is genuinely
   dead by the time `shutdown()` returns — not merely that `shutdown()`
   didn't raise.
+
+Round-3 review (finding #2, a second time — a real bug in round-2's own
+fix) added one more:
+
+- `test_reap_stop_orphans_does_not_touch_a_child_spawned_by_the_next_turn`:
+  `stop()`'s pre-cancel snapshot and `worker.descendant_baseline` at
+  reap-task-creation time are BOTH frozen at that instant — but `stop()`
+  neither tears the worker down (it's deliberately
+  left for the next message to reuse) nor cancels the reap task it just
+  scheduled. If the user's NEXT message starts a new turn on that SAME
+  worker before the grace period elapses, that new turn's own `mark_turn_
+  started` call re-baselines the worker for ITS turn, but the ALREADY-
+  SLEEPING reap task from the turn that got stopped still holds the OLD
+  baseline — so when it wakes up and re-snapshots (round-2's own finding
+  #2 fix), the new turn's legitimate, currently-in-use descendants (a
+  shell command, a newly connected MCP server) look exactly like a late-
+  grace-period orphan of the STOPPED turn and get killed. Turn 1 spawns an
+  independent-session child and is `stop()`ped while still holding it
+  open (a real, correctly-reaped orphan — establishes the reap task in the
+  first place); as soon as Turn 1's task is actually done, Turn 2 (an
+  ordinary, unrelated turn on the SAME reused worker) spawns its OWN
+  independent-session child and is left running, never stopped. Asserts
+  Turn 1's child is dead (the fallback still works) while Turn 2's child is
+  still alive well past both grace periods (the fallback doesn't reach
+  across the turn boundary).
 """
 
 from __future__ import annotations
@@ -544,3 +569,119 @@ async def test_shutdown_waits_long_enough_for_reap_stop_orphans_own_worst_case(
         if orphan_pid is not None and _alive(orphan_pid):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(orphan_pid, 9)
+
+
+async def test_reap_stop_orphans_does_not_touch_a_child_spawned_by_the_next_turn(
+    tmp_path, monkeypatch
+):
+    """Round-3 review (finding #2, a second time — see module docstring for
+    the full mechanism). `_ORPHAN_CANCEL_GRACE_S` is widened well past
+    `_make_service`'s default 0.2s here — long enough for Turn 1's own
+    ~1s-blocking `SPAWN_ORPHAN_INDEPENDENT_SESSION` handler to actually
+    finish (so `stop()`'s reap task is still asleep through its grace period
+    when Turn 2 starts, not already done), while `_ORPHAN_TERM_GRACE_S` is
+    shrunk (a plain `sleep` dies the instant SIGTERM arrives — no need for
+    the real 5.0s default here)."""
+    service = await _make_service(tmp_path, monkeypatch)
+    # Override `_make_service`'s own 0.2s grace period — this test needs
+    # room for Turn 1's task to actually finish and Turn 2 to start and
+    # spawn its own child, all while the reap task from Turn 1's stop() is
+    # still asleep.
+    monkeypatch.setattr(manager_module, "_ORPHAN_CANCEL_GRACE_S", 2.5)
+    monkeypatch.setattr(manager_module, "_ORPHAN_TERM_GRACE_S", 1.0)
+    turn1_child_pid: int | None = None
+    turn2_child_pid: int | None = None
+    try:
+        session_id = await _new_session(service, mode="task")
+
+        async def _get_worker():
+            while service.worker_manager.get(session_id) is None:
+                await asyncio.sleep(0.02)
+            return service.worker_manager.get(session_id)
+
+        # Turn 1: spawn an independent-session child, stop() while it's
+        # still in flight — a real, correctly-reaped orphan (establishes
+        # that `stop()` actually schedules a `reap_stop_orphans` task).
+        await service.send(session_id, "SPAWN_ORPHAN_INDEPENDENT_SESSION")
+        worker = await _get_worker()
+        pid_file = worker.hermes_home / _ORPHAN_PID_FILE_NAME
+        await _wait_until(lambda: pid_file.exists(), timeout=5.0)
+        turn1_child_pid = int(pid_file.read_text().strip())
+        assert _alive(turn1_child_pid), "turn-1 orphan child never started"
+
+        result = await service.stop(session_id)
+        assert result["stopped"] is True
+        reap_tasks_before_turn2 = set(service._background_tasks)
+        assert reap_tasks_before_turn2, (
+            "stop() did not schedule a reap_stop_orphans background task — "
+            "test setup bug, the rest of this test proves nothing"
+        )
+
+        # Wait for Turn 1's own task to actually finish (its handler's
+        # blocking sleep, then the cancelled prompt() returning) — only
+        # once it's done() does `send()` start Turn 2 immediately instead
+        # of queuing it behind a (round-1-fix) suspended queue.
+        await _wait_until(
+            lambda: session_id not in service._turn_tasks
+            or service._turn_tasks[session_id].done(),
+            timeout=5.0,
+        )
+
+        # Turn 2: an ordinary, unrelated turn on the SAME (reused) worker,
+        # started while Turn 1's `reap_stop_orphans` task (grace period
+        # 2.5s) is still asleep. Spawns its own independent-session child
+        # and is left running — never stopped, so this child is genuinely
+        # still in use.
+        await service.send(session_id, "SPAWN_ORPHAN_INDEPENDENT_SESSION")
+        await _wait_until(
+            lambda: pid_file.exists()
+            and int(pid_file.read_text().strip()) != turn1_child_pid,
+            timeout=5.0,
+        )
+        turn2_child_pid = int(pid_file.read_text().strip())
+        assert _alive(turn2_child_pid), "turn-2 child never started"
+        assert turn2_child_pid != turn1_child_pid, (
+            "test setup bug: turn-2 didn't actually spawn a NEW child"
+        )
+
+        # Past both of Turn 1's reap task's grace periods (2.5s + 1.0s,
+        # plus margin) — Turn 1's own child must be dead (the fallback
+        # still works), Turn 2's child must still be alive the WHOLE time
+        # (not just at the deadline — see `_actually_running`'s own
+        # docstring for why a single end-of-window check isn't enough).
+        # `_actually_running` (not `_alive()`) for turn-1's child too: its
+        # real OS parent is the fake-agent WORKER process, which never
+        # explicitly `wait()`s on it, so a SIGTERM'd-but-unreaped child is a
+        # ZOMBIE — `_alive()`/bare `kill(pid, 0)` keeps reporting that as
+        # "still alive" until something coincidentally reaps it (see
+        # `_actually_running`'s own docstring), which isn't a signal this
+        # test should block on.
+        deadline = time.monotonic() + 5.5
+        turn1_child_reaped = False
+        while time.monotonic() < deadline:
+            assert _actually_running(turn2_child_pid), (
+                f"turn-2 descendant pid {turn2_child_pid} was killed by turn-1's "
+                "stop() reap task after a new turn started during its grace period "
+                "— Issue #41 round-3 review finding #2"
+            )
+            if not _actually_running(turn1_child_pid):
+                turn1_child_reaped = True
+                break
+            await asyncio.sleep(0.1)
+        assert turn1_child_reaped, (
+            f"turn-1 orphan pid {turn1_child_pid} was never reaped — the fallback "
+            "itself stopped working, not just the round-3 fix's own claim"
+        )
+        # Final confirmation turn-2's child is still alive after turn-1's
+        # reap task has definitely finished (it just proved turn-1's child
+        # is gone).
+        assert _actually_running(turn2_child_pid), (
+            f"turn-2 descendant pid {turn2_child_pid} was killed by turn-1's stop() "
+            "reap task — Issue #41 round-3 review finding #2"
+        )
+    finally:
+        for pid in (turn1_child_pid, turn2_child_pid):
+            if pid is not None and _alive(pid):
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, 9)
+        await service.shutdown()

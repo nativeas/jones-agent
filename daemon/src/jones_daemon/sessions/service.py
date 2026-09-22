@@ -1003,6 +1003,12 @@ class SessionService:
         # and must never be reaped, no matter how long it survives past this
         # `stop()`.
         worker_baseline = worker.descendant_baseline if worker is not None else frozenset()
+        # Round-3 review (finding #2, a second time): captured alongside
+        # `worker_baseline` above, from the SAME worker snapshot — passed
+        # through to `reap_stop_orphans` so it can tell whether a new turn
+        # started on this worker while it was asleep through its grace
+        # period (see that method's own docstring for why that matters).
+        worker_turn_generation = worker.turn_generation if worker is not None else 0
         has_orphan_candidate = any(
             (e.pid, e.create_time) not in worker_baseline for e in orphan_snapshot
         )
@@ -1062,6 +1068,7 @@ class SessionService:
                     session_id=session_id,
                     worker_pid=worker.process.pid,
                     baseline=worker_baseline,
+                    turn_generation=worker_turn_generation,
                 )
             )
             self._background_tasks.add(task)

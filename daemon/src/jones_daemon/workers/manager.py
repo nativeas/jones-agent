@@ -148,6 +148,18 @@ class Worker:
     # apart is whether they existed before this turn started. Empty until
     # the first turn on this worker calls `mark_turn_started`.
     descendant_baseline: frozenset[tuple[int, float]] = field(default_factory=frozenset)
+    # Round-3 review (finding #2, a second time): bumped by `mark_turn_
+    # started` every time it runs, alongside `descendant_baseline`. Lets a
+    # `reap_stop_orphans` call that's already sleeping through its grace
+    # period notice a NEW turn started on this SAME worker while it slept —
+    # see that method's own docstring for why that matters: a descendant
+    # the new turn legitimately spawned (during ITS OWN actions, after ITS
+    # OWN `mark_turn_started`) is indistinguishable, by process-tree shape
+    # alone, from a genuine late-grace-period orphan of the turn `stop()`
+    # actually stopped. `reap_stop_orphans` captures this value at snapshot
+    # time and compares it against the worker's CURRENT value after waking
+    # up — a mismatch means a new turn raced it.
+    turn_generation: int = 0
 
 
 async def _noop(_params: dict[str, Any]) -> None:
@@ -639,6 +651,10 @@ class WorkerManager:
             return
         entries = snapshot_worker_descendants(worker.process.pid)
         worker.descendant_baseline = frozenset((e.pid, e.create_time) for e in entries)
+        # Round-3 review (finding #2, a second time) — see `Worker.turn_
+        # generation`'s own field comment for why this is bumped in lockstep
+        # with `descendant_baseline` above, every call, not just the first.
+        worker.turn_generation += 1
 
     async def reap_stop_orphans(
         self,
@@ -647,6 +663,7 @@ class WorkerManager:
         session_id: str,
         worker_pid: int,
         baseline: frozenset[tuple[int, float]] = frozenset(),
+        turn_generation: int = 0,
     ) -> list[dict[str, Any]]:
         """Issue #41 fallback for `SessionService.stop()` — see `snapshot_
         worker_descendants`'s docstring for why `snapshot_before_cancel` must
@@ -670,6 +687,33 @@ class WorkerManager:
         the grace period and UNIONed with the first (by `(pid, create_time)`)
         so a descendant that appears in EITHER is a reap candidate, not just
         one visible before `session/cancel` was ever sent.
+
+        Round-3 review (finding #2, a second time — a real bug in the fix
+        just described): that second snapshot is a plain re-walk of
+        `worker_pid`'s WHOLE descendant tree, with no idea which turn any
+        given descendant belongs to. If the user starts a brand-new message
+        on this SAME worker within the grace window (stop() doesn't tear the
+        worker down — see `SessionService.stop()`'s own comment — and
+        nothing cancels a still-sleeping `reap_stop_orphans` when a new turn
+        begins), that new turn's `mark_turn_started` call re-baselines
+        `worker.descendant_baseline` for the NEW turn — but this call's own
+        `baseline` argument is a value captured back when THIS call was
+        created and never updates. Anything the new turn legitimately spawns
+        during its own actions (a shell command, a newly connected MCP
+        server) then shows up in `snapshot_after_grace`, isn't in the stale
+        `baseline`, and is structurally indistinguishable from a genuine
+        late-grace-period orphan of the turn THIS call is trying to clean up
+        after — the old code reaped it anyway. Fix: `turn_generation`
+        (captured by the caller at the same moment as `baseline`, from
+        `Worker.turn_generation`) is compared against the worker's CURRENT
+        value right before the second snapshot is taken; a mismatch (or the
+        worker no longer being this same live one at all — same check) means
+        a new turn raced this call, and the second snapshot is skipped
+        entirely rather than risk attributing its contents to the wrong
+        turn. This narrows finding #2's original catch (a descendant spawned
+        late in the grace period by the STOPPED turn itself) back to exactly
+        the case it was meant for — the overwhelmingly common one, where no
+        other turn starts on this worker during the wait.
 
         Round-2 review findings #1/#4: `baseline` (`WorkerManager.mark_turn_
         started`'s snapshot from when the CURRENT turn began) is subtracted
@@ -695,23 +739,49 @@ class WorkerManager:
         grace_period_s = _ORPHAN_CANCEL_GRACE_S
         if grace_period_s > 0:
             await asyncio.sleep(grace_period_s)
-        try:
-            snapshot_after_grace = snapshot_worker_descendants(worker_pid)
-        except Exception as exc:  # noqa: BLE001 - the worker itself may have
-            # exited during the grace period (a crash, or a completely
-            # separate teardown path racing this one) — `snapshot_worker_
-            # descendants` already handles `psutil.NoSuchProcess` for the
-            # worker pid itself internally, but this defends the same way
-            # findings #5's per-entry handling does below: never let this
-            # second look's own failure erase what the FIRST snapshot
-            # already proved needs reaping.
-            logger.warning(
-                "stop(): re-snapshotting worker descendants after the grace period failed "
-                "— proceeding with only the pre-cancel snapshot (Issue #41 fallback)",
-                extra={"detail": {"session_id": session_id, "worker_pid": worker_pid,
-                                   "error": str(exc)}},
+        # Round-3 review (finding #2, a second time) — see this method's own
+        # docstring. If a new turn has started on this SAME worker while
+        # this call was asleep, its own `mark_turn_started` will have
+        # advanced `turn_generation` past what this call captured at
+        # snapshot time; if the worker was torn down and a different one
+        # spawned in its place, `self._workers.get(session_id)` no longer
+        # matches `worker_pid` at all. Either way, a fresh walk of the whole
+        # descendant tree right now can no longer be trusted to belong to
+        # the turn this call is cleaning up after — skip it.
+        current_worker = self._workers.get(session_id)
+        worker_unchanged = (
+            current_worker is not None
+            and current_worker.process.pid == worker_pid
+            and current_worker.turn_generation == turn_generation
+        )
+        if not worker_unchanged:
+            logger.info(
+                "stop(): a new turn started on this worker during the grace period — "
+                "skipping the post-grace-period re-snapshot to avoid mistaking that new "
+                "turn's own legitimate descendants for a leftover orphan of the turn "
+                "this call is cleaning up after (Issue #41 round-3 review)",
+                extra={"detail": {"session_id": session_id, "worker_pid": worker_pid}},
             )
             snapshot_after_grace = []
+        else:
+            try:
+                snapshot_after_grace = snapshot_worker_descendants(worker_pid)
+            except Exception as exc:  # noqa: BLE001 - the worker itself may have
+                # exited during the grace period (a crash, or a completely
+                # separate teardown path racing this one) — `snapshot_worker_
+                # descendants` already handles `psutil.NoSuchProcess` for the
+                # worker pid itself internally, but this defends the same way
+                # findings #5's per-entry handling does below: never let this
+                # second look's own failure erase what the FIRST snapshot
+                # already proved needs reaping.
+                logger.warning(
+                    "stop(): re-snapshotting worker descendants after the grace period "
+                    "failed — proceeding with only the pre-cancel snapshot (Issue #41 "
+                    "fallback)",
+                    extra={"detail": {"session_id": session_id, "worker_pid": worker_pid,
+                                       "error": str(exc)}},
+                )
+                snapshot_after_grace = []
         combined: dict[tuple[int, float], OrphanSnapshotEntry] = {
             (e.pid, e.create_time): e
             for e in (*snapshot_before_cancel, *snapshot_after_grace)
