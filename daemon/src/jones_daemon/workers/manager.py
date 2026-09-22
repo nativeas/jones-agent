@@ -134,6 +134,20 @@ class Worker:
         default=lambda params: _deny_during_startup(params)
     )
     startup_updates: list[dict[str, Any]] = field(default_factory=list)
+    # Issue #41 round-2 review (findings #1/#4): the worker's own descendant
+    # tree (`(pid, create_time)` pairs), snapshotted by `WorkerManager.
+    # mark_turn_started` right after THIS session's most recent turn's own
+    # `ensure_started()` returned — i.e. everything that already existed
+    # BEFORE that turn's own actions had any chance to spawn something.
+    # `reap_stop_orphans` never touches anything in this set: a stdio MCP
+    # server, a persistent `code_kernel`, or a `terminal(background=true)`
+    # process the user is depending on all predate whichever turn's `stop()`
+    # happens to run next (they're meant to survive across turns on the SAME
+    # worker), and are structurally indistinguishable from a genuine leaked
+    # orphan by process-tree shape alone — the only thing that tells them
+    # apart is whether they existed before this turn started. Empty until
+    # the first turn on this worker calls `mark_turn_started`.
+    descendant_baseline: frozenset[tuple[int, float]] = field(default_factory=frozenset)
 
 
 async def _noop(_params: dict[str, Any]) -> None:
@@ -234,6 +248,22 @@ it."""
 _GROUP_KILL_POLL_INTERVAL_S = 0.05
 
 
+def orphan_reap_worst_case_wait_s() -> float:
+    """Round-2 review findings #3/#6: `reap_stop_orphans`'s own worst-case
+    duration (grace period + TERM->KILL escalation window), for `Session
+    Service.shutdown()` to bound its wait on a still-in-flight reap task
+    against — the flat 5.0s that wait used before could cut a genuinely
+    still-reaping task off mid-way (SIGTERM already sent, SIGKILL never
+    reached), letting an orphan the fallback itself already found survive
+    past daemon exit, exactly the G09 guarantee this whole fallback exists
+    for. A plain function, not a module-level constant computed once: reads
+    `_ORPHAN_CANCEL_GRACE_S`/`_ORPHAN_TERM_GRACE_S` fresh on every call (same
+    reasoning as `reap_stop_orphans`'s own docstring on why it reads those as
+    plain globals instead of binding them as default parameter values) so a
+    test monkeypatching those constants changes this too."""
+    return _ORPHAN_CANCEL_GRACE_S + _ORPHAN_TERM_GRACE_S
+
+
 @dataclass(frozen=True)
 class OrphanSnapshotEntry:
     """One descendant of a worker, captured at snapshot time. `create_time`
@@ -318,19 +348,45 @@ def _same_process_still_alive(entry: OrphanSnapshotEntry) -> bool:
     is still running AND its `create_time` still matches what was recorded
     at snapshot time — a different process that happens to reuse the same
     pid will always have a different `create_time`, so this can never
-    mistake an unrelated later process for the one we snapshotted."""
+    mistake an unrelated later process for the one we snapshotted.
+
+    Round-2 review finding #5: catches `psutil.Error` broadly (`Zombie
+    Process`/`AccessDenied` included) — `create_time()` can raise `Access
+    Denied` for a process this daemon isn't permitted to introspect (e.g. a
+    `sudo` descendant), which real-world-verified escapes an `except
+    psutil.NoSuchProcess`-only guard and aborts whatever loop is calling
+    this mid-batch; catching the whole `psutil.Error` family (not just the
+    two known subtypes) is the same "never let one entry's OS-level quirk
+    break the rest of the batch" defense-in-depth the review asked for.
+    Treated as "not confirmed alive": if identity can't be proven, the R3
+    "绝不能误伤" requirement means not touching it, the same conservative
+    call `NoSuchProcess` already makes here."""
     try:
         proc = psutil.Process(entry.pid)
         return proc.is_running() and proc.create_time() == entry.create_time
-    except psutil.NoSuchProcess:
+    except psutil.Error:
         return False
 
 
-def _signal_pid(pid: int, sig: int) -> None:
+def _signal_pid(pid: int, sig: int) -> bool:
+    """Send `sig` to `pid`. Returns True if the signal was delivered, or the
+    process was already gone (same as before — nothing left to do). Returns
+    False for any other `OSError` (round-2 review finding #5: `Permission
+    Error` is real on macOS for a `sudo`-elevated descendant the daemon
+    isn't allowed to signal, or a pid-reuse race landing on a process this
+    daemon doesn't own — caught here as the `OSError` family generally,
+    not just that one subtype, so a DIFFERENT OS-level failure on some
+    other platform/kernel isn't a fresh instance of the same bug) — the
+    caller logs it and moves on to the REST of its batch instead of letting
+    an uncaught error escape and abort every remaining entry (this used to
+    only catch `ProcessLookupError`)."""
     try:
         os.kill(pid, sig)
+        return True
     except ProcessLookupError:
-        pass  # already gone — nothing left to signal
+        return True  # already gone — nothing left to signal
+    except OSError:
+        return False
 
 
 def _prepare_hermes_home(
@@ -558,26 +614,69 @@ class WorkerManager:
         docstring for what this actually does and why call-order matters."""
         return snapshot_worker_descendants(worker_pid)
 
+    def mark_turn_started(self, session_id: str) -> None:
+        """Round-2 review (findings #1/#4): baseline the worker's descendant
+        tree at the START of a turn — before that turn's own actions (tool
+        calls) get any chance to spawn something — so a later `stop()` on
+        this same worker can tell apart a genuine leaked orphan (created
+        DURING that turn) from a legitimate long-lived descendant that
+        already existed (a stdio MCP server, a persistent `code_kernel`, a
+        `terminal(background=true)` process) and is meant to keep running
+        across turns on the same worker.
+
+        `SessionService` calls this once per turn, right after `ensure_
+        started()` returns and before that turn's own `prompt()` — see that
+        call site's own comment. Called unconditionally every turn (not just
+        the first) so the baseline keeps accumulating whatever the PREVIOUS
+        turn's own legitimate descendants were, not just what existed when
+        the worker was first spawned — a descendant created lazily on first
+        use (e.g. `code_kernel` connects on the first code-execution tool
+        call, not necessarily at worker startup) must still be protected on
+        every subsequent turn's `stop()`, not only the turn that created it.
+        A no-op if this session has no live worker (nothing to baseline)."""
+        worker = self._workers.get(session_id)
+        if worker is None:
+            return
+        entries = snapshot_worker_descendants(worker.process.pid)
+        worker.descendant_baseline = frozenset((e.pid, e.create_time) for e in entries)
+
     async def reap_stop_orphans(
         self,
-        snapshot: list[OrphanSnapshotEntry],
+        snapshot_before_cancel: list[OrphanSnapshotEntry],
         *,
         session_id: str,
         worker_pid: int,
+        baseline: frozenset[tuple[int, float]] = frozenset(),
     ) -> list[dict[str, Any]]:
         """Issue #41 fallback for `SessionService.stop()` — see `snapshot_
-        worker_descendants`'s docstring for why `snapshot` must already have
-        been captured by the caller BEFORE `session/cancel` was even sent,
-        not computed inside this method. This method owns everything AFTER
-        that: wait a grace period for Hermes's own cleanup to do its job,
-        then confirm (by `create_time`, never by re-deriving the ppid chain
-        — see `_same_process_still_alive`) which snapshotted entries are
-        still alive, TERM them, give them a short beat, then KILL whatever's
-        still standing. Returns what was actually reaped (empty if Hermes's
-        own cleanup already got everything, the overwhelmingly common case)
-        for the caller to log/report — this method logs its own summary
-        regardless so it's visible even when the caller doesn't inspect the
-        return value.
+        worker_descendants`'s docstring for why `snapshot_before_cancel` must
+        already have been captured by the caller BEFORE `session/cancel` was
+        even sent, not computed inside this method. This method owns
+        everything AFTER that: wait a grace period for Hermes's own cleanup
+        to do its job, then confirm (by `create_time`, never by re-deriving
+        the ppid chain — see `_same_process_still_alive`) which candidates
+        are still alive, TERM them, give them a short beat, then KILL
+        whatever's still standing. Returns what was actually reaped (empty if
+        Hermes's own cleanup already got everything, the overwhelmingly
+        common case) for the caller to log/report — this method logs its own
+        summary regardless so it's visible even when the caller doesn't
+        inspect the return value.
+
+        Round-2 review finding #2: `snapshot_before_cancel` alone misses a
+        descendant that gets spawned AFTER it was taken but still DURING the
+        grace period below (e.g. a `make -j` that was already running at
+        cancel time keeps forking new compiler children while its own
+        cancellation is in flight) — a second snapshot is taken right after
+        the grace period and UNIONed with the first (by `(pid, create_time)`)
+        so a descendant that appears in EITHER is a reap candidate, not just
+        one visible before `session/cancel` was ever sent.
+
+        Round-2 review findings #1/#4: `baseline` (`WorkerManager.mark_turn_
+        started`'s snapshot from when the CURRENT turn began) is subtracted
+        from every candidate before anything is signalled — a legitimate,
+        meant-to-survive-across-turns descendant is indistinguishable from a
+        leaked orphan by process-tree shape alone; the only thing that tells
+        them apart is whether it predates this turn.
 
         Never polls outside of an active stop() call (R6: no resident
         background scan) — this coroutine runs exactly once per `stop()`
@@ -591,12 +690,36 @@ class WorkerManager:
         module constant afterward (same pattern `test_workers_manager.py`
         already uses for `_IDLE_SCAN_INTERVAL_S`) would silently have no
         effect on it were it a default instead."""
-        if not snapshot:
+        if not snapshot_before_cancel:
             return []
         grace_period_s = _ORPHAN_CANCEL_GRACE_S
         if grace_period_s > 0:
             await asyncio.sleep(grace_period_s)
-        survivors = [e for e in snapshot if _same_process_still_alive(e)]
+        try:
+            snapshot_after_grace = snapshot_worker_descendants(worker_pid)
+        except Exception as exc:  # noqa: BLE001 - the worker itself may have
+            # exited during the grace period (a crash, or a completely
+            # separate teardown path racing this one) — `snapshot_worker_
+            # descendants` already handles `psutil.NoSuchProcess` for the
+            # worker pid itself internally, but this defends the same way
+            # findings #5's per-entry handling does below: never let this
+            # second look's own failure erase what the FIRST snapshot
+            # already proved needs reaping.
+            logger.warning(
+                "stop(): re-snapshotting worker descendants after the grace period failed "
+                "— proceeding with only the pre-cancel snapshot (Issue #41 fallback)",
+                extra={"detail": {"session_id": session_id, "worker_pid": worker_pid,
+                                   "error": str(exc)}},
+            )
+            snapshot_after_grace = []
+        combined: dict[tuple[int, float], OrphanSnapshotEntry] = {
+            (e.pid, e.create_time): e
+            for e in (*snapshot_before_cancel, *snapshot_after_grace)
+        }
+        candidates = [entry for key, entry in combined.items() if key not in baseline]
+        if not candidates:
+            return []
+        survivors = [e for e in candidates if _same_process_still_alive(e)]
         if not survivors:
             return []
         logger.warning(
@@ -611,20 +734,46 @@ class WorkerManager:
                 }
             },
         )
+        # Round-2 review finding #5: per-entry, not a bare loop that lets one
+        # pid's `PermissionError`/`psutil.Error` (a `sudo` descendant, or a
+        # pid-reuse race — both real, see `_signal_pid`/`_same_process_still_
+        # alive`'s own docstrings) abort every REMAINING entry in the batch.
+        term_failed_pids: list[int] = []
         for entry in survivors:
-            _signal_pid(entry.pid, signal.SIGTERM)
+            if not _signal_pid(entry.pid, signal.SIGTERM):
+                term_failed_pids.append(entry.pid)
+        if term_failed_pids:
+            logger.warning(
+                "stop(): failed to signal (permission denied) some orphaned descendant "
+                "process(es) — continuing with the rest of the batch (Issue #41 fallback)",
+                extra={"detail": {"session_id": session_id, "worker_pid": worker_pid,
+                                   "pids": term_failed_pids}},
+            )
+
+        # `_same_process_still_alive` itself already catches `psutil.Error`
+        # broadly (see its own docstring, round-2 review finding #5) — no
+        # extra wrapper needed here to keep this poll loop from aborting on
+        # one entry's OS-level quirk.
         deadline = time.monotonic() + _ORPHAN_TERM_GRACE_S
         while time.monotonic() < deadline and any(
             _same_process_still_alive(e) for e in survivors
         ):
             await asyncio.sleep(_GROUP_KILL_POLL_INTERVAL_S)
         reaped: list[dict[str, Any]] = []
+        kill_failed_pids: list[int] = []
         for entry in survivors:
             escalated_to_sigkill = _same_process_still_alive(entry)
-            if escalated_to_sigkill:
-                _signal_pid(entry.pid, signal.SIGKILL)
+            if escalated_to_sigkill and not _signal_pid(entry.pid, signal.SIGKILL):
+                kill_failed_pids.append(entry.pid)
             reaped.append(
                 {"pid": entry.pid, "cmdline": entry.cmdline, "sigkill": escalated_to_sigkill}
+            )
+        if kill_failed_pids:
+            logger.warning(
+                "stop(): failed to SIGKILL (permission denied) some orphaned descendant "
+                "process(es) — see `pids` (Issue #41 fallback)",
+                extra={"detail": {"session_id": session_id, "worker_pid": worker_pid,
+                                   "pids": kill_failed_pids}},
             )
         logger.warning(
             "stop(): reaped orphaned descendant process(es) Hermes's own cleanup missed "

@@ -184,6 +184,13 @@ own entry below).
   the gap `WorkerManager.reap_stop_orphans` exists to cover. Writes the
   child's pid to `$HERMES_HOME/_orphan_independent_session.pid`, then
   finishes the prompt normally (`stopReason: "end_turn"`).
+- "SPAWN_ORPHAN_IGNORING_SIGTERM" prompt marker (Issue #41 round-2 review
+  findings #3/#6, pure addition, "normal" mode only, same pattern as
+  "SPAWN_ORPHAN_INDEPENDENT_SESSION" above) — identical shape EXCEPT the
+  child ignores `SIGTERM` (only `SIGKILL` ends it), to force a test all the
+  way through `WorkerManager.reap_stop_orphans`'s TERM-grace-then-KILL
+  escalation instead of a plain `sleep` dying the instant `SIGTERM` arrives.
+  Writes the child's pid to `$HERMES_HOME/_orphan_ignoring_sigterm.pid`.
 - "MANY_TOOL_CALLS:<n>" prompt marker (R-N5, controller ruling 2026-09-20,
   04-w5-interfaces.md §4.3 — Issue #22's Step-count budget test: "假 ACP
   agent 发 201 个 tool_call") — pure addition, same pattern as "USE_TOOL"/
@@ -501,6 +508,39 @@ def _handle_spawn_orphan_independent_session() -> None:
     time.sleep(1.0)
 
 
+_SPAWN_ORPHAN_IGNORING_SIGTERM_MARKER = "SPAWN_ORPHAN_IGNORING_SIGTERM"
+_ORPHAN_IGNORING_SIGTERM_PID_FILE_NAME = "_orphan_ignoring_sigterm.pid"
+
+
+def _handle_spawn_orphan_ignoring_sigterm() -> None:
+    """Issue #41 round-2 review (findings #3/#6): same shape as `_handle_
+    spawn_orphan_independent_session` above (a real child in its OWN new
+    session/pgid, never cleaned up by this agent on cancel or anything
+    else) EXCEPT this child installs its own `SIGTERM` handler that does
+    nothing — only `SIGKILL` can end it. A plain `sleep` (the other
+    handler's child) dies the instant `SIGTERM` arrives, which never
+    exercises `WorkerManager.reap_stop_orphans`'s TERM-grace-then-KILL
+    escalation at all; this one forces a test through that full path, to
+    prove `SessionService.shutdown()`'s own wait is bounded to cover it
+    (round-2 review findings #3/#6 — a flat 5.0s bound was shorter than that
+    escalation's own worst case)."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)"],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        Path(home, _ORPHAN_IGNORING_SIGTERM_PID_FILE_NAME).write_text(
+            str(proc.pid), encoding="utf-8"
+        )
+    # Same reasoning as `_handle_spawn_orphan_independent_session` above:
+    # hold this prompt "in flight" long enough for a test to observe the pid
+    # file and call stop() while the Turn is still active.
+    time.sleep(1.0)
+
+
 def _handle_normal_prompt(session_id: str, text: str) -> None:
     _send_update(
         session_id,
@@ -566,6 +606,8 @@ def _handle_normal_prompt(session_id: str, text: str) -> None:
         _handle_spawn_orphan_on_shutdown()
     if _SPAWN_ORPHAN_INDEPENDENT_SESSION_MARKER in text:
         _handle_spawn_orphan_independent_session()
+    if _SPAWN_ORPHAN_IGNORING_SIGTERM_MARKER in text:
+        _handle_spawn_orphan_ignoring_sigterm()
     many_match = _MANY_TOOL_CALLS_MARKER.search(text)
     if many_match:
         _handle_many_tool_calls_prompt(session_id, int(many_match.group(1)))
