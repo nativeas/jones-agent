@@ -16,6 +16,26 @@ already uses, see that file's module docstring) rather than imported.
 
 Behavior is selected via the `FAKE_ACP_MODE` env var (default "normal"):
 
+`jones_tools.json` (Issue #38 ruling 1 — the daemon's PRIMARY, fail-closed
+self-check criterion, `workers/manager.py::_wait_for_tools_snapshot`): every
+mode below WRITES this file into `$HERMES_HOME` the moment this agent handles
+its FIRST `session/prompt` request for a session (before dispatching to any
+mode-specific handler) — standing in for the real `jones_gate` plugin's own
+`on_session_start` hook (`kernel/plugin/jones_gate/_tools_snapshot.py`).
+Deliberately NOT written at `session/new` time: source-verified against the
+installed hermes-agent checkout, the real hook only fires from `agent/
+conversation_loop.py` as part of building the FIRST TURN's system prompt —
+i.e. strictly after a `session/prompt` is sent, never before (see `workers/
+manager.py::_startup_self_check`'s docstring for the full story and why this
+means the daemon's own probe prompt is a REQUIRED trigger, not merely a nice-
+to-have second layer). Getting this fake agent's timing right matters: an
+earlier version of this file wrote the snapshot at `session/new` instead,
+which made every fake-agent test pass while the equivalent real-Hermes E2E
+run hung forever — see the PR report.
+EXCEPT "no_tools_snapshot", which deliberately never writes it, simulating a
+`HERMES_SAFE_MODE`-style "plugin skipped loading entirely" (see that mode's
+own entry below).
+
 - "normal": blocks the startup-probe tool call (as a correctly-loaded
   jones_gate would), and for any other prompt streams two `agent_message_chunk`
   deltas; a prompt containing the marker "USE_TOOL" also emits a
@@ -27,20 +47,37 @@ Behavior is selected via the `FAKE_ACP_MODE` env var (default "normal"):
   `_handle_custom_permission_prompt`'s docstring). Finishes with
   `stopReason: "cancelled"` if a `session/cancel` notification arrived for
   that session while the prompt was in flight, else `"end_turn"`.
+- "no_tools_snapshot": behaves exactly like "normal" (including blocking the
+  probe correctly) EXCEPT it never writes `jones_tools.json` — simulates the
+  PRIMARY self-check criterion's own file never appearing (e.g. a
+  `HERMES_SAFE_MODE`-style skip that, unrealistically for this one mode, still
+  left `pre_tool_call` blocking intact) so a test can isolate "primary layer
+  alone must fail-closed" from whatever the optional probe layer shows (Issue
+  #38 ruling 1/3 — the primary criterion must reject even when the secondary
+  probe would otherwise look fine).
 - "probe_completes": reports the probe tool call as *completed* instead of
-  blocked — simulates `jones_gate` having silently failed to load
-  (`HERMES_SAFE_MODE`, see 00-foundation.md §7/§8.1) so the self-check must
-  refuse to deliver this worker.
+  blocked, AND never writes `jones_tools.json` — simulates `jones_gate` having
+  silently failed to load entirely (`HERMES_SAFE_MODE`, see
+  00-foundation.md §7/§8.1): neither its `pre_tool_call` block nor its
+  `on_session_start` snapshot write would have run. Issue #38 ruling 3: the
+  PRIMARY (tools-snapshot) layer must still refuse this worker — the
+  *optional* second layer's "completed" verdict is exercised elsewhere
+  (`no_tools_snapshot` above supplies a snapshot so that path can be tested
+  as diagnostic-only, non-blocking).
 - "probe_fails_unverified": reports the probe tool call as *failed*, same as
-  "normal", but WITHOUT jones_gate's own block-message marker in `rawOutput` —
-  simulates the plugin never having loaded at all (so Hermes fails the call as
-  an unknown tool, a `status: failed` event that looks identical to a real
-  block unless the daemon checks *why* it failed, round-1 review fix; see
-  `workers/manager.py::_probe_event_verdict`'s docstring). The self-check must
-  refuse to deliver this worker too — "failed" alone is not proof jones_gate
-  did the blocking.
-- "no_probe_call": never emits any tool_call event at all for the probe —
-  simulates the self-check prompt itself going unanswered/ignored.
+  "normal", but WITHOUT jones_gate's own block-message marker in `rawOutput`,
+  AND never writes `jones_tools.json` — simulates the plugin never having
+  loaded at all (so Hermes fails the call as an unknown tool, a
+  `status: failed` event that looks identical to a real block unless the
+  daemon checks *why* it failed, round-1 review fix; see
+  `workers/manager.py::_probe_event_verdict`'s docstring). Same as
+  "probe_completes": the PRIMARY layer must refuse this worker regardless of
+  what the optional probe shows.
+- "no_probe_call": never emits any tool_call event at all for the probe, but
+  DOES write `jones_tools.json` (jones_gate loaded fine; the model just never
+  called the probe tool) — Issue #38 ruling 2's central scenario: the
+  self-check must still deliver this worker, only logging that the optional
+  second layer got no cooperation.
 - "hang_init": never responds to `initialize` — exercises the daemon's
   handshake timeout.
 - "crash_on_prompt": behaves like "normal" through the startup self-check
@@ -111,6 +148,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 PROBE_TOOL_NAME = "jones.__probe__"
 MODE = os.environ.get("FAKE_ACP_MODE", "normal")
@@ -118,6 +156,46 @@ MODE = os.environ.get("FAKE_ACP_MODE", "normal")
 # see that module's comment for why it's duplicated rather than imported (this
 # file must stay dependency-free of jones_daemon).
 _GATE_BLOCK_MARKER = "jones_gate startup self-check: this tool is reserved and never runs."
+
+# Kept in sync by hand with jones_daemon.workers.manager._TOOLS_SNAPSHOT_FILE_NAME
+# / kernel/plugin/jones_gate/_tools_snapshot.py's `_FILE_NAME` — see module
+# docstring's "jones_tools.json" section.
+_TOOLS_SNAPSHOT_FILE_NAME = "jones_tools.json"
+_TOOLS_SNAPSHOT_SKIP_MODES = {"probe_completes", "probe_fails_unverified", "no_tools_snapshot"}
+# Sessions this agent has already written a snapshot for — real Hermes only
+# fires `on_session_start` once, on the first Turn (see module docstring);
+# writing again on every later prompt would be harmless (atomic replace) but
+# wouldn't match reality, so this mirrors "once per session" instead.
+_snapshot_written: set[str] = set()
+
+
+def _maybe_write_tools_snapshot(session_id: str) -> None:
+    if MODE in _TOOLS_SNAPSHOT_SKIP_MODES or session_id in _snapshot_written:
+        return
+    _snapshot_written.add(session_id)
+    _write_tools_snapshot(session_id)
+
+
+def _write_tools_snapshot(session_id: str) -> None:
+    """Stands in for `jones_gate`'s real `on_session_start` hook — see module
+    docstring's "jones_tools.json" section. Best-effort, same spirit as the
+    real hook: `HERMES_HOME` should always be set (the daemon always sets it,
+    `workers/manager.py::_worker_env`) but this must never crash the fake
+    agent if it somehow isn't."""
+    home = os.environ.get("HERMES_HOME")
+    if not home:
+        return
+    payload = {
+        "session_id": session_id,
+        "tools": ["hermes-acp"],
+        "mcp_servers": [],
+        "mcp_discovery_complete": True,
+        "written_at": time.time(),
+    }
+    target = Path(home) / _TOOLS_SNAPSHOT_FILE_NAME
+    tmp = Path(home) / f"{_TOOLS_SNAPSHOT_FILE_NAME}.tmp"
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(target)
 
 _stdout_lock = threading.Lock()
 _cancelled_sessions: set[str] = set()
@@ -395,6 +473,12 @@ def _wait_for_response(req_id: int, timeout: float = 10.0) -> dict | None:
 
 def _handle_prompt_request(req_id, params: dict) -> None:
     session_id = params.get("sessionId")
+    # Real Hermes writes `jones_tools.json` as a side effect of processing the
+    # FIRST Turn's prompt (see module docstring's "jones_tools.json" section)
+    # — done before dispatching to any mode-specific handler below, same
+    # relative ordering (early in Turn processing, before anything else this
+    # agent does for the prompt).
+    _maybe_write_tools_snapshot(session_id)
     prompt_blocks = params.get("prompt") or []
     text = "".join(b.get("text", "") for b in prompt_blocks if isinstance(b, dict))
     if PROBE_TOOL_NAME in text:

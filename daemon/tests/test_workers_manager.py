@@ -94,49 +94,117 @@ async def test_worker_subprocess_env_never_carries_yolo_or_safe_mode(tmp_path, m
     assert env["HERMES_HOME"] == str(tmp_path / "hermes_home")
 
 
-async def test_startup_self_check_rejects_a_worker_whose_probe_completes(tmp_path, monkeypatch):
-    # Simulates jones_gate having silently failed to load (HERMES_SAFE_MODE) —
-    # the probe tool ran to completion instead of being blocked.
+async def test_startup_self_check_rejects_a_worker_whose_plugin_never_loaded_at_all(
+    tmp_path, monkeypatch
+):
+    """Issue #38 ruling 1/3: a `HERMES_SAFE_MODE`-style "plugin skipped loading
+    entirely" must still be caught, fail-closed, by the PRIMARY (tools-snapshot)
+    self-check layer — `probe_completes` mode simulates exactly that (jones_gate
+    never loaded, so neither its block hook nor its `on_session_start` snapshot
+    write ran; see `fake_acp_agent.py`'s module docstring), and never writes
+    `jones_tools.json`. The self-check must time out waiting for that file and
+    refuse to deliver this worker, regardless of what the now-optional probe
+    layer would have shown."""
     monkeypatch.setenv("FAKE_ACP_MODE", "probe_completes")
-    manager = _make_manager(tmp_path)
-    await manager.start()
-    try:
-        with pytest.raises(WorkerStartupError, match="ran to completion"):
-            await manager.ensure_started("s1", cwd="/tmp")
-        assert manager.get("s1") is None
-    finally:
-        await manager.stop()
-
-
-async def test_startup_self_check_rejects_a_failed_probe_without_the_gate_marker(
-    tmp_path, monkeypatch
-):
-    """Round-1 review fix: a `status: failed` probe event isn't by itself proof
-    jones_gate did the blocking — it's exactly what a *missing* plugin (probe
-    tool never registered at all, so Hermes fails the call as unknown) looks
-    like too. The self-check must refuse to deliver this worker, the same as
-    `probe_completes`, not treat "some failure happened" as good enough."""
-    monkeypatch.setenv("FAKE_ACP_MODE", "probe_fails_unverified")
-    manager = _make_manager(tmp_path)
-    await manager.start()
-    try:
-        with pytest.raises(WorkerStartupError, match="verified-blocked"):
-            await manager.ensure_started("s1", cwd="/tmp")
-        assert manager.get("s1") is None
-    finally:
-        await manager.stop()
-
-
-async def test_startup_self_check_rejects_a_worker_that_never_calls_the_probe(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setenv("FAKE_ACP_MODE", "no_probe_call")
     manager = _make_manager(tmp_path, startup_timeout_s=1.0)
     await manager.start()
     try:
-        with pytest.raises(WorkerStartupError):
+        with pytest.raises(WorkerStartupError, match="self-check failed"):
             await manager.ensure_started("s1", cwd="/tmp")
         assert manager.get("s1") is None
+    finally:
+        await manager.stop()
+
+
+async def test_startup_self_check_rejects_a_worker_with_unverified_probe_and_no_snapshot(
+    tmp_path, monkeypatch
+):
+    """Same PRIMARY-layer refusal as above, via `probe_fails_unverified` mode —
+    another "plugin never loaded" simulation (Hermes fails the probe call as an
+    unknown tool because it was never registered) that also never writes
+    `jones_tools.json`. Confirms the primary layer's fail-closed timeout is
+    what's actually rejecting the worker, independent of which probe outcome
+    accompanies the missing snapshot."""
+    monkeypatch.setenv("FAKE_ACP_MODE", "probe_fails_unverified")
+    manager = _make_manager(tmp_path, startup_timeout_s=1.0)
+    await manager.start()
+    try:
+        with pytest.raises(WorkerStartupError, match="self-check failed"):
+            await manager.ensure_started("s1", cwd="/tmp")
+        assert manager.get("s1") is None
+    finally:
+        await manager.stop()
+
+
+async def test_startup_self_check_rejects_a_worker_whose_tools_snapshot_never_appears(
+    tmp_path, monkeypatch
+):
+    """Issue #38 ruling 1/3, isolated: the PRIMARY layer alone must fail-closed
+    when `jones_tools.json` never appears, even when the optional probe layer
+    would otherwise look completely fine (`no_tools_snapshot` mode blocks the
+    probe correctly, same as "normal" — it just never writes the snapshot
+    file). Proves the tools-snapshot check, not the probe, is what's doing the
+    rejecting here."""
+    monkeypatch.setenv("FAKE_ACP_MODE", "no_tools_snapshot")
+    manager = _make_manager(tmp_path, startup_timeout_s=1.0)
+    await manager.start()
+    try:
+        with pytest.raises(WorkerStartupError, match="self-check failed"):
+            await manager.ensure_started("s1", cwd="/tmp")
+        assert manager.get("s1") is None
+    finally:
+        await manager.stop()
+
+
+async def test_startup_self_check_delivers_a_worker_even_when_the_model_never_calls_the_probe(
+    tmp_path, monkeypatch
+):
+    """Issue #38 ruling 2 — the central scenario the whole fix is about: a
+    model that doesn't cooperate with the optional second-layer probe (here,
+    `no_probe_call` mode: no tool_call event at all for it) must NOT block
+    delivery once the PRIMARY layer has already proved `jones_gate` loaded
+    (`jones_tools.json` is written normally in this mode). Real DeepSeek
+    reproduces exactly this "no probe tool_call ever observed" shape 100% of
+    the time (see the PR report) — this is the regression test for that."""
+    monkeypatch.setenv("FAKE_ACP_MODE", "no_probe_call")
+    manager = _make_manager(tmp_path)
+    await manager.start()
+    try:
+        worker = await manager.ensure_started("s1", cwd="/tmp")
+        assert worker.acp_session_id == "fake-session-1"
+    finally:
+        await manager.stop()
+
+
+async def test_probe_second_layer_never_raises_on_a_completed_verdict(tmp_path, monkeypatch):
+    """Unit-level check on `_probe_second_layer` directly (Issue #38 ruling 2):
+    even the worst probe outcome — the reserved tool running to *completion*
+    instead of being blocked — must only log, never raise, since this layer
+    is diagnostic-only once the primary tools-snapshot check has already
+    passed."""
+    from jones_daemon.workers.manager import Worker
+
+    monkeypatch.setenv("FAKE_ACP_MODE", "normal")
+    manager = _make_manager(tmp_path)
+    await manager.start()
+    try:
+        worker = await manager.ensure_started("s1", cwd="/tmp")
+        assert isinstance(worker, Worker)
+        # Fabricate a "completed" probe verdict, as `_probe_event_verdict`
+        # would read it off a real `session/update` — exercises
+        # `_probe_second_layer` in isolation, without a second real prompt
+        # round-trip against the fake agent.
+        worker.startup_updates = [
+            {
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "title": "jones.__probe__",
+                    "status": "completed",
+                    "rawOutput": {"blocked": False},
+                }
+            }
+        ]
+        await manager._probe_second_layer(worker)  # must not raise
     finally:
         await manager.stop()
 

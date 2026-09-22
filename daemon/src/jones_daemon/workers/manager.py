@@ -46,6 +46,13 @@ _GATE_BLOCK_MARKER = "jones_gate startup self-check: this tool is reserved and n
 
 _JONES_GATE_SRC = Path(__file__).resolve().parent.parent / "kernel" / "plugin" / "jones_gate"
 
+# Kept in sync by hand with kernel/plugin/jones_gate/_tools_snapshot.py's `_FILE_NAME`
+# (same reason PROBE_TOOL_NAME/`_GATE_BLOCK_MARKER` are duplicated, not imported,
+# above — that package ships into the worker's own Python environment). Issue #38
+# primary self-check criterion — see `_wait_for_tools_snapshot`'s docstring.
+_TOOLS_SNAPSHOT_FILE_NAME = "jones_tools.json"
+_TOOLS_SNAPSHOT_POLL_INTERVAL_S = 0.05
+
 # PRD 9.2 "空闲超时（默认 10 min）回收".
 DEFAULT_IDLE_TIMEOUT_S = 600.0
 _IDLE_SCAN_INTERVAL_S = 30.0
@@ -453,33 +460,151 @@ class WorkerManager:
         return _collect
 
     async def _startup_self_check(self, worker: Worker) -> None:
-        """§8.1: prove `jones_gate` is actually loaded before this worker is handed
-        to a real session. Sends a directive prompt asking the model to call the
-        reserved, always-blocked probe tool, then inspects the `session/update`
-        events collected during that prompt for a blocked (never a completed) call
-        to it. See the PR report for this mechanism's real-Hermes reliability
-        caveat — it is fully deterministic against the fake test agent used in
-        every non-`JONES_E2E` test.
+        """§8.1 fail-closed startup self-check — restructured per Issue #38's
+        controller ruling into two layers, because the original sole criterion
+        (the probe prompt, now `_probe_second_layer` below) turned out to depend
+        on a model *choosing* to cooperate: 100% reproducible failure against a
+        real DeepSeek worker, which never calls the probe tool no matter how the
+        prompt is worded, even though `jones_gate` was loaded correctly the whole
+        time. A fail-closed invariant can't rest on that.
+
+        1. PRIMARY, fail-closed (`_wait_for_tools_snapshot`): poll for
+           `<HERMES_HOME>/jones_tools.json`, written by `jones_gate`'s own
+           `on_session_start` hook. The file's mere existence is proof the
+           plugin loaded, produced by the plugin itself with zero MODEL
+           participation. This alone decides whether the worker is delivered;
+           still catches the `HERMES_SAFE_MODE`-style "plugin silently never
+           loaded at all" case this self-check exists for, since that hook
+           then never runs either.
+        2. SECOND, optional layer (`_probe_second_layer`): the original probe
+           mechanism, kept only to additionally verify `jones_gate`'s *block*
+           semantics are actually enforcing (not just "loaded"). Diagnostic
+           only — logs what it observes and never raises, so an uncooperative
+           model (or any other outcome of this one extra, non-essential
+           prompt) can never block delivering a worker the primary layer
+           already proved safe.
+
+        **Why these two run CONCURRENTLY, not sequentially (correction to
+        00-foundation.md §8.1's original text and this Issue's own "顺带确认"
+        note — both wrong about this one specific hook, verified against the
+        installed hermes-agent==0.21.2 checkout)**: `on_session_start` does
+        NOT fire at `session/new`/`AIAgent` construction. Source: `agent/
+        conversation_loop.py`'s `invoke_hook("on_session_start", ...)` call
+        sits inside the FIRST TURN's system-prompt-build step — i.e. it only
+        fires as a side effect of the daemon actually sending a
+        `session/prompt`, before the model is called but strictly after a
+        prompt was sent. A real run against DeepSeek confirmed this
+        empirically: sequentially awaiting the snapshot BEFORE sending the
+        probe prompt hangs forever (`jones_tools.json` never appears, because
+        nothing ever triggers the hook) — see the PR report. Sending A prompt
+        is therefore a REQUIRED trigger for the primary check, not merely
+        nice-to-have for the optional second layer — but this is still zero
+        MODEL participation (ruling 1's actual requirement): the daemon
+        itself unconditionally sends this one prompt regardless of what any
+        model does with it, so a model refusing to call the probe tool still
+        can't stop `jones_tools.json` from appearing. `_probe_second_layer`
+        therefore runs as a background task, started before the primary wait
+        and always awaited afterward (never fire-and-forget) — it must finish
+        before this method returns, because `_spawn_and_check` swaps `worker.
+        session_update_handler` from the startup collector to the real,
+        production handler the moment this method returns; a still-in-flight
+        probe response arriving after that swap would be misrouted to
+        `SessionService` instead of collected here.
         """
         assert worker.client is not None and worker.acp_session_id is not None  # noqa: S101
-        await worker.client.prompt(worker.acp_session_id, _PROBE_PROMPT)
+        probe_task = asyncio.create_task(self._probe_second_layer(worker))
+        try:
+            await self._wait_for_tools_snapshot(worker)
+        finally:
+            # `_probe_second_layer` never raises (see its own docstring) and is
+            # internally bounded by `self._startup_timeout_s` regardless of how
+            # the primary wait above concluded — awaiting it here can't add an
+            # unbounded delay even on the fail-closed (timeout) path.
+            await probe_task
+
+    async def _wait_for_tools_snapshot(self, worker: Worker) -> None:
+        """PRIMARY self-check criterion (Issue #38 ruling 1) — see
+        `_startup_self_check`'s docstring, including why this only ever
+        resolves once the concurrent `_probe_second_layer` has actually sent
+        its prompt. Polls for `<HERMES_HOME>/jones_tools.json` to appear; no
+        timeout of its own, since this always runs under `_spawn_and_check`'s
+        `asyncio.wait_for(..., self._startup_timeout_s)`, which cancels this
+        loop (turned into `WorkerStartupError` there) the same fail-closed way
+        a stuck `initialize()`/`new_session()` already does.
+
+        `_prepare_hermes_home` already deleted any stale snapshot left by a
+        PREVIOUS worker generation for this same `hermes_home` before this
+        worker was even spawned (see that function's comment), so a leftover
+        file from an old generation can't produce a false pass here.
+        """
+        snapshot_path = worker.hermes_home / _TOOLS_SNAPSHOT_FILE_NAME
+        while not snapshot_path.exists():
+            await asyncio.sleep(_TOOLS_SNAPSHOT_POLL_INTERVAL_S)
+
+    async def _probe_second_layer(self, worker: Worker) -> None:
+        """Optional SECOND self-check layer (Issue #38 ruling 2) — see
+        `_startup_self_check`'s docstring, including why THIS is what actually
+        triggers the primary layer's file to ever appear. Sends the same
+        directive prompt the old sole self-check used, asking the model to
+        call the reserved, always-blocked probe tool, and logs what the
+        `session/update` events collected during that prompt show — but never
+        raises `WorkerStartupError` and never blocks longer than
+        `self._startup_timeout_s` (its own inner `asyncio.wait_for`, since
+        `AcpClient.prompt()` itself has no client-side deadline — "an agent
+        turn can legitimately run for a long time" — and this method is always
+        awaited to completion by `_startup_self_check`, so an unbounded prompt
+        here would make the self-check's own fail-closed timeout unbounded
+        too on the failure path).
+        """
+        assert worker.client is not None and worker.acp_session_id is not None  # noqa: S101
+        detail: dict[str, Any] = {"session_id": worker.session_id}
+        try:
+            await asyncio.wait_for(
+                worker.client.prompt(worker.acp_session_id, _PROBE_PROMPT),
+                timeout=self._startup_timeout_s,
+            )
+        except (TimeoutError, AcpError, AcpProtocolError) as exc:
+            logger.info(
+                "startup self-check second-layer probe could not run (error on this "
+                "one extra, optional prompt) — primary tools-snapshot check already "
+                "passed, delivering this worker regardless",
+                extra={"detail": {**detail, "error": str(exc)}},
+            )
+            return
         verdicts = {v for v in (_probe_event_verdict(u) for u in worker.startup_updates) if v}
-        if "completed" in verdicts:
-            raise WorkerStartupError(
-                f"{PROBE_TOOL_NAME} ran to completion instead of being blocked — "
-                "jones_gate is not enforcing (HERMES_SAFE_MODE? plugin failed to load?)"
+        if "blocked" in verdicts:
+            logger.info(
+                "startup self-check second-layer probe confirmed jones_gate's block "
+                "semantics are enforcing",
+                extra={"detail": detail},
             )
-        if "blocked" not in verdicts:
-            detail = (
-                f" — {PROBE_TOOL_NAME} failed, but without jones_gate's own block "
-                "marker; most likely Hermes reporting 'unknown tool' because the "
-                "plugin (and therefore the probe tool registration) never loaded"
-                if "failed_unverified" in verdicts
-                else ""
+        elif "completed" in verdicts:
+            logger.warning(
+                f"startup self-check second-layer probe observed {PROBE_TOOL_NAME} run "
+                "to completion instead of being blocked — jones_gate's block semantics "
+                "may not be enforcing even though it's loaded (primary tools-snapshot "
+                "check already passed; delivering this worker regardless — this "
+                "second layer is diagnostic-only, per Issue #38 ruling, never a "
+                "delivery gate)",
+                extra={"detail": detail},
             )
-            raise WorkerStartupError(
-                f"no verified-blocked {PROBE_TOOL_NAME} tool_call observed during "
-                f"self-check — cannot confirm jones_gate is loaded{detail}"
+        elif "failed_unverified" in verdicts:
+            logger.warning(
+                f"startup self-check second-layer probe: {PROBE_TOOL_NAME} failed but "
+                "without jones_gate's own block marker — inconclusive (primary "
+                "tools-snapshot check already passed; delivering this worker "
+                "regardless)",
+                extra={"detail": detail},
+            )
+        else:
+            # No probe tool_call event observed at all — the model simply
+            # didn't cooperate (Issue #38: reproducibly true for DeepSeek).
+            # Per the controller's ruling this must never block delivery.
+            logger.info(
+                f"startup self-check second-layer probe: model did not call "
+                f"{PROBE_TOOL_NAME} (non-cooperative model — primary tools-snapshot "
+                "check already passed, delivering this worker regardless)",
+                extra={"detail": detail},
             )
 
     async def _terminate(self, worker: Worker, *, reason: str) -> None:

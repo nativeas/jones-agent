@@ -241,17 +241,43 @@ title=cron 名)` 与失败/完成/停用推回主会话的系统消息都需要�
   发现也不加载——注意这是 `config.yaml` 的键，不是 `plugin.yaml` 的键，`plugin.yaml` 只声明插件自身的
   `name`/`version`/`hooks`）；**不得**写 `approvals.mode: off`（默认 `manual` 即可，见 §7）；
   `command_allowlist` 初始为空或由 Jones 自己管理写入，不要复制用户默认 profile 的现存内容。
-- **启动自检（fail-closed，2026-09-19 第三轮评审新增）**：daemon 每次拉起 worker 子进程后，在把它接入
-  正式会话前必须显式验证两件事，任一失败就拒绝启动该 worker（不能带着"权限闸可能不存在"这个状态继续跑）：
+- **启动自检（fail-closed，2026-09-19 第三轮评审新增；2026-09-22 Issue #38 改判据，见下）**：daemon
+  每次拉起 worker 子进程后，在把它接入正式会话前必须显式验证两件事，任一失败就拒绝启动该 worker（不能
+  带着"权限闸可能不存在"这个状态继续跑）：
   1. 子进程 env 里确实没有 `HERMES_YOLO_MODE`/`HERMES_SAFE_MODE`（daemon 自己构造 env 时就该保证，这里
      是双重确认，防止未来有人在别处不小心把它们带回来）；
-  2. Jones 自研插件确实被加载——`pre_tool_call`/`post_tool_call` 已注册。ACP 协议本身没有"列出已加载
-     插件"的标准方法，建议做法：worker 启动后，daemon 主动发一次已知会命中规则闸的合成工具调用（例如一
-     个 Jones 保留、必定被规则闸拒绝的工具名/参数组合），断言收到的是插件产生的拒绝结果而不是工具直接
-     执行的结果；断言失败视为"插件未加载或 `HERMES_SAFE_MODE` 生效"，daemon 拒绝把这个 worker 交付给
-     真实会话使用。这条自检解决的正是 `HERMES_SAFE_MODE` 的风险——它不产生任何显式报错，只是让 Jones 的
-     三道闸静默消失，事后从单次工具调用结果上可能无法可靠区分"插件正常放行"和"插件根本不存在"，所以必须
-     在启动阶段主动探测，不能被动等第一次真实工具调用去发现。
+  2. Jones 自研插件确实被加载。**判据（Issue #38 控制者裁定，取代下面已废弃的旧方案）**：轮询
+     `<HERMES_HOME>/jones_tools.json` 是否出现——这是 `jones_gate` 自己的 `on_session_start` 钩子
+     （`kernel/plugin/jones_gate/_tools_snapshot.py`）写出的真实装配工具清单（Issue #17/#19），文件存在
+     本身就是插件已加载的证据，**零模型参与**；超时未出现即 fail-closed 拒绝交付这个 worker
+     （`workers/manager.py::_wait_for_tools_snapshot`）。`HERMES_SAFE_MODE` 生效、或插件目录里的
+     `__init__.py` 抛异常这类"插件整体没装上"的情形下，这个钩子根本不会跑，文件也就永远不会出现，同样
+     被这条判据挡住。
+     - **触发时机订正（2026-09-22，针对installed hermes-agent==0.21.2 源码重新核对；此前 spike #1
+       §8.2 与本 Issue 自己的"顺带确认"一条都说错了）**：`on_session_start` **不是**在 `session/new`
+       构造 `AIAgent` 时触发，而是 `agent/conversation_loop.py` 在处理**第一个 Turn**（即第一次
+       `session/prompt`）构建 system prompt 时才 `invoke_hook("on_session_start", ...)`——在模型被
+       实际调用之前，但确确实实晚于、而不是早于第一次 prompt。真跑一次 DeepSeek 才发现：若像原计划那样
+       "`session/new` 之后、发任何 prompt 之前就先轮询这个文件"，会永远轮询不到——没有 prompt 就没有
+       Turn，没有 Turn 这个钩子压根不会跑。**因此**：探针 prompt（判据 2）不再是"判据 1 通过之后才发的
+       可选探测"，而是判据 1 得以成立的必要触发动作——`workers/manager.py::_startup_self_check` 把两者
+       并发跑（`_probe_second_layer` 作为后台 task 先提交，`_wait_for_tools_snapshot` 并发轮询），探针
+       prompt 发出这个动作本身仍是 daemon 自己无条件做的、不依赖模型配不配合，只是"等文件出现"这件事现在
+       依赖"daemon 发过至少一条 prompt"这个前提，不再依赖"AIAgent 刚构造完"这个（错误的）前提。
+     - **已废弃的旧方案，保留说明是为了不重蹈覆辙**：worker 启动后由 daemon 发一条指令 prompt，让*模型*
+       主动调用一个已知会命中规则闸的保留工具名（`jones.__probe__`），再从返回的 `session/update` 里找
+       "被插件拒绝"的痕迹，且把这个判定结果当成唯一判据。**问题**：这把一条 fail-closed 不变量的判定权
+       交给了"模型是否听话"——真实跑通后发现，至少 DeepSeek 上 100% 不会主动调用这个工具，导致这条判据把
+       每一个非 Anthropic 厂商的 worker 全部误判为"插件未加载"而拒绝交付（PRD G02"六厂商各跑一个含工具
+       调用的 Turn"因此对五家厂商都不成立）。
+     - 这个探针机制**没有被删除**，降级为可选的**第二层**（`workers/manager.py::_probe_second_layer`）：
+       只用来额外验证"block 语义真的在生效"（不只是"插件加载了"），诊断性质——探针跑了就记录观察到的结
+       果（`blocked`/`completed`/`failed_unverified`），模型没配合调用就记一条 info 日志；无论哪种结果
+       都**不再影响 worker 交付**，因为判据 1 此时已经独立证明过插件加载了。
+
+  这条自检解决的正是 `HERMES_SAFE_MODE` 的风险——它不产生任何显式报错，只是让 Jones 的三道闸静默消失，
+  事后从单次工具调用结果上可能无法可靠区分"插件正常放行"和"插件根本不存在"，所以必须在启动阶段主动探
+  测，不能被动等第一次真实工具调用去发现，也不能依赖模型愿不愿意配合一次额外的、非业务性质的探针调用。
 - **worker↔daemon 的进程关系**：daemon 是这个子进程的父进程和 ACP **client**（stdio 两端），worker/
   Hermes 是 ACP **agent**（server）——方向和"谁发 RPC 请求给谁"因此是：daemon 发 `initialize`/
   `new_session`/`prompt`/`cancel` 等方法调用给 worker；worker 反过来向 daemon 发
