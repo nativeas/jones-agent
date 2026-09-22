@@ -74,7 +74,18 @@ mkdir -p "$SITE_PACKAGES"
 #        unchecked one) ------------------------------------------------------
 cd "$DAEMON_DIR"
 REQS_FILE="$(mktemp -t jones-release-reqs.XXXXXX)"
-trap 'rm -f "$REQS_FILE"' EXIT
+# `ec=$?; ...; exit $ec`, not a bare `rm -f "$REQS_FILE"`: an EXIT trap whose
+# last command exits 0 (which `rm -f` on an existing file always does)
+# silently OVERWRITES the script's real exit status with that 0 — bash uses
+# the trap's own last exit code as the shell's final one when the trap
+# doesn't explicitly `exit`. Round-1 CI verification for #36 hit exactly
+# this: the `--python-platform` bash-3.2 bug below made the build crash
+# outputting only a partial bundle, but this trap's bare `rm -f` silently
+# turned that crash into a reported `exit 0` — both CI jobs, and a plain
+# local rerun, showed green while shipping a broken bundle (no dependencies
+# installed, no DEPENDENCY-REPORT.md). Capturing `$?` before cleanup and
+# re-exiting with it is what makes a real failure actually surface as one.
+trap 'ec=$?; rm -f "$REQS_FILE"; exit $ec' EXIT
 # --no-default-groups: exclude `dev` (pytest/ruff — dev tooling, not shipped).
 # --group worker: `hermes-agent[acp]==<pinned>` + `mcp==2.0.0` (01-w2-interfaces
 # §2.2, daemon/pyproject.toml's own comment on the `worker` group) — this is
@@ -129,15 +140,27 @@ WHEEL="$(ls dist/jones_daemon-*.whl)"
 # carries hashes — see the export step above); the local wheel is a separate
 # call below since it has no hash to check against and pip's hash-checking
 # mode requires all-or-nothing within one invocation.
+# `"${PLATFORM_FLAGS[@]+"${PLATFORM_FLAGS[@]}"}"`, not the plain
+# `"${PLATFORM_FLAGS[@]}"`: macOS's shipped `/bin/bash` is stuck at 3.2 (Apple
+# won't ship GPLv3), and bash <4.4's `set -u` treats expanding an EMPTY array
+# as an unbound-variable error — fatal, immediately. The native branch above
+# sets `PLATFORM_FLAGS=()` (empty on purpose), so a plain `"${PLATFORM_FLAGS[@]}"`
+# here crashes every native build on this host's own /bin/bash (confirmed:
+# reproduced locally AND on both macos-14/macos-15-intel CI runners, which
+# also default to bash 3.2 — round-1 CI verification for #36 silently shipped
+# a broken bundle this way, see this branch's report for the full story). The
+# `${arr[@]+"${arr[@]}"}` form is the standard bash-3.2-safe idiom: it tests
+# "is this array SET" (true — `()` still counts as set) without ever forcing
+# nounset to evaluate an empty `[@]` on its own.
 uv pip install \
   --target "$SITE_PACKAGES" \
-  "${PLATFORM_FLAGS[@]}" \
+  "${PLATFORM_FLAGS[@]+"${PLATFORM_FLAGS[@]}"}" \
   --python 3.12 \
   -r "$REQS_FILE"
 
 uv pip install \
   --target "$SITE_PACKAGES" \
-  "${PLATFORM_FLAGS[@]}" \
+  "${PLATFORM_FLAGS[@]+"${PLATFORM_FLAGS[@]}"}" \
   --python 3.12 \
   "$WHEEL"
 
