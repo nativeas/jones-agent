@@ -13,6 +13,20 @@ dependencies = [
     "cryptography>=50.0.0",
     "keyring>=25.7.0",
     "pyyaml>=6.0",
+    # Issue #41 (G09 orphan-process fallback, `workers/manager.py::
+    # snapshot_worker_descendants`): was only ever installed transitively,
+    # via the `worker` dependency group's `hermes-agent[acp]` pin — never a
+    # direct dependency of this package even though `workers/manager.py`
+    # imports it unconditionally (every `uv sync`/CI run, not just `--group
+    # worker`). `psutil.Process(pid).children(recursive=True)` is the
+    # cross-platform way to walk a real process tree (v1.1 needs this to
+    # also work on Windows, PRD 11 G18) — hand-parsing `ps` output was the
+    # other option DEV.md 工程原则 #6 would otherwise favor avoiding a new
+    # dependency for, but `ps`'s column semantics genuinely differ between
+    # macOS and Linux and parsing it can't disambiguate a reused pid the way
+    # `create_time()` here does — that complexity is exactly what a
+    # dependency should absorb, not what this package should reinvent.
+    "psutil>=7.2.2",
 ]
 
 [dependency-groups]

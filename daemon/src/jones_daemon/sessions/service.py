@@ -77,7 +77,11 @@ from jones_daemon.rpc.errors import (
 )
 from jones_daemon.sessions import queries
 from jones_daemon.store import run_in_db_thread
-from jones_daemon.workers.manager import WorkerManager, WorkerStartupError
+from jones_daemon.workers.manager import (
+    WorkerManager,
+    WorkerStartupError,
+    orphan_reap_worst_case_wait_s,
+)
 
 logger = get_logger("sessions")
 
@@ -672,8 +676,22 @@ class SessionService:
         # (e.g. a full disk). `return_exceptions=True` because a background
         # write task already logs its own failures (see `_write_step_payload`);
         # this wait exists to give it time to do so, not to re-raise here.
+        #
+        # Round-2 review (findings #3/#6): this set can also hold a `reap_
+        # stop_orphans` task (Issue #41) — a flat 5.0s bound was SHORTER than
+        # that task's own worst case (`orphan_reap_worst_case_wait_s()`,
+        # grace period + TERM->KILL escalation, ~8s default), so "user clicks
+        # stop, then immediately quits the app" — the single most common way
+        # to hit this path — could cut a genuinely still-reaping task off
+        # mid-way (SIGTERM already sent, SIGKILL never reached), letting an
+        # orphan the fallback itself already found survive past daemon exit:
+        # exactly the G09 guarantee this whole fallback exists for. The bound
+        # below covers that task's own worst case (plus a small margin for
+        # its own polling overhead) as well as the 5.0s the step-payload
+        # writes were already using, whichever is larger.
         if self._background_tasks:
-            await asyncio.wait(self._background_tasks, timeout=5.0)
+            timeout_s = max(5.0, orphan_reap_worst_case_wait_s() + 1.0)
+            await asyncio.wait(self._background_tasks, timeout=timeout_s)
 
     def _resolve_pending_permissions(self, *, session_id: str | None = None, reason: str) -> None:
         """Close off pending `session/request_permission` waits (all of them, or
@@ -964,6 +982,36 @@ class SessionService:
                 step_seq=ctx_turn.step_seq or None,
             )
         worker = self.worker_manager.get(session_id)
+        # Issue #41 controller ruling (R1/R3): Jones's own belt-and-suspenders
+        # guarantee that G09 "停止后无孤儿进程" holds from THIS user-visible
+        # stop, not only from a later full worker teardown. Snapshotted here,
+        # BEFORE `session/cancel` is even sent below — see `WorkerManager.
+        # snapshot_worker_descendants`'s docstring for why "before anything
+        # else happens" is load-bearing, not merely tidy: a descendant
+        # Hermes's own cleanup (or the worker crashing outright) has already
+        # detached from the worker's process tree by the time anything later
+        # looked would be invisible to that later look. Synchronous, cheap
+        # (no `await`) — nothing about this ordering is left to asyncio's own
+        # scheduling.
+        orphan_snapshot = self.worker_manager.snapshot_worker_descendants(
+            worker.process.pid
+        ) if worker is not None else []
+        # Round-2 review (findings #1/#4): `worker.descendant_baseline` was
+        # captured by `WorkerManager.mark_turn_started` right after THIS
+        # session's most recent turn's own `ensure_started()` returned — see
+        # that method's docstring. Anything already in it predates this turn
+        # and must never be reaped, no matter how long it survives past this
+        # `stop()`.
+        worker_baseline = worker.descendant_baseline if worker is not None else frozenset()
+        # Round-3 review (finding #2, a second time): captured alongside
+        # `worker_baseline` above, from the SAME worker snapshot — passed
+        # through to `reap_stop_orphans` so it can tell whether a new turn
+        # started on this worker while it was asleep through its grace
+        # period (see that method's own docstring for why that matters).
+        worker_turn_generation = worker.turn_generation if worker is not None else 0
+        has_orphan_candidate = any(
+            (e.pid, e.create_time) not in worker_baseline for e in orphan_snapshot
+        )
         if worker is not None and worker.client is not None and worker.acp_session_id is not None:
             try:
                 # A notification, not a hard kill: PRD 9.3 "用户终止" requires the
@@ -1002,6 +1050,29 @@ class SessionService:
         # this, `stop()` during a pending approval never produces `run.terminated`
         # (see this PR report's "第 1 轮修复记录").
         self._resolve_pending_permissions(session_id=session_id, reason="stopped by user")
+        if has_orphan_candidate:
+            # Backgrounded, not awaited here: the overwhelmingly common case
+            # (Hermes's own cleanup already got everything, or every
+            # descendant present is a baseline one this Turn never touches)
+            # must cost this RPC nothing, and the rare case that DOES need
+            # this fallback still takes several seconds (its own grace
+            # period, see `WorkerManager.reap_stop_orphans`) that a user
+            # clicking "stop" shouldn't have to wait on before getting
+            # `{"stopped": true}` back. Tracked the same way this class's own
+            # background Step-payload writes are (`_background_tasks`,
+            # awaited with a bound in `shutdown()` sized to this task's own
+            # worst case — see that method's comment) — not fire-and-forget.
+            task = asyncio.create_task(
+                self.worker_manager.reap_stop_orphans(
+                    orphan_snapshot,
+                    session_id=session_id,
+                    worker_pid=worker.process.pid,
+                    baseline=worker_baseline,
+                    turn_generation=worker_turn_generation,
+                )
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
         return {"stopped": True}
 
     async def delete_guard(self, session_id: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -1553,6 +1624,32 @@ class SessionService:
         # pops `_active_turns[session_id]`, whichever of those awaits an
         # exception or a cancellation lands on.
         try:
+            # Round-2 review findings #1/#4 (a real, reproduced bug, not
+            # just a hardening measure): re-baselining the worker's
+            # descendant tree only AFTER `ensure_started()` returns further
+            # down left a genuine race — `ensure_started()` is preceded by
+            # several real `await`s (this Run's own DB insert right below,
+            # gate-config's `run_in_db_thread` hop, MCP server resolution),
+            # during which `stop()` could already run using the PREVIOUS
+            # turn's baseline (empty, on a worker whose only descendant so
+            # far is a legitimate one that previous turn itself created) —
+            # reproduced directly: a Turn that spawns a persistent
+            # descendant and finishes normally, followed immediately by an
+            # unrelated Turn that's `stop()`ped before ITS OWN baseline call
+            # had run, killed the first Turn's still-legitimate descendant.
+            # Calling this here — literally the first thing this Task does,
+            # before this function's own first `await` — closes that
+            # window: nothing else can run on this event loop between task
+            # creation and this line, so by the time anything (including a
+            # racing `stop()`) gets a chance to run, this worker's baseline
+            # already reflects everything that predates THIS turn. The
+            # second call after `ensure_started()` (below) still matters
+            # separately: THIS worker may not exist yet at this exact point
+            # (first Turn on a session) — `mark_turn_started` is a no-op
+            # when there's no live worker — and even when one already
+            # existed, `ensure_started()` returning is still the earliest
+            # point this Turn's OWN actions could have added anything.
+            self.worker_manager.mark_turn_started(session_id)
             await run_in_db_thread(
                 queries.create_run,
                 self.ctx.db,
@@ -1722,6 +1819,15 @@ class SessionService:
                     )
                     return
                 assert worker.client is not None and worker.acp_session_id is not None  # noqa: S101
+                # Issue #41 round-2 review (findings #1/#4): baseline this
+                # worker's descendant tree right here, before this Turn's own
+                # `prompt()` call below gets any chance to spawn something —
+                # see `WorkerManager.mark_turn_started`'s own docstring for
+                # why this exact point (right after `ensure_started()`
+                # returns) is what makes the baseline correct, and why it
+                # must run on EVERY turn, not only the first one on this
+                # worker.
+                self.worker_manager.mark_turn_started(session_id)
                 # Issue #39 (controller ruling, 2026-09-21; amended review
                 # round 1, finding #2): `stop()` may have pinned `ctx_turn.
                 # termination_intent` while THIS Turn's worker was still
