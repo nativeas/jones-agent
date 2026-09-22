@@ -18,6 +18,7 @@ import functools
 import json
 import os
 import shutil
+import signal
 import sys
 import time
 from collections.abc import Awaitable, Callable
@@ -146,6 +147,32 @@ def _worker_env(hermes_home: Path, extra_env: dict[str, str] | None = None) -> d
     env.pop("HERMES_SAFE_MODE", None)
     env["HERMES_HOME"] = str(hermes_home)
     return env
+
+
+def _signal_worker_group(process: asyncio.subprocess.Process, sig: int) -> None:
+    """G09 "无孤儿进程" (Issue #40 investigation): signal the worker's WHOLE
+    process group — spawned with `start_new_session=True` above specifically
+    so this is possible — not just its own PID. `Process.terminate()`/
+    `.kill()` alone only ever reached the worker itself; any descendant still
+    alive at that moment (Hermes's own terminal-tool child, mid-`killpg` in
+    its OWN background thread when the daemon decides to tear the worker down
+    at the same time) was never guaranteed to go with it. `os.getpgid` on a
+    pid whose leader already exited but whose group still has live members
+    keeps working (POSIX: the pgid stays valid as long as any member is
+    alive) — this is what makes the SIGKILL escalation below still reach
+    stragglers even if the worker itself died first. Windows never gets here
+    with a real group (v1.0 is macOS-only, PRD 11 G18; `start_new_session`
+    isn't set there) so this falls back to the single-PID call `Process.
+    terminate`/`.kill()` already provided.
+    """
+    if sys.platform == "win32":
+        (process.terminate if sig == signal.SIGTERM else process.kill)()
+        return
+    try:
+        pgid = os.getpgid(process.pid)
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        pass  # already gone — nothing left to signal
 
 
 def _prepare_hermes_home(
@@ -413,6 +440,22 @@ class WorkerManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                # G09 "无孤儿进程" (Issue #40 investigation): the worker itself
+                # spawns further children (Hermes's local terminal backend,
+                # `tools/environments/local.py`, starts each shell command in
+                # its OWN new session/process group precisely so a cancelled
+                # command can't escape a plain kill of the worker PID). Without
+                # this, the worker shares the DAEMON's own process group, so a
+                # worker that's SIGKILLed while a descendant hasn't finished
+                # exiting yet (Hermes's own kill-and-verify is a background
+                # thread, not synchronous with `session/cancel`) leaves that
+                # descendant orphaned instead of dying with it. Starting the
+                # worker in its own session lets `_terminate` below reap the
+                # whole group in one `killpg`, the same shape Hermes's own
+                # `_kill_process_group_posix` already uses one level down.
+                # POSIX only (v1.0 is macOS-only per PRD 11's G18; Windows is
+                # v1.1, `subprocess.Popen` doesn't support this flag there).
+                start_new_session=(sys.platform != "win32"),
             )
         except OSError as exc:
             raise WorkerStartupError(f"failed to spawn worker process: {exc}") from exc
@@ -447,6 +490,29 @@ class WorkerManager:
             await asyncio.wait_for(
                 self._startup_self_check(worker), timeout=self._startup_timeout_s
             )
+            # Issue #40 investigation finding: the self-check's second-layer probe
+            # (`_probe_second_layer`) sends its diagnostic prompt on THIS SAME
+            # session and, whenever the model doesn't answer within its own small
+            # `_PROBE_BUDGET_S` budget, sends a real `session/cancel` for it — a
+            # real, reproducible outcome against DeepSeek (its probe Turn routinely
+            # runs past 3s). Real Hermes's own `acp_adapter/server.py::cancel()`
+            # records that cancelled Turn's text as `state.interrupted_prompt_
+            # text`, and `_rewrite_prompt_for_interrupt()` silently PREPENDS it to
+            # the very next prompt sent on this same session ("User correction/
+            # guidance after interrupt: <next prompt>") — source-verified against
+            # the installed hermes-agent checkout by reproducing it: a real worker
+            # whose probe needed cancelling received the caller's actual first
+            # production prompt (e.g. this file's own real-Hermes E2E tests' file/
+            # terminal instructions) silently glued onto the leftover probe text,
+            # confusing the model into not doing what the caller actually asked.
+            # A worker delivered to a caller must never carry this land mine — get
+            # a FRESH session for production use now that self-check has already
+            # proven the plugin loaded (jones_tools.json) on the old one; a session
+            # that has never had `cancel()` called on it can't have this problem.
+            production_session = await asyncio.wait_for(
+                client.new_session(cwd), timeout=self._startup_timeout_s
+            )
+            worker.acp_session_id = production_session["sessionId"]
         except (TimeoutError, AcpError, AcpProtocolError, KeyError, WorkerStartupError) as exc:
             elapsed = time.monotonic() - t0
             logger.error(
@@ -741,11 +807,11 @@ class WorkerManager:
         if worker.client is not None:
             await worker.client.close()
         if worker.process.returncode is None:
-            worker.process.terminate()
+            _signal_worker_group(worker.process, signal.SIGTERM)
             try:
                 await asyncio.wait_for(worker.process.wait(), timeout=5.0)
             except TimeoutError:
-                worker.process.kill()
+                _signal_worker_group(worker.process, signal.SIGKILL)
                 await worker.process.wait()
         logger.info(
             "worker stopped", extra={"detail": {"session_id": worker.session_id, "reason": reason}}

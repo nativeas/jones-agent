@@ -5,6 +5,7 @@ YOLO/SAFE_MODE env strip, and the fail-closed startup self-check)."""
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -81,6 +82,88 @@ async def test_ensure_started_passes_self_check_and_isolates_hermes_home(tmp_pat
         # second spawn (idempotent ensure_started).
         again = await manager.ensure_started("s1", cwd="/tmp")
         assert again is worker
+    finally:
+        await manager.stop()
+
+
+async def test_ensure_started_gets_a_fresh_session_for_production_use(tmp_path, monkeypatch):
+    """Issue #40 investigation finding: the startup self-check's second-layer
+    probe (`_probe_second_layer`) runs its diagnostic prompt on a session, and
+    on a real worker whose probe needs a `session/cancel` (routinely true
+    against real DeepSeek — its probe Turn commonly runs past the 3s probe
+    budget), real Hermes's own `acp_adapter/server.py::cancel()` marks that
+    session's cancelled prompt as "interrupted" and silently PREPENDS it onto
+    the very next prompt sent on that SAME session (source-verified against
+    the installed hermes-agent checkout, reproduced against a real worker —
+    see the PR report). `ensure_started()` must therefore hand callers a
+    session that has never had the self-check's probe run on it: this asserts
+    `session/new` is requested TWICE — once for the self-check itself, once
+    for the session actually returned as `worker.acp_session_id` — using the
+    fake agent's `_new_session_calls.json` side channel (`fake_acp_agent.py`'s
+    module docstring) since the fake agent has no notion of Hermes's
+    interrupted-prompt reattachment to assert on directly."""
+    monkeypatch.setenv("FAKE_ACP_MODE", "normal")
+    manager = _make_manager(tmp_path)
+    await manager.start()
+    try:
+        worker = await manager.ensure_started("s1", cwd="/tmp")
+        calls_file = worker.hermes_home / "_new_session_calls.json"
+        assert calls_file.exists(), "fake agent never recorded any session/new call"
+        import json
+
+        assert json.loads(calls_file.read_text())["count"] == 2, (
+            "ensure_started() must request a fresh session after the self-check's "
+            "probe session, not hand out the probe's own session for production use"
+        )
+    finally:
+        await manager.stop()
+
+
+async def test_stop_worker_reaps_a_child_the_worker_never_cleaned_up_itself(
+    tmp_path, monkeypatch
+):
+    """G09 "无孤儿进程" (Issue #40 investigation, the OTHER half of the bug the
+    original report's "child pid N is still alive 10s after cancel" symptom
+    traced back to): `WorkerManager._terminate` used to signal only the
+    worker's own PID (`Process.terminate()`/`.kill()`) — a child the worker
+    spawned and never got around to reaping itself (not every teardown is a
+    cooperative in-Turn `session/cancel`; `stop_worker`/idle-reap/daemon
+    shutdown can all land while a child is still running) was never
+    guaranteed to die with it. `fake_acp_agent.py`'s `SPAWN_ORPHAN_ON_SHUTDOWN`
+    marker starts a real `sleep 30` this agent deliberately never reaps
+    itself, so the only thing that can kill it is `WorkerManager` spawning
+    the worker into its own process group and `_terminate` signalling that
+    whole group — exactly what `fake_acp_agent.py`'s `SPAWN_REAL_SUBPROCESS_
+    TERMINAL`-based test above cannot exercise (that one only proves the
+    AGENT's own cancel-driven cleanup)."""
+    monkeypatch.setenv("FAKE_ACP_MODE", "normal")
+    manager = _make_manager(tmp_path)
+    await manager.start()
+    try:
+        worker = await manager.ensure_started("s1", cwd="/tmp")
+        assert worker.client is not None and worker.acp_session_id is not None
+        await worker.client.prompt(worker.acp_session_id, "SPAWN_ORPHAN_ON_SHUTDOWN")
+
+        pid_file = worker.hermes_home / "_orphan_child.pid"
+        assert pid_file.exists(), "fake agent never recorded the orphan child's pid"
+        child_pid = int(pid_file.read_text().strip())
+        os.kill(child_pid, 0)  # confirm it's actually alive before tearing down
+
+        await manager.stop_worker("s1", reason="test")
+
+        deadline = time.monotonic() + 5.0
+        gone = False
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                gone = True
+                break
+            await asyncio.sleep(0.05)
+        assert gone, (
+            f"child pid {child_pid} is still alive after stop_worker() — orphan "
+            "process (G09): _terminate must kill the worker's whole process group"
+        )
     finally:
         await manager.stop()
 

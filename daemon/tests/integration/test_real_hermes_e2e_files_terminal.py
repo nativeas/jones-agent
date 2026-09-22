@@ -214,8 +214,23 @@ async def test_real_hermes_terminal_stop_leaves_no_orphan_process(tmp_path):
 
         prompt_task = asyncio.create_task(_run_prompt())
 
-        # Wait for the child to actually start and record its own pid.
-        deadline = time.monotonic() + 20.0
+        # Wait for the child to actually start and record its own pid. 20s
+        # wasn't enough here (Issue #40 investigation, reproduced against a
+        # real DeepSeek worker): Hermes's local terminal backend
+        # auto-installs `tirith` (`tools/tirith_security.py`) into
+        # `$HERMES_HOME/bin/tirith` synchronously on its FIRST use per
+        # `HERMES_HOME` — measured ~11-20s download+verify against GitHub's
+        # release CDN, network-variance dependent — and this suite's own
+        # `_prepare_hermes_home` deliberately gives every worker a fresh,
+        # empty `HERMES_HOME` (isolation, see that function's docstring), so
+        # this cost is paid on every run here, not a one-off warm-cache
+        # effect (see the PR report for the follow-up this points at: a
+        # shared, pre-warmed `TIRITH_BIN` would remove the download from this
+        # critical path entirely, out of scope for this fix). 60s covers
+        # self-check (~15s) + the model's own tool-call latency (~3s) + a
+        # slow tirith install with real margin; the actual G09 assertion
+        # below (process gone within 10s of cancel) is untouched.
+        deadline = time.monotonic() + 60.0
         while time.monotonic() < deadline and not pid_file.exists():
             await asyncio.sleep(0.1)
         assert pid_file.exists(), "terminal command never started (pid file missing)"

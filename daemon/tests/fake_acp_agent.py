@@ -141,6 +141,27 @@ own entry below).
   Hermes uses when a tool's exception is unrecoverable enough to end the
   Turn (`kernel/acp_client.py`'s `AcpError`), as opposed to "USE_TOOL"'s
   always-succeeds `demo_tool`, which the agent just continues past.
+- `_new_session_calls.json` (pure addition, no existing behavior changed):
+  every mode writes the running count of `session/new` requests handled so
+  far to this file under `$HERMES_HOME` (same best-effort/atomic-replace
+  spirit as `jones_tools.json`) — lets a fake-agent-level test assert
+  `WorkerManager.ensure_started()` actually requests a SECOND, fresh session
+  after the startup self-check finishes (Issue #40 investigation finding:
+  see `workers/manager.py::_spawn_and_check`'s comment on why the production
+  session must never be the same one the self-check's probe ran on).
+- "SPAWN_ORPHAN_ON_SHUTDOWN" prompt marker (pure addition, "normal" mode
+  only, same pattern as "USE_TOOL"/`SPAWN_REAL_SUBPROCESS_TERMINAL`) — Issue
+  #40 investigation finding, G09's OTHER half: starts a real `sleep 30` with
+  a plain `subprocess.Popen` (deliberately NOT its own process group, and
+  deliberately never cleaned up by THIS agent on `session/cancel` or
+  anything else — simulates a worker that leaves a background child running
+  and is then torn down from the OUTSIDE, e.g. `WorkerManager.stop_worker`/
+  idle-reap/daemon shutdown, not a cooperative in-Turn cancel), writes the
+  child's pid to `$HERMES_HOME/_orphan_child.pid`, then finishes the prompt
+  normally. Proves `WorkerManager._terminate`'s process-GROUP kill (this
+  agent process itself has no chance to reap its own child before dying) —
+  `SPAWN_REAL_SUBPROCESS_TERMINAL` above instead proves the AGENT's own
+  cancel-driven cleanup, a different half of G09.
 - "MANY_TOOL_CALLS:<n>" prompt marker (R-N5, controller ruling 2026-09-20,
   04-w5-interfaces.md §4.3 — Issue #22's Step-count budget test: "假 ACP
   agent 发 201 个 tool_call") — pure addition, same pattern as "USE_TOOL"/
@@ -215,6 +236,23 @@ def _write_tools_snapshot(session_id: str) -> None:
     tmp = Path(home) / f"{_TOOLS_SNAPSHOT_FILE_NAME}.tmp"
     tmp.write_text(json.dumps(payload), encoding="utf-8")
     tmp.replace(target)
+
+_NEW_SESSION_CALLS_FILE_NAME = "_new_session_calls.json"
+_new_session_call_count = [0]  # boxed for the closure below, same pattern as `_next_id`
+
+
+def _record_new_session_call() -> None:
+    """See module docstring's `_new_session_calls.json` entry. Best-effort, same
+    spirit as `_write_tools_snapshot` — must never crash this agent."""
+    _new_session_call_count[0] += 1
+    home = os.environ.get("HERMES_HOME")
+    if not home:
+        return
+    target = Path(home) / _NEW_SESSION_CALLS_FILE_NAME
+    tmp = Path(home) / f"{_NEW_SESSION_CALLS_FILE_NAME}.tmp"
+    tmp.write_text(json.dumps({"count": _new_session_call_count[0]}), encoding="utf-8")
+    tmp.replace(target)
+
 
 _stdout_lock = threading.Lock()
 _cancelled_sessions: set[str] = set()
@@ -351,6 +389,21 @@ def _handle_custom_permission_prompt(session_id: str, text: str) -> None:
     )
 
 
+_SPAWN_ORPHAN_MARKER = "SPAWN_ORPHAN_ON_SHUTDOWN"
+_ORPHAN_CHILD_PID_FILE_NAME = "_orphan_child.pid"
+
+
+def _handle_spawn_orphan_on_shutdown() -> None:
+    """See module docstring's `SPAWN_ORPHAN_ON_SHUTDOWN` entry. Deliberately a
+    plain `Popen` (no `start_new_session`) so the child inherits THIS agent's
+    own process group — whatever `WorkerManager` spawned this agent process
+    into — and deliberately never reaped by this agent itself."""
+    proc = subprocess.Popen(["sleep", "30"])
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        Path(home, _ORPHAN_CHILD_PID_FILE_NAME).write_text(str(proc.pid), encoding="utf-8")
+
+
 _SPAWN_SUBPROCESS_MARKER = "SPAWN_REAL_SUBPROCESS_TERMINAL"
 
 
@@ -447,6 +500,8 @@ def _handle_normal_prompt(session_id: str, text: str) -> None:
         _handle_custom_permission_prompt(session_id, text)
     if _SPAWN_SUBPROCESS_MARKER in text:
         _handle_spawn_subprocess_terminal(session_id)
+    if _SPAWN_ORPHAN_MARKER in text:
+        _handle_spawn_orphan_on_shutdown()
     many_match = _MANY_TOOL_CALLS_MARKER.search(text)
     if many_match:
         _handle_many_tool_calls_prompt(session_id, int(many_match.group(1)))
@@ -574,6 +629,7 @@ def _dispatch_loop() -> None:
                     continue  # never respond — exercises the daemon's handshake timeout
                 _respond(req_id, {"protocolVersion": 1, "agentCapabilities": {}})
             elif method == "session/new":
+                _record_new_session_call()
                 result = {"sessionId": "fake-session-1"}
                 if MODE == "session_new_non_default_mode":
                     result["modes"] = {"currentModeId": "accept_edits"}
