@@ -107,6 +107,19 @@ spike #2（§2 已定案的 python-build-standalone 方案）在真实 daemon（
   详见 `docs/release.md` §2.2 的完整实测记录与后续路径。v1.0 macOS 双架构
   （PRD G18）在真实依赖闭环下的 x86_64 可行性因此仍是未验证状态，不能引用 spike
   #2 的空壳结论作为已验证的依据。
+- **后续（#36 解除，2026-09-22）**：上面这条订正的结论本身没变——arm64 主机
+  确实造不出 x86_64 产物。但"必须在原生架构的机器上编译"这条路径已经在 CI 上
+  验证成立，不再是未验证状态：`.github/workflows/release-bundle.yml` 新增
+  两个矩阵 job，分别在 `macos-15-intel`（原生 x86_64；`macos-13` 已于
+  2025-12 被 GitHub 完全退役，见该工作流与 `docs/release.md` §2.3 的实测记录）
+  与 `macos-14`（原生 arm64）上原生跑 `scripts/release/build-daemon-bundle.sh`
+  ——包括 `x64` 腿真实用宿主自带的 Rust 工具链把 `cryptography==50.0.0` 从
+  sdist 源码编译出来（2:47，非交叉编译），两份产物都完整上传为 CI artifact，
+  真实跑通记录见 `docs/release.md` §2.3。`build-daemon-bundle.sh` 相应改为
+  「目标架构与主机架构相同（原生构建）时不传 `--python-platform`」——那个参数
+  原本只是为了在不匹配的宿主上伪装目标平台，原生构建不需要这层伪装。PRD G18
+  因此从"x86_64 可行性未验证"降级为"构建阻塞已解除，剩真机 Intel 手工验收待
+  执行"，见 `docs/acceptance/v1.0/G18.md`。
 
 ## 4. RPC 契约 v0（daemon ⇄ 前端）
 
