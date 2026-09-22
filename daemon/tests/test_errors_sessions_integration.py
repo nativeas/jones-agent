@@ -1135,11 +1135,12 @@ async def test_stop_before_worker_ready_pins_the_intent_and_skips_the_prompt(
 
     Deterministic repro: `WorkerManager.ensure_started` is wrapped with an
     injected delay, so it provably has not returned when `stop()` runs below.
-    `_run_turn` populates `_active_turns` BEFORE it ever calls `ensure_started`
-    (see `_TurnContext`'s own comment on the field) — waiting for that
-    predicate and then asserting `worker_manager.get(session_id) is None`
-    proves this test actually lands in the race window Issue #39 describes,
-    not merely "stop() was called at some point during the Turn"."""
+    `_start_turn` populates `_active_turns` synchronously, before `_run_turn`
+    ever calls `ensure_started` (review round 1 follow-up — see `_start_
+    turn`'s own comment) — waiting for that predicate and then asserting
+    `worker_manager.get(session_id) is None` proves this test actually lands
+    in the race window Issue #39 describes, not merely "stop() was called at
+    some point during the Turn"."""
     service = await _make_service(tmp_path, monkeypatch)
     await service.worker_manager.start()
 
@@ -1196,13 +1197,19 @@ async def test_stop_before_worker_ready_pins_the_intent_and_skips_the_prompt(
         assert card["reason"] == "stopped by user"
 
         # (a) the agent was never prompted with the actual Turn text: `_run_
-        # turn`'s post-`ensure_started` intent check (Issue #39 part 3) sends
-        # the one cancel `stop()` itself couldn't (worker wasn't ready when
-        # `stop()` ran) and terminates directly, without ever calling
-        # `prompt(..., "hello there")` — only the startup self-check's own
-        # unrelated probe prompt is allowed to have gone out.
+        # turn`'s post-`ensure_started` intent check (Issue #39 part 3)
+        # terminates directly without ever calling `prompt(..., "hello
+        # there")` — only the startup self-check's own unrelated probe
+        # prompt is allowed to have gone out.
         assert "hello there" not in prompted_texts
-        assert cancel_calls == 1
+        # No compensating `cancel()` either (review round 1, finding #2):
+        # this Turn's `prompt()` was never called, so there is nothing
+        # in-flight on `worker.acp_session_id` to cancel — and against a real
+        # Hermes worker, `cancel()` on an idle ACP session sets a sticky
+        # interrupt flag that silently swallows the NEXT Turn on that same
+        # session/worker instead of being a harmless no-op. `stop()` itself
+        # also sent none (worker wasn't ready when it ran).
+        assert cancel_calls == 0
 
         # (c) queue stays suspended — R-N4 applies to every termination kind,
         # `kind="user"` included, and this Turn's is no exception.
@@ -1214,6 +1221,38 @@ async def test_stop_before_worker_ready_pins_the_intent_and_skips_the_prompt(
 
         suspend_events = [e for e in _queue_changed_events(service) if e.get("suspended")]
         assert suspend_events[-1]["reason"] == "user"
+    finally:
+        await service.shutdown()
+
+
+async def test_active_turns_is_populated_before_send_returns(tmp_path, monkeypatch):
+    """Issue #39 follow-up (review round 1, findings #1/#3): the test above
+    covers the window INSIDE `ensure_started()` (worker not ready yet), but
+    there was an earlier, narrower window too — between `_start_turn`
+    scheduling the Turn's task (`self._turn_tasks[session_id] = task`) and
+    `_run_turn`'s own registration of `self._active_turns[session_id] =
+    ctx_turn`, which used to happen only after `create_run`, `set_queue_
+    suspended_reason`, and the prompt-snapshot write had each already run a
+    real DB-thread/file round trip. A `stop()` landing THERE also pinned
+    nothing (same `if ctx_turn is not None` guard in `stop()`, same silent
+    "no worker yet" outcome) — reproducible on unmodified pre-follow-up code
+    without any injected delay at all: `_run_turn`'s task, freshly scheduled
+    by `asyncio.create_task`, simply hadn't been given a turn on the event
+    loop yet by the time `send()`'s own coroutine returned (no `await` sits
+    between `_start_turn()` and `send()`'s `return` — see that method).
+
+    No timing/sleep needed to make this deterministic either way: `_start_
+    turn` now constructs and registers `ctx_turn` itself, synchronously,
+    before ever calling `asyncio.create_task` — so this assertion is true
+    the instant `send()` returns, not eventually true once its scheduled
+    task gets around to it."""
+    service = await _make_service(tmp_path, monkeypatch)
+    await service.worker_manager.start()
+    try:
+        session_id = await _new_session(service, title="s1")
+        first = await service.send(session_id, "hello there")
+        assert first["queued"] is False
+        assert session_id in service._active_turns
     finally:
         await service.shutdown()
 
