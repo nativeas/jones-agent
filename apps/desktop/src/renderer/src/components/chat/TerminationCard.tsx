@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { cn } from '../../lib/utils'
 import type { CardAction, ErrorKind, Model, Provider, TerminationCard as TerminationCardData } from '../../domain/types'
 
 interface TerminationCardProps {
@@ -34,17 +35,23 @@ interface TerminationCardProps {
  * renders: one style per `ErrorKind`, folded down to 7 distinct visual
  * buckets (`errors/classify.py::VISUALLY_DISTINCT_KINDS`) — `provider_error`/
  * `internal` share the generic fallback rather than getting their own
- * color/icon, matching that module's own comment on why. */
-const KIND_STYLE: Record<ErrorKind, { label: string; className: string; icon: string }> = {
-  network: { label: '网络', className: 'termination-card--network', icon: '⚠' },
-  provider_quota: { label: '配额', className: 'termination-card--quota', icon: '⛔' },
-  provider_auth: { label: '认证', className: 'termination-card--auth', icon: '🔑' },
-  tool_exception: { label: '工具', className: 'termination-card--tool', icon: '🛠' },
-  worker_crash: { label: '崩溃', className: 'termination-card--crash', icon: '💥' },
-  approval_timeout: { label: '超时', className: 'termination-card--timeout', icon: '⏱' },
-  budget: { label: '预算', className: 'termination-card--budget-kind', icon: '📊' },
-  provider_error: { label: '出错', className: 'termination-card--generic', icon: '❗' },
-  internal: { label: '出错', className: 'termination-card--generic', icon: '❗' }
+ * color/icon, matching that module's own comment on why. Buckets further
+ * share one of 4 accent colors, same grouping the original design used. */
+const RED = { card: 'border-red-300/70 bg-red-50 dark:border-red-500/30 dark:bg-red-950/20', iconColor: 'text-red-600 dark:text-red-400' }
+const AMBER = { card: 'border-amber-300/70 bg-amber-50 dark:border-amber-500/30 dark:bg-amber-950/20', iconColor: 'text-amber-600 dark:text-amber-400' }
+const PURPLE = { card: 'border-purple-300/70 bg-purple-50 dark:border-purple-500/30 dark:bg-purple-950/20', iconColor: 'text-purple-600 dark:text-purple-400' }
+const SLATE = { card: 'border-slate-300/70 bg-slate-50 dark:border-slate-500/30 dark:bg-slate-900/40', iconColor: 'text-slate-600 dark:text-slate-400' }
+
+const KIND_CONFIG: Record<ErrorKind, { label: string; icon: string; card: string; iconColor: string }> = {
+  network: { label: '网络', icon: '⚠', ...RED },
+  provider_quota: { label: '配额', icon: '⛔', ...AMBER },
+  provider_auth: { label: '认证', icon: '🔑', ...AMBER },
+  tool_exception: { label: '工具', icon: '🛠', ...RED },
+  worker_crash: { label: '崩溃', icon: '💥', ...PURPLE },
+  approval_timeout: { label: '超时', icon: '⏱', ...SLATE },
+  budget: { label: '预算', icon: '📊', ...AMBER },
+  provider_error: { label: '出错', icon: '❗', ...RED },
+  internal: { label: '出错', icon: '❗', ...RED }
 }
 
 const ACTION_LABEL: Record<CardAction, string> = {
@@ -52,6 +59,17 @@ const ACTION_LABEL: Record<CardAction, string> = {
   switch_model: '换模型',
   abandon: '放弃'
 }
+
+const actionButtonClass =
+  'rounded-md border px-2.5 py-1 text-[12px] font-medium transition-colors disabled:cursor-default disabled:opacity-50'
+const primaryButtonClass = cn(
+  actionButtonClass,
+  'border-transparent bg-black text-white hover:bg-black/80 dark:bg-white dark:text-black dark:hover:bg-white/80'
+)
+const secondaryButtonClass = cn(
+  actionButtonClass,
+  'border-black/15 bg-transparent hover:bg-black/5 dark:border-white/20 dark:hover:bg-white/10'
+)
 
 /** Round-2 review #2/#6: what a used-up card says instead of its buttons. */
 const HANDLED_LABEL: Record<'retry' | 'switch_model', string> = {
@@ -66,6 +84,8 @@ function abandonLabel(clearedQueueItems: number | undefined): string {
   if (!clearedQueueItems) return '已放弃这条消息。'
   return `已放弃，同时清空了排队中的 ${clearedQueueItems} 条后续指令。`
 }
+
+const selectClass = 'rounded-md border border-black/15 bg-transparent px-2 py-1 text-[12px] dark:border-white/20'
 
 function ModelPicker({
   providers,
@@ -84,16 +104,19 @@ function ModelPicker({
 
   if (providers.length === 0) {
     return (
-      <div className="termination-card__model-picker">
-        <span>还没有配置好 Key 的模型厂商 — 先去设置页配置一个。</span>
-        <button onClick={onCancel}>取消</button>
+      <div data-testid="termination-model-picker" className="mt-2 flex flex-wrap items-center gap-2 text-[12px]">
+        <span className="text-black/60 dark:text-white/60">还没有配置好 Key 的模型厂商 — 先去设置页配置一个。</span>
+        <button type="button" className={secondaryButtonClass} onClick={onCancel}>
+          取消
+        </button>
       </div>
     )
   }
 
   return (
-    <div className="termination-card__model-picker">
+    <div data-testid="termination-model-picker" className="mt-2 flex flex-wrap items-center gap-2">
       <select
+        className={selectClass}
         value={provider}
         onChange={(e) => {
           const next = e.target.value
@@ -107,7 +130,7 @@ function ModelPicker({
           </option>
         ))}
       </select>
-      <select value={model} onChange={(e) => setModel(e.target.value)}>
+      <select className={selectClass} value={model} onChange={(e) => setModel(e.target.value)}>
         {models
           .filter((m) => m.provider === provider)
           .map((m) => (
@@ -116,10 +139,17 @@ function ModelPicker({
             </option>
           ))}
       </select>
-      <button disabled={!provider || !model} onClick={() => onConfirm({ provider, model })}>
+      <button
+        type="button"
+        className={primaryButtonClass}
+        disabled={!provider || !model}
+        onClick={() => onConfirm({ provider, model })}
+      >
         确认重试
       </button>
-      <button onClick={onCancel}>取消</button>
+      <button type="button" className={secondaryButtonClass} onClick={onCancel}>
+        取消
+      </button>
     </div>
   )
 }
@@ -129,7 +159,7 @@ function ModelPicker({
  * `kind==="user"` (nothing to act on), and `kind==="error"|"budget"` sharing
  * one `ErrorCard`-driven rendering (the outer `kind` only decides the top-line
  * framing text; the 7-bucket style and the available actions come from
- * `card.card` — see `KIND_STYLE`/`ACTION_LABEL` above). Every field is read
+ * `card.card` — see `KIND_CONFIG`/`ACTION_LABEL` above). Every field is read
  * defensively (`card.card` may be an older/partial shape from a daemon this
  * exact renderer build hasn't seen) so a missing field renders less detail
  * instead of a white screen (N16).
@@ -150,49 +180,57 @@ export function TerminationCard({
 
   if (card.kind === 'user' || !inner || inner.actions?.length === 0) {
     return (
-      <div className="termination-card termination-card--user">
-        <div className="termination-card__title">{inner?.title ?? '已停止'}</div>
-        <div className="termination-card__body">
+      <div className="my-2.5 rounded-lg border border-black/10 bg-black/[0.02] px-3 py-2.5 text-[13px] dark:border-white/10 dark:bg-white/[0.03]">
+        <div className="mb-0.5 font-semibold">{inner?.title ?? '已停止'}</div>
+        <div className="text-black/60 dark:text-white/60">
           {inner?.message || card.reason || '用户手动停止，正在执行的动作已收尾。'}
         </div>
       </div>
     )
   }
 
-  const style = KIND_STYLE[inner.kind as ErrorKind] ?? KIND_STYLE.internal
+  const style = KIND_CONFIG[inner.kind as ErrorKind] ?? KIND_CONFIG.internal
   const actions = inner.actions ?? []
   const rawExcerpt = inner.raw_excerpt ?? ''
 
   return (
-    <div className={`termination-card ${style.className}`}>
-      <div className="termination-card__title">
-        <span aria-hidden className="termination-card__icon">
+    <div className={cn('my-2.5 rounded-lg border px-3 py-2.5 text-[13px]', style.card)}>
+      <div className="flex items-center gap-1.5 font-semibold">
+        <span aria-hidden className={style.iconColor}>
           {style.icon}
         </span>
         {inner.title || style.label}
       </div>
       {inner.step_seq != null && (
-        <div className="termination-card__detail">发生在第 {inner.step_seq} 步</div>
+        <div className="mt-0.5 text-[12px] text-black/50 dark:text-white/50">发生在第 {inner.step_seq} 步</div>
       )}
-      <div className="termination-card__body">{inner.message || card.reason}</div>
+      <div className="mt-1 text-black/80 dark:text-white/80">{inner.message || card.reason}</div>
       {/* Round-2 review #4: PRD 9.3 "显式卡片说明是哪个预算、用了多少、上限多少" —
        * only rendered when the daemon actually sent structured numbers
        * (`errors/classify.py::ErrorCard.budget`'s docstring: nothing does yet,
        * this is the structural slot for when something does). */}
       {inner.budget && (
-        <div className="termination-card__detail">
+        <div className="mt-1 font-mono text-[12px] text-black/50 dark:text-white/50">
           {inner.budget.name ?? '预算'}：{inner.budget.used ?? '?'} / {inner.budget.limit ?? '?'}{' '}
           {inner.budget.unit ?? ''}
         </div>
       )}
       {rawExcerpt && (
-        <details className="termination-card__raw" open={expanded} onToggle={(e) => setExpanded(e.currentTarget.open)}>
-          <summary>查看原始错误</summary>
-          <pre>{rawExcerpt}</pre>
+        <details
+          className="mt-1.5 text-[12px]"
+          open={expanded}
+          onToggle={(e) => setExpanded(e.currentTarget.open)}
+        >
+          <summary className="cursor-pointer text-black/50 select-none hover:text-black/70 dark:text-white/50 dark:hover:text-white/70">
+            查看原始错误
+          </summary>
+          <pre className="mt-1 max-h-48 overflow-auto rounded-md bg-black/5 px-2 py-1.5 font-mono text-[11px] whitespace-pre-wrap break-words dark:bg-white/10">
+            {rawExcerpt}
+          </pre>
         </details>
       )}
       {handled ? (
-        <div className="termination-card__handled">
+        <div className="mt-2 text-[12px] text-black/60 dark:text-white/60">
           {handled.action === 'abandon' ? abandonLabel(handled.clearedQueueItems) : HANDLED_LABEL[handled.action]}
         </div>
       ) : picking ? (
@@ -206,19 +244,19 @@ export function TerminationCard({
           }}
         />
       ) : (
-        <div className="termination-card__actions">
+        <div data-testid="termination-actions" className="mt-2 flex gap-2">
           {actions.includes('retry') && (
-            <button disabled={pending} onClick={onRetry}>
+            <button type="button" className={primaryButtonClass} disabled={pending} onClick={onRetry}>
               {ACTION_LABEL.retry}
             </button>
           )}
           {actions.includes('switch_model') && (
-            <button disabled={pending} onClick={() => setPicking(true)}>
+            <button type="button" className={secondaryButtonClass} disabled={pending} onClick={() => setPicking(true)}>
               {ACTION_LABEL.switch_model}
             </button>
           )}
           {actions.includes('abandon') && (
-            <button disabled={pending} onClick={onAbandon}>
+            <button type="button" className={secondaryButtonClass} disabled={pending} onClick={onAbandon}>
               {ACTION_LABEL.abandon}
             </button>
           )}

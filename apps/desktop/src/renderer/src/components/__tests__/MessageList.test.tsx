@@ -5,6 +5,21 @@ import { MessageList } from '../chat/MessageList'
 import type { TimelineEntry } from '../../store/chatStore'
 import type { Message } from '../../domain/types'
 
+// jsdom has no IntersectionObserver; each row is now wrapped in Magic UI's
+// BlurFade, which calls motion's useInView unconditionally on mount (its own
+// `inView` prop only gates whether the result is used, not whether the
+// browser API is touched). Stub it so mounting doesn't throw — this doesn't
+// change what the test below actually asserts.
+if (typeof globalThis.IntersectionObserver === 'undefined') {
+  class IntersectionObserverStub {
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  // @ts-expect-error jsdom test shim, not a spec-complete IntersectionObserver
+  globalThis.IntersectionObserver = IntersectionObserverStub
+}
+
 /** jones-agent#34 regression: the daemon's real `message.content` shape is an
  * OBJECT (`{kind, text}` — `sessions/queries.py::_d()`), not a string.
  * Rendering that object as a raw React child used to throw ("Objects are not

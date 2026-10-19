@@ -70,7 +70,7 @@ describe('TerminationCard', () => {
     const { container, unmount } = mount(<TerminationCard card={card} providers={providers} models={models} />)
     try {
       expect(container.textContent).toContain('已停止')
-      expect(container.querySelectorAll('.termination-card__actions button')).toHaveLength(0)
+      expect(container.querySelectorAll('[data-testid="termination-actions"] button')).toHaveLength(0)
     } finally {
       unmount()
     }
@@ -94,7 +94,7 @@ describe('TerminationCard', () => {
       expect(container.querySelector('summary')?.textContent).toBe('查看原始错误')
       expect(container.textContent).toContain('Connection refused while calling api.anthropic.com')
 
-      const buttons = Array.from(container.querySelectorAll('.termination-card__actions button'))
+      const buttons = Array.from(container.querySelectorAll('[data-testid="termination-actions"] button'))
       expect(buttons.map((b) => b.textContent)).toEqual(['重试', '换模型', '放弃'])
 
       act(() => {
@@ -120,7 +120,7 @@ describe('TerminationCard', () => {
     })
     const { container, unmount } = mount(<TerminationCard card={card} providers={providers} models={models} />)
     try {
-      const buttons = Array.from(container.querySelectorAll('.termination-card__actions button'))
+      const buttons = Array.from(container.querySelectorAll('[data-testid="termination-actions"] button'))
       expect(buttons.map((b) => b.textContent)).toEqual(['换模型', '放弃'])
     } finally {
       unmount()
@@ -141,12 +141,12 @@ describe('TerminationCard', () => {
       />
     )
     try {
-      const switchBtn = Array.from(container.querySelectorAll('.termination-card__actions button')).find(
+      const switchBtn = Array.from(container.querySelectorAll('[data-testid="termination-actions"] button')).find(
         (b) => b.textContent === '换模型'
       ) as HTMLButtonElement
       act(() => switchBtn.click())
 
-      const confirmBtn = Array.from(container.querySelectorAll('.termination-card__model-picker button')).find(
+      const confirmBtn = Array.from(container.querySelectorAll('[data-testid="termination-model-picker"] button')).find(
         (b) => b.textContent === '确认重试'
       ) as HTMLButtonElement
       expect(confirmBtn).toBeDefined()
@@ -162,7 +162,7 @@ describe('TerminationCard', () => {
     const card = errorCard()
     const { container, unmount } = mount(<TerminationCard card={card} providers={[]} models={[]} />)
     try {
-      const switchBtn = Array.from(container.querySelectorAll('.termination-card__actions button')).find(
+      const switchBtn = Array.from(container.querySelectorAll('[data-testid="termination-actions"] button')).find(
         (b) => b.textContent === '换模型'
       ) as HTMLButtonElement
       act(() => switchBtn.click())
@@ -186,7 +186,7 @@ describe('TerminationCard', () => {
       />
     )
     try {
-      const buttons = Array.from(container.querySelectorAll('.termination-card__actions button')) as HTMLButtonElement[]
+      const buttons = Array.from(container.querySelectorAll('[data-testid="termination-actions"] button')) as HTMLButtonElement[]
       expect(buttons.every((b) => b.disabled)).toBe(true)
       act(() => buttons[0]!.click())
       // jsdom still fires click on a disabled button's handler only if the
@@ -204,7 +204,7 @@ describe('TerminationCard', () => {
       <TerminationCard card={card} providers={providers} models={models} handled={{ action: 'retry' }} />
     )
     try {
-      expect(container.querySelectorAll('.termination-card__actions button')).toHaveLength(0)
+      expect(container.querySelectorAll('[data-testid="termination-actions"] button')).toHaveLength(0)
       expect(container.textContent).toContain('已重试，新的对话已经开始。')
     } finally {
       unmount()
