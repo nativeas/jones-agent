@@ -14,7 +14,11 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "isolatedModules": true,
-    "noEmit": true
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/renderer/src/*"]
+    }
   },
   "include": ["src/renderer/src/**/*.ts", "src/renderer/src/**/*.tsx"]
 }

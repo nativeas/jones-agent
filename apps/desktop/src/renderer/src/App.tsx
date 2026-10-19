@@ -9,6 +9,8 @@ import { LeftPane } from './components/left/LeftPane'
 import { CenterPane } from './components/CenterPane'
 import { RightPane } from './components/right/RightPane'
 import { SettingsPage } from './components/settings/SettingsPage'
+import { DotPattern } from './components/ui/dot-pattern'
+import { cn } from './lib/utils'
 
 // One transport for the lifetime of this renderer — created once at module
 // scope (not per-render) since it owns notification subscriptions.
@@ -31,25 +33,49 @@ export function App(): JSX.Element {
 
   return (
     <div className="shell">
-      <header className="shell__topbar">
-        <button onClick={toggleLeftPane}>{leftPaneOpen ? '◀' : '▶'} 会话</button>
-        <span className="shell__title">Jones</span>
-        <nav className="shell__nav">
+      <header className="shell__topbar relative overflow-hidden">
+        <DotPattern
+          className="text-zinc-500/[0.08]"
+          width={14}
+          height={14}
+          aria-hidden="true"
+        />
+        <div className="relative z-10 flex w-full items-center justify-between gap-2">
           <button
-            className={view === 'sessions' ? 'shell__nav-btn--active' : ''}
-            onClick={() => setView('sessions')}
+            className="rounded-md px-2 py-1 text-sm transition-colors hover:bg-zinc-500/10"
+            onClick={toggleLeftPane}
           >
-            会话
+            {leftPaneOpen ? '◀' : '▶'} 会话
           </button>
+          <span className="shell__title">Jones</span>
+          <nav className="shell__nav">
+            <button
+              className={cn(
+                'rounded-md px-2 py-1 text-sm transition-colors hover:bg-zinc-500/10',
+                view === 'sessions' && 'shell__nav-btn--active bg-zinc-500/10'
+              )}
+              onClick={() => setView('sessions')}
+            >
+              会话
+            </button>
+            <button
+              className={cn(
+                'rounded-md px-2 py-1 text-sm transition-colors hover:bg-zinc-500/10',
+                view === 'settings' && 'shell__nav-btn--active bg-zinc-500/10'
+              )}
+              onClick={() => setView('settings')}
+            >
+              设置
+            </button>
+          </nav>
+          <DaemonStatusCard transport={transport} />
           <button
-            className={view === 'settings' ? 'shell__nav-btn--active' : ''}
-            onClick={() => setView('settings')}
+            className="rounded-md px-2 py-1 text-sm transition-colors hover:bg-zinc-500/10"
+            onClick={toggleRightPane}
           >
-            设置
+            {rightPaneOpen ? '▶' : '◀'} 详情
           </button>
-        </nav>
-        <DaemonStatusCard transport={transport} />
-        <button onClick={toggleRightPane}>{rightPaneOpen ? '▶' : '◀'} 详情</button>
+        </div>
       </header>
       {/* jones-agent#34 / PRD G08 / N16: one bad render below (a message
        * whose shape drifted from what the daemon actually sent, e.g.) must

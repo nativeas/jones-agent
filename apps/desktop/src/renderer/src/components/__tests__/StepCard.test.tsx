@@ -30,7 +30,7 @@ describe('StepCard', () => {
         root.render(<StepCard step={step} />)
       })
       act(() => {
-        container.querySelector<HTMLButtonElement>('.step-card__header')!.click()
+        container.querySelector<HTMLButtonElement>('[data-testid="step-card-header"]')!.click()
       })
 
       expect(container.textContent).toContain('README.md')
@@ -64,7 +64,7 @@ describe('StepCard', () => {
         root.render(<StepCard step={step} />)
       })
       act(() => {
-        container.querySelector<HTMLButtonElement>('.step-card__header')!.click()
+        container.querySelector<HTMLButtonElement>('[data-testid="step-card-header"]')!.click()
       })
 
       expect(container.textContent).toContain('（无参数）')
